@@ -517,6 +517,14 @@ REGIONS_BY_PROFILE = {
     "leggings": REGIONS,
     "bras": {"band": (0.62, 1.00), "cups/centre": (0.25, 0.68),
              "straps": (0.00, 0.30)},
+    # A pullover's bands are vertical spans at FULL garment width (crop_region
+    # takes the whole bbox width), so each one carries the body AND the sleeve
+    # at that height - which is what you want here: sleeve seams, armhole and
+    # cuff ribbing are exactly the construction stage 3 exists to catch. The
+    # narrow body-only boxes live in crop_pair.py, for looking at one thing.
+    "pullovers": {"collar/shoulders": (0.00, 0.28),
+                  "chest/sleeves": (0.22, 0.62),
+                  "hem/cuffs": (0.76, 1.00)},
 }
 
 

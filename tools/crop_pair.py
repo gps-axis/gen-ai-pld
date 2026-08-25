@@ -79,6 +79,27 @@ REGIONS_BY_PROFILE = {
         "left":      (0.00, 0.18, 0.30, 0.78),
         "right":     (0.70, 0.18, 1.00, 0.78),
     },
+    # Hangs the same way up as a bra - collar at the top, hem at the bottom -
+    # but the sleeves push the bounding box out sideways, so the BODY occupies
+    # only the middle ~55% of its width. Every body region is inset to match:
+    # 'chest' taken full-width, the way the bra's 'cups' is, would be half
+    # sleeve and half plate and would compare clean while the chest print was
+    # wrong. Assumes the standard PDP laydown, sleeves angled down and out; if
+    # a brand lays them straight out horizontally the body narrows further and
+    # these need re-measuring against that library.
+    "pullovers": {
+        "collar":    (0.34, 0.00, 0.66, 0.13),
+        "neckline":  (0.28, 0.00, 0.72, 0.19),
+        "shoulders": (0.16, 0.05, 0.84, 0.27),
+        "chest":     (0.24, 0.18, 0.76, 0.50),
+        "body":      (0.22, 0.32, 0.78, 0.80),
+        "hem":       (0.20, 0.84, 0.80, 1.00),
+        "centre":    (0.34, 0.30, 0.66, 0.60),
+        # The sleeves, cuff included. Named left/right rather than 'sleeve' for
+        # the same reason the bra has no single 'underarm': one box is one side.
+        "left":      (0.00, 0.14, 0.32, 0.80),
+        "right":     (0.68, 0.14, 1.00, 0.80),
+    },
 }
 
 

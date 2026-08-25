@@ -39,6 +39,14 @@ PROFILE_TERMS = {
     "leggings": {"legging", "leggings", "legging_bottoms", "tight", "tights",
                  "short", "shorts", "biker_short", "biker_shorts",
                  "cycling_shorts"},
+    # Sleeved upper body. It shares the bra's orientation - collar at the top,
+    # hem at the bottom - and nothing else: the sleeves push the bounding box
+    # out sideways, so a bra's 'cups' band lands half on sleeve and half on
+    # plate. Its own bands, in both region tables.
+    "pullovers": {"pullover", "pullovers", "sweater", "sweaters", "sweatshirt",
+                  "sweatshirts", "jumper", "jumpers", "hoodie", "hoodies",
+                  "hooded_sweatshirt", "crewneck", "crewnecks", "crew_neck",
+                  "half_zip", "quarter_zip", "long_sleeve_top"},
 }
 DEFAULT_PROFILE = "leggings"
 

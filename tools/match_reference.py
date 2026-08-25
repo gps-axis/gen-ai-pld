@@ -320,6 +320,13 @@ CATEGORY_TERMS = {
     "legging": {"legging", "leggings", "tight", "tights", "legging_bottoms"},
     "short": {"short", "shorts", "biker_short", "biker_shorts", "cycling_shorts"},
     "top": {"top", "tops", "tank_top", "tank_tops", "tank", "t_shirt", "tee", "tees"},
+    # Sleeved upper body, pulled on over the head. Kept apart from "top", which
+    # is the sleeveless/tank family: the two are graded on different bands and a
+    # tank scored against a sweatshirt library returns confident nonsense.
+    "pullover": {"pullover", "pullovers", "sweater", "sweaters", "sweatshirt",
+                 "sweatshirts", "jumper", "jumpers", "hoodie", "hoodies",
+                 "hooded_sweatshirt", "crewneck", "crewnecks", "crew_neck",
+                 "half_zip", "quarter_zip"},
 }
 
 
