@@ -47,6 +47,21 @@ PROFILE_TERMS = {
                   "sweatshirts", "jumper", "jumpers", "hoodie", "hoodies",
                   "hooded_sweatshirt", "crewneck", "crewnecks", "crew_neck",
                   "half_zip", "quarter_zip", "long_sleeve_top"},
+    # Also sleeved upper body, and deliberately NOT folded into pullovers. The
+    # silhouette is close, but the pile sits proud of the seam: loft pushes the
+    # body out ~2% of the bbox each side, so the pullover's inset boxes clip the
+    # edge of a fleece, and the construction that has to survive generation is
+    # different - a zip placket running the full length, hand pockets at hip
+    # height, a stand collar or hood taller than any crewneck. Those get their
+    # own bands rather than being judged inside a box drawn for a sweatshirt.
+    #
+    # Terms are kept disjoint from pullovers on purpose: profile_for() returns
+    # the first set a token appears in, so a word in both would resolve by dict
+    # order. A hoodie is a pullover here unless the garment_type says fleece.
+    "fleeces": {"fleece", "fleeces", "fleece_top", "fleece_jacket",
+                "fleece_pullover", "polar_fleece", "microfleece",
+                "micro_fleece", "sherpa", "sherpas", "sherpa_jacket",
+                "sherpa_pullover"},
 }
 DEFAULT_PROFILE = "leggings"
 

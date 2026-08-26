@@ -525,6 +525,21 @@ REGIONS_BY_PROFILE = {
     "pullovers": {"collar/shoulders": (0.00, 0.28),
                   "chest/sleeves": (0.22, 0.62),
                   "hem/cuffs": (0.76, 1.00)},
+    # Fleece gets the pullover's three bands moved to where its hardware is.
+    # The top band runs deeper because a stand collar or hood is taller than a
+    # crewneck and its seam would otherwise fall on the join between bands,
+    # visible in neither. The bottom band starts at 0.70 rather than 0.76 so the
+    # hand pockets sit inside it: their openings are the second thing after the
+    # zip that a generation invents, and at 0.76 they land above the crop.
+    #
+    # These stay full-width like the others, so each band carries the sleeve at
+    # that height as well as the body - and on a fleece the pile direction is
+    # part of what has to match, which a full-width band shows and a body-only
+    # box does not. The narrow boxes are in crop_pair.py, for looking at one
+    # thing once this has told you which band moved.
+    "fleeces": {"collar/hood/shoulders": (0.00, 0.30),
+                "chest/zip/sleeves": (0.24, 0.62),
+                "pockets/hem/cuffs": (0.70, 1.00)},
 }
 
 

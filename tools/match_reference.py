@@ -102,7 +102,11 @@ def _load_api_key() -> str:
 API_KEY = _load_api_key()
 
 # Bump when the attribute prompt changes, to invalidate cached records.
-PROMPT_VERSION = "v2"
+# v3: garment_type gained "pullover" and "fleece", fabric_finish gained "fleece"
+# and "sherpa". Every v2 record predates those words, so a cached fleece reads
+# "other"/"textured" - which resolves to no category and no region profile at
+# all. They have to be re-described, not merged with the new ones.
+PROMPT_VERSION = "v3"
 
 IS_TTY = sys.stdout.isatty()
 
@@ -236,16 +240,27 @@ apply: set neckline, strap_style, strap_width, adjusters, padding, closure and
 support_level to "unknown" rather than guessing. Fields that are "unknown" on
 both sides of a comparison are dropped from scoring, so this costs you nothing.
 
+If the garment is SLEEVED (pullover, fleece), the bra fields do not apply the
+same way: set strap_style, strap_width, adjusters, padding and support_level to
+"unknown". Neckline, closure, band, coverage and fabric_finish still apply.
+
+Separate "pullover" from "fleece" on the FABRIC, not the cut - the two are cut
+alike, and the pile is what tells them apart. Answer "fleece" when the surface
+is a raised pile that stands off the seams: fleece, polar fleece, microfleece,
+sherpa, teddy. Answer "pullover" for a flat-faced sweatshirt, sweater or hoodie
+in jersey, french terry or knit, however heavy. A brushed INSIDE with a flat
+outer face is a pullover - judge the face you can see.
+
 Return ONE JSON object, nothing else. No prose, no markdown fence.
 
 {
-  "garment_type":  "sports_bra" | "bralette" | "t_shirt_bra" | "tank_top" | "leggings" | "shorts" | "other",
+  "garment_type":  "sports_bra" | "bralette" | "t_shirt_bra" | "tank_top" | "leggings" | "shorts" | "pullover" | "fleece" | "other",
   "neckline":      "square" | "scoop" | "v_neck" | "sweetheart" | "high_neck" | "plunge" | "other",
   "strap_style":   "wide_straight" | "thin_straight" | "crossback" | "racerback" | "v_back" | "strappy_multi" | "halter" | "other",
   "strap_width":   "thin" | "medium" | "wide",
   "adjusters":     true | false,
   "band":          "wide_elastic" | "narrow_elastic" | "logo_band" | "smooth_no_band" | "other",
-  "fabric_finish": "smooth_matte" | "shiny" | "ribbed" | "textured" | "lace" | "mesh" | "printed",
+  "fabric_finish": "smooth_matte" | "shiny" | "ribbed" | "textured" | "fleece" | "sherpa" | "lace" | "mesh" | "printed",
   "padding":       "molded_cups" | "removable_pads" | "unpadded" | "unknown",
   "closure":       "pullover" | "front_zip" | "front_hook" | "back_hook",
   "support_level": "low" | "medium" | "high" | "unknown",
@@ -327,6 +342,18 @@ CATEGORY_TERMS = {
                  "sweatshirts", "jumper", "jumpers", "hoodie", "hoodies",
                  "hooded_sweatshirt", "crewneck", "crewnecks", "crew_neck",
                  "half_zip", "quarter_zip"},
+    # Kept apart from "pullover" for the fabric, not the cut. The two share a
+    # silhouette, so a fleece scored against the sweatshirt folder returns a
+    # confident match on everything except the one attribute that matters: the
+    # pile. fabric_finish carries 1.5 of the ~19 total weight, which is not
+    # enough to demote a same-cut smooth sweatshirt below a different-cut
+    # fleece. Splitting the folder is what makes the pile decisive.
+    #
+    # Terms are disjoint from "pullover" - _canon returns the first set a token
+    # is found in, so a word in both would resolve by dict order.
+    "fleece": {"fleece", "fleeces", "fleece_top", "fleece_jacket",
+               "fleece_pullover", "polar_fleece", "microfleece", "micro_fleece",
+               "sherpa", "sherpas", "sherpa_jacket", "sherpa_pullover"},
 }
 
 
@@ -422,6 +449,12 @@ PARTIAL = {
     "padding": {("molded_cups", "removable_pads"): 0.4},
     "coverage": {("cropped_short", "standard"): 0.5, ("standard", "longline"): 0.5},
     "band": {("wide_elastic", "logo_band"): 0.5, ("wide_elastic", "narrow_elastic"): 0.5},
+    # Both are pile, and "textured" is where a model puts a pile it has not been
+    # given a word for - which is what the v2 prompt did to every fleece in the
+    # library. Partial credit rather than 0 keeps a fleece near a sherpa and near
+    # its own older description, without making either equal to the other.
+    "fabric_finish": {("fleece", "sherpa"): 0.5, ("fleece", "textured"): 0.4,
+                      ("sherpa", "textured"): 0.3},
 }
 
 

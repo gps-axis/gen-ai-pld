@@ -100,6 +100,38 @@ REGIONS_BY_PROFILE = {
         "left":      (0.00, 0.14, 0.32, 0.80),
         "right":     (0.68, 0.14, 1.00, 0.80),
     },
+    # The pullover's shape with the loft added and the hardware named. Three
+    # things differ, and each one is a box the pullover set does not have:
+    #
+    #   * The pile stands off the seam, so the body reads ~2% of the bbox wider
+    #     each side. Every body box here is the pullover's opened by that much;
+    #     borrowing the tighter ones puts the fleece's own edge on the boundary,
+    #     which is where a redrawn seam hides.
+    #   * 'placket' is the zip line, top to hem. On a full-zip it is the single
+    #     most-redrawn feature on the garment - teeth spacing, the pull, where
+    #     the tape meets the collar - and no horizontal band isolates it.
+    #   * 'pockets' is the hand-pocket band. The openings are diagonal welts at
+    #     hip height; inside 'body' they are four percent of the frame and a
+    #     judge will not mention them.
+    #
+    # 'collar' is taller and wider than the pullover's: a stand collar or a hood
+    # occupies height a crewneck does not. On a fleece with neither, the box
+    # simply shows the neckline - the same way 'pockets' costs nothing on a
+    # fleece without them.
+    "fleeces": {
+        "collar":    (0.30, 0.00, 0.70, 0.16),
+        "hood":      (0.24, 0.00, 0.76, 0.22),
+        "neckline":  (0.26, 0.02, 0.74, 0.20),
+        "shoulders": (0.14, 0.06, 0.86, 0.30),
+        "chest":     (0.22, 0.20, 0.78, 0.52),
+        "placket":   (0.40, 0.06, 0.60, 0.92),
+        "pockets":   (0.20, 0.52, 0.80, 0.78),
+        "body":      (0.20, 0.34, 0.80, 0.82),
+        "hem":       (0.18, 0.84, 0.82, 1.00),
+        "centre":    (0.32, 0.32, 0.68, 0.62),
+        "left":      (0.00, 0.14, 0.32, 0.82),
+        "right":     (0.68, 0.14, 1.00, 0.82),
+    },
 }
 
 
