@@ -18,6 +18,7 @@ Two things differ from the original and both matter:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -105,10 +106,15 @@ class Client:
         return self.model
 
     def chat(self, content: list, max_tokens: int = 900,
-             temperature: float = 0.0) -> str:
+             temperature: float = 0.0, system: str | None = None) -> str:
+        # describe.py's standing instruction ("you see ONE side, never infer the
+        # other") has to hold for the whole call, not read as one more paragraph
+        # of the question. Optional, so every existing caller is unaffected.
+        msgs = ([{"role": "system", "content": system}] if system else [])
+        msgs.append({"role": "user", "content": content})
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": content}],
+            "messages": msgs,
             # Thinking needs headroom for the chain *plus* the answer; running
             # out mid-chain returns empty content and finish_reason "length".
             "max_tokens": max_tokens * 4 if self.think else max_tokens,
@@ -131,7 +137,15 @@ def ensure_small(src: Path, max_dim: int = 1024) -> Path:
     """Downscale into .cache/small. A 4K generation is ~20MB; sending that raw
     blows up both the request and the model's vision budget."""
     SMALL.mkdir(parents=True, exist_ok=True)
-    dst = SMALL / f"{src.stem}__{max_dim}.jpg"
+    # The parent folder is part of the cache name. Every run writes the SAME
+    # stems - offset_upload.jpg, cand_01.jpg - so keying on the stem alone made
+    # the cache collide across runs, and the mtime guard could not catch it: the
+    # entry cached by today's run is newer than an August source, so the check
+    # passes and the wrong garment is returned as a hit. Caught when the
+    # description step read one bra and produced a description of another.
+    # match_reference.py's copy has always done this; this one had not.
+    tag = hashlib.sha1(str(src.resolve().parent).encode()).hexdigest()[:8]
+    dst = SMALL / f"{src.stem}__{tag}__{max_dim}.jpg"
     if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime:
         return dst
     subprocess.run(["sips", "-Z", str(max_dim), str(src), "--out", str(dst)],

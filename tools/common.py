@@ -28,6 +28,46 @@ RUNS = ROOT / "runs"
 ENDPOINT = "fal-ai/nano-banana-pro/edit"
 PRICE_4K = 0.30
 
+# The shape every generation comes back in. Deliberately fixed rather than
+# derived from the input: the deliverable is a 3:4 flat whatever the photographer
+# handed over, and matching the output to an odd source would just move the odd
+# shape downstream. generate.py's --aspect-ratio still overrides it.
+ASPECT = "3:4"
+
+
+def pad_to_aspect(im, aspect: str = ASPECT, fill=(255, 255, 255)):
+    """Letterbox an image to `aspect` on a white plate, garment centred.
+
+    This is what stops the ghost. The source photos are landscape (4096x3072)
+    while the output is portrait 3:4, so the model was handed a wide picture and
+    asked for a tall one. Laying the garment square in that taller frame leaves
+    an empty band above it, and a band of nothing is where an image model puts a
+    second copy of the subject: runs/20260827_095355 came back with four of nine
+    candidates showing a whole extra sweater or the top of one fading in, and
+    runs/20260827_101946 still had two of ten after everything else was fixed.
+
+    Padding the SOURCE to the target shape removes the discrepancy at the input
+    rather than the output. The model then sees a 3:4 frame containing a garment
+    with white margins and has nothing left to invent. 3:4 out is unchanged,
+    which is the point - the odd shape is absorbed here instead of being passed
+    on.
+
+    A source already at the target ratio is returned untouched.
+    """
+    w, h = im.size
+    aw, ah = (float(x) for x in aspect.split(":"))
+    want = aw / ah
+    have = w / h
+    if abs(have - want) < 0.01:
+        return im
+    if have > want:                      # too wide - grow the height
+        nw, nh = w, int(round(w / want))
+    else:                                # too tall - grow the width
+        nw, nh = int(round(h * want)), h
+    out = Image.new("RGB", (nw, nh), fill)
+    out.paste(im.convert("RGB"), ((nw - w) // 2, (nh - h) // 2))
+    return out
+
 # Canonical region profile -> the garment_type spellings that mean it. This is
 # the same token vocabulary match_reference.py uses to pick the library folder,
 # so the crops a tool measures with always follow the category step 0 already
@@ -39,6 +79,36 @@ PROFILE_TERMS = {
     "leggings": {"legging", "leggings", "legging_bottoms", "tight", "tights",
                  "short", "shorts", "biker_short", "biker_shorts",
                  "cycling_shorts"},
+    # Full-length woven bottoms. Split from leggings in match_reference for the
+    # LAY, which differs a lot, but the crop geometry barely differs at all and
+    # that is a measurement rather than an assumption: drawn on the upload from
+    # runs/20260827_131825, the leggings bands land on 0.00-0.22 waistband, belt
+    # loops, button and the top of the fly; 0.18-0.45 fly, rivets, pocket bags
+    # and the rise; 0.80-1.00 both leg hems. So the bands are inherited and only
+    # renamed, in REGIONS_BY_PROFILE, for what a woven bottom actually has.
+    #
+    # Terms are disjoint from leggings - profile_for() returns the first set a
+    # token appears in, so a word in both would resolve by dict order.
+    "loose": {"loose", "loose_fit", "jean", "jeans", "denim", "denims",
+              "pant", "pants", "trouser", "trousers", "jogger", "joggers",
+              "sweatpant", "sweatpants", "chino", "chinos", "cargo",
+              "cargo_pant", "cargo_pants", "wide_leg", "barrel_leg"},
+    # Gathered-waist woven bottoms. A separate library category from loose,
+    # because the waistband changes the lay - but the same three crop bands,
+    # checked the same way: drawn on three boyfriend/ assets with a paperbag, a
+    # smocked and an elasticated band, 0.00-0.22 holds the frill, the elastic
+    # and the closure below it, 0.18-0.45 holds the pockets and the rise, and
+    # 0.80-1.00 holds both hems. Only the first band's NAME changes, because a
+    # frill standing off the plate is the thing most likely to be generated
+    # wrong here and "waistband/fly" does not ask about it.
+    #
+    # Terms are disjoint from loose and leggings - profile_for() returns the
+    # first set a token appears in, so a word in both would resolve by dict
+    # order.
+    "boyfriend": {"boyfriend", "boyfriends", "boyfriend_fit", "boyfriend_jean",
+                  "boyfriend_jeans", "boyfriend_pant", "boyfriend_pants",
+                  "paperbag", "paperbag_pant", "paperbag_pants", "paper_bag",
+                  "slouch", "slouchy", "slouch_fit"},
     # Sleeved upper body. It shares the bra's orientation - collar at the top,
     # hem at the bottom - and nothing else: the sleeves push the bounding box
     # out sideways, so a bra's 'cups' band lands half on sleeve and half on
@@ -47,6 +117,20 @@ PROFILE_TERMS = {
                   "sweatshirts", "jumper", "jumpers", "hoodie", "hoodies",
                   "hooded_sweatshirt", "crewneck", "crewnecks", "crew_neck",
                   "half_zip", "quarter_zip", "long_sleeve_top"},
+    # Front-opening sleeved knit. Same three bands as pullovers, checked the
+    # same way: drawn on a striped, a shawl-collar and a cropped cardigan,
+    # 0.00-0.28 holds the neckline and the top of the placket, 0.22-0.62 the
+    # placket, the middle buttons and the sleeves, 0.76-1.00 the hem rib, the
+    # bottom button and the cuffs. All three carry the placket, which is the
+    # point - it is the construction a generation gets wrong, and it runs the
+    # full height of the garment rather than living in one band.
+    #
+    # Terms are disjoint from pullovers and fleeces - profile_for() returns the
+    # first set a token appears in, so a word in both would resolve by dict
+    # order.
+    "cardigans": {"cardigan", "cardigans", "cardi", "cardis", "button_front",
+                  "button_up", "button_through", "open_front", "duster",
+                  "shrug", "shrugs", "bolero", "boleros"},
     # Also sleeved upper body, and deliberately NOT folded into pullovers. The
     # silhouette is close, but the pile sits proud of the seam: loft pushes the
     # body out ~2% of the bbox each side, so the pullover's inset boxes clip the
@@ -423,6 +507,11 @@ def garment_evidence(path: Path, long_side: int = 1024,
         "mask": mask,
         # The same blob with its holes left open. Only outline_map() wants this.
         "mask_open": _blob(cue_raw, fill=False),
+        # Every cue pixel, BEFORE _blob() throws away all but the largest
+        # component. extra_garments() needs this and nothing else does: the
+        # largest-blob step is exactly what made a second sweater invisible to
+        # every metric in the pipeline.
+        "cue_raw": cue_raw,
         "shape": a.shape[:2],
         "cue": "chroma" if use_chroma else "luminance",
         "cue_why": why,
@@ -442,6 +531,23 @@ def garment_evidence(path: Path, long_side: int = 1024,
         "aspect": (round((box[3] - box[2] + 1) / max(box[1] - box[0] + 1, 1), 3)
                    if box else 0.0),
     }
+
+
+# NOTE - a connected-component count was tried here and REMOVED. It looked like
+# the obvious way to catch the duplicate-garment ghost: label the raw cue mask,
+# call anything over ~6% of the main blob a second object. Measured against ten
+# candidates classified by eye it was wrong in both directions.
+#
+#   * runs/20260827_104532 cand_04 is unmistakably two sweaters and it passed.
+#     The copies OVERLAP, so they are one connected component. Component
+#     counting cannot see a duplicate that touches the original, and most of
+#     them do.
+#   * the same run's cand_08 is a single clean garment and it failed, on three
+#     phantom components at 0.18, 0.12 and 0.07 - backdrop gradient and shadow
+#     picked up by the luminance cue.
+#
+# The geometry is not separable here. Counting garments is a semantic question
+# and it is asked of the vision model instead, in grade_flats.count_garments().
 
 
 def garment_mask(path: Path, long_side: int = 1024, cue: str | None = None):
@@ -481,8 +587,44 @@ def silhouette(path: Path, long_side: int = 1024, cue: str | None = None) -> dic
             "grid": grid, "cue": e["cue"]}
 
 
+def _pose_holes(mask: np.ndarray, min_frac: float = 0.015):
+    """Keep the holes that describe the POSE, close the ones that are print.
+
+    outline_map() keeps the mask's holes unfilled, and it has to: the gap
+    between a bra's crossed straps and the gap between two legs are most of what
+    makes a lay readable, and filling them turns the reference into a blob.
+
+    But a hole is only a mask artefact, and anything the cue reads as
+    not-garment becomes one. On the pullover reference the intarsia teddy bear
+    is lighter than the navy body, so the luminance cue punched it out and the
+    outline came back with a bear-shaped patch of speckles in the middle of the
+    chest - construction, in the one image whose entire purpose is to carry no
+    construction. Whatever else the model copies off the lay reference, it must
+    not be a graphic.
+
+    Area separates the two cleanly. A strap gap or a leg gap is a large share of
+    the garment; a print, a logo or a light stripe is not. Everything under
+    `min_frac` of the garment's own area is closed.
+
+    Returns (mask, holes_closed).
+    """
+    filled = ndimage.binary_fill_holes(mask)
+    holes = filled & ~mask
+    if not holes.any():
+        return mask, 0
+    lab, n = ndimage.label(holes)
+    if n == 0:
+        return mask, 0
+    area = float(filled.sum())
+    sizes = ndimage.sum(holes, lab, range(1, n + 1))
+    small = [i + 1 for i, s in enumerate(sizes) if float(s) / area < min_frac]
+    if not small:
+        return mask, 0
+    return (mask | np.isin(lab, small)), len(small)
+
+
 def outline_map(src: Path, dst: Path, long_side: int = 2048,
-                stroke: int = 3) -> dict:
+                stroke: int = 3, hole_frac: float = 0.015) -> dict:
     """Write a line drawing of the garment's outline: pose, no construction.
 
     The lay reference exists to say how the garment should be ARRANGED - straps
@@ -503,6 +645,7 @@ def outline_map(src: Path, dst: Path, long_side: int = 2048,
     m = e["mask_open"]
     if not m.any():
         raise RuntimeError(f"no garment found in {src}, so no outline to draw")
+    m, closed = _pose_holes(m, min_frac=hole_frac)
 
     W, H = Image.open(src).size
     k = long_side / max(W, H)
@@ -514,6 +657,7 @@ def outline_map(src: Path, dst: Path, long_side: int = 2048,
     out = np.where(edge, 0, 255).astype(np.uint8)
     Image.fromarray(out, mode="L").save(dst, quality=95, subsampling=0)
     return {"size": [W, H], "cue": e["cue"], "stroke": stroke,
+            "holes_closed": closed,
             "ink": round(float(edge.mean()) * 100, 3)}
 
 

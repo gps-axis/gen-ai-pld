@@ -106,7 +106,51 @@ API_KEY = _load_api_key()
 # and "sherpa". Every v2 record predates those words, so a cached fleece reads
 # "other"/"textured" - which resolves to no category and no region profile at
 # all. They have to be re-described, not merged with the new ones.
-PROMPT_VERSION = "v3"
+# v4: garment_type gained "jeans" and "pants", and the bottoms now carry a rule
+# for telling the four of them apart. "shorts" was the only woven bottom in the
+# schema, so a full-length woven leg had nowhere else to go: on
+# runs/20260827_131825 a pair of wide-leg kids' jeans came back "shorts", which
+# matches no folder, which pooled the whole library and ranked a pair of jeans
+# against 39 sports bras. Every v3 record of a woven bottom is wrong in that
+# same direction and has to be re-described rather than merged.
+# v5: "closure" gained "unknown". The bottoms rule above has always said to
+# answer "unknown" for closure, but the schema line offered only the four bra
+# values, so the model could not comply and picked the nearest-sounding one -
+# differently for each photo of the same fly. On runs/20260827_133232 a pair of
+# jeans read "front_zip" and a near-identical library pair read "front_hook",
+# scoring 0.0 on a field worth 1.0 of a 9.5 total: 88.7 against a threshold of
+# 95, where dropping the field scores 99.2. Two of the seven bra fields are
+# skipped for a bottom by being unknown on both sides, so one bogus zero is a
+# large fraction of what is left to disagree about.
+# v6: garment_type gained "boyfriend", the gathered-waist bottom.
+#
+# The category was asked for as "like pants but for kids", which is not a thing
+# a classifier can see: these are flat lays on white with no scale reference in
+# frame, and a toddler's jean photographed alone is indistinguishable from an
+# adult's. So the rule keys on what IS visible, and the library picked it out
+# rather than a guess - described under v5, 13 of the 14 assets in boyfriend/
+# came back with "ruffled elasticated waistband", "elasticated waistband" or
+# "elasticated smocked waistband" in their own notes, and neither asset in
+# loose/ did. The gathered waist is the signal; "for kids" is a fact about the
+# folder, not about the pixels.
+#
+# v7: the same rule, rebalanced. v6 phrased it as a test that "OVERRIDES jeans
+# and pants", and the model duly made boyfriend the default: it took all 14 of
+# boyfriend/, which is right, and both of loose/ as well, including the
+# wide-leg button-fly jean it had itself described as flat-banded one version
+# earlier. An override invites the model to reach for the overriding answer. So
+# the two waistbands are now stated as one fork with both branches described in
+# equal detail, and the leg shape - the thing that makes a boyfriend LOOK like a
+# boyfriend, and the thing most likely to drag a flat-banded wide-leg across -
+# is explicitly ruled out as evidence.
+#
+# v8: garment_type gained "cardigan", the sleeved knit that opens all the way
+# down the centre front. The pullover/fleece rule was rewritten into an ordered
+# pair rather than a third branch bolted on, because the two splits are not on
+# the same axis: fleece is decided on FABRIC and cardigan on the FRONT, and a
+# full-zip fleece jacket satisfies both. Pile is asked first and wins, which
+# keeps every existing fleece where it was. Only then does the front decide.
+PROMPT_VERSION = "v8"
 
 IS_TTY = sys.stdout.isatty()
 
@@ -235,26 +279,76 @@ you can actually see. If a field is genuinely not visible, use "unknown".
 Ignore any hangtag, label, price ticket, background, shadow or prop - describe
 the garment only.
 
-If the garment is a BOTTOM (leggings, shorts), the upper-body fields do not
-apply: set neckline, strap_style, strap_width, adjusters, padding, closure and
-support_level to "unknown" rather than guessing. Fields that are "unknown" on
-both sides of a comparison are dropped from scoring, so this costs you nothing.
+If the garment is a BOTTOM (leggings, shorts, jeans, pants), the upper-body
+fields do not apply: set neckline, strap_style, strap_width, adjusters, padding,
+closure and support_level to "unknown" rather than guessing. Fields that are
+"unknown" on both sides of a comparison are dropped from scoring, so this costs
+you nothing.
 
-If the garment is SLEEVED (pullover, fleece), the bra fields do not apply the
-same way: set strap_style, strap_width, adjusters, padding and support_level to
-"unknown". Neckline, closure, band, coverage and fabric_finish still apply.
+"closure" in particular: the four closure values describe how an UPPER BODY
+garment is put on. A fly, a button, a zip, a drawstring or an elastic waist on a
+bottom is none of them, so answer "unknown" for every bottom. Do not reach for
+the nearest-sounding value.
 
-Separate "pullover" from "fleece" on the FABRIC, not the cut - the two are cut
-alike, and the pile is what tells them apart. Answer "fleece" when the surface
-is a raised pile that stands off the seams: fleece, polar fleece, microfleece,
-sherpa, teddy. Answer "pullover" for a flat-faced sweatshirt, sweater or hoodie
-in jersey, french terry or knit, however heavy. A brushed INSIDE with a flat
-outer face is a pullover - judge the face you can see.
+Separate the bottoms on LENGTH and CUT. Judge length against the KNEE, not
+against the ankle: answer "shorts" only when the leg ends at or above the knee.
+Everything ending below the knee is full length here, including a cropped, wide,
+barrel or ankle-length leg. Among the full-length ones, answer "leggings" when
+the leg is knitted and close-fitting to the leg, "jeans" for a woven denim
+bottom, and "pants" for any other woven bottom - chino, cargo, jogger, trouser -
+however wide or tapered the leg.
+
+Then split the full-length WOVEN bottoms once more, on the WAISTBAND. Look at
+the band itself and decide which of these two you can actually see:
+
+  GATHERED - the fabric is drawn up along the band into ripples or folds, by
+  elastic, shirring or smocking, and/or a paperbag frill stands up above the
+  closure. Answer "boyfriend". Denim, corduroy, canvas and coated all qualify,
+  and so does any leg: straight, barrel, wide or flared.
+
+  FLAT - the band lies smooth and untucked all the way across, normally with
+  belt loops and a fly or button front below it. Answer "jeans" for denim and
+  "pants" for anything else woven.
+
+Judge this on the band and nothing else. A wide, barrel, slouchy or flared leg
+sits on a flat band just as often as on a gathered one, so the leg tells you
+nothing here; neither does the fabric, and neither does how big the garment
+looks. If the band lies smooth, it is "jeans" or "pants" however relaxed the
+rest of the garment is.
+
+If the garment is SLEEVED (pullover, fleece, cardigan), the bra fields do not
+apply the same way: set strap_style, strap_width, adjusters, padding and
+support_level to "unknown". Neckline, closure, band, coverage and fabric_finish
+still apply.
+
+For a sleeved garment, ask the two questions in this order.
+
+FIRST, the FABRIC, which separates "fleece" from everything else sleeved. Answer
+"fleece" when the surface is a raised pile that stands off the seams: fleece,
+polar fleece, microfleece, sherpa, teddy. A pile is "fleece" whatever its front
+does, zipped right down or not. A brushed INSIDE with a flat outer face is not a
+pile - judge the face you can see.
+
+SECOND, if it is not a pile, the CENTRE FRONT, which separates "cardigan" from
+"pullover":
+
+  OPENS THE WHOLE WAY - two separate front panels meeting down the middle, held
+  by buttons, snaps or a zip running from neck to hem, or simply hanging open.
+  Answer "cardigan". A hood, a collar, a pocket or any knit or stitch - cable,
+  pointelle, jacquard, ribbed, flat - makes no difference.
+
+  DOES NOT - one unbroken front panel, or a placket, half-zip or quarter-zip
+  that stops somewhere above the hem, so the garment still has to go over the
+  head. Answer "pullover", for a sweatshirt, sweater or hoodie in jersey, french
+  terry or knit, however heavy.
+
+The test is whether the front separates all the way to the hem. Buttons that run
+only partway down are a pullover placket, not a cardigan.
 
 Return ONE JSON object, nothing else. No prose, no markdown fence.
 
 {
-  "garment_type":  "sports_bra" | "bralette" | "t_shirt_bra" | "tank_top" | "leggings" | "shorts" | "pullover" | "fleece" | "other",
+  "garment_type":  "sports_bra" | "bralette" | "t_shirt_bra" | "tank_top" | "leggings" | "shorts" | "jeans" | "pants" | "boyfriend" | "pullover" | "cardigan" | "fleece" | "other",
   "neckline":      "square" | "scoop" | "v_neck" | "sweetheart" | "high_neck" | "plunge" | "other",
   "strap_style":   "wide_straight" | "thin_straight" | "crossback" | "racerback" | "v_back" | "strappy_multi" | "halter" | "other",
   "strap_width":   "thin" | "medium" | "wide",
@@ -262,7 +356,7 @@ Return ONE JSON object, nothing else. No prose, no markdown fence.
   "band":          "wide_elastic" | "narrow_elastic" | "logo_band" | "smooth_no_band" | "other",
   "fabric_finish": "smooth_matte" | "shiny" | "ribbed" | "textured" | "fleece" | "sherpa" | "lace" | "mesh" | "printed",
   "padding":       "molded_cups" | "removable_pads" | "unpadded" | "unknown",
-  "closure":       "pullover" | "front_zip" | "front_hook" | "back_hook",
+  "closure":       "pullover" | "front_zip" | "front_hook" | "back_hook" | "unknown",
   "support_level": "low" | "medium" | "high" | "unknown",
   "coverage":      "cropped_short" | "standard" | "longline",
   "color_name":    "<plain english, e.g. periwinkle blue>",
@@ -334,6 +428,38 @@ CATEGORY_TERMS = {
             "t_shirt_bra", "crop_top", "crop_tops"},
     "legging": {"legging", "leggings", "tight", "tights", "legging_bottoms"},
     "short": {"short", "shorts", "biker_short", "biker_shorts", "cycling_shorts"},
+    # Full-length WOVEN bottoms: jeans, chinos, cargos, joggers, trousers. Kept
+    # apart from "legging" and "short" for the LAY, which is the only thing a
+    # reference is used for. A legging lies as two narrow tubes touching down
+    # the middle; a loose jean lies with the legs apart, the rise spread open
+    # and the hems well clear of each other. Either one used as the other's lay
+    # reference asks the model to reshape the garment, which is the one thing a
+    # lay reference must never do.
+    #
+    # The canonical key is "loose" because that is what the folder is called
+    # (library_reference/loose/) - find_categories keys on _canon(folder name),
+    # so the key and the folder have to spell it the same way.
+    #
+    # Terms are disjoint from "short" and "legging" - _canon returns the first
+    # set a token is found in, so a word in both would resolve by dict order.
+    "loose": {"loose", "loose_fit", "jean", "jeans", "denim", "denims",
+              "pant", "pants", "trouser", "trousers", "jogger", "joggers",
+              "sweatpant", "sweatpants", "chino", "chinos", "cargo",
+              "cargo_pant", "cargo_pants", "wide_leg", "barrel_leg"},
+    # The same family as "loose" and split off it for the WAISTBAND: gathered,
+    # elasticated, shirred or paperbag, against loose's flat band with belt
+    # loops and a fly. That is a lay difference and not just a styling one - a
+    # gathered band pulls the whole top of the garment in and stands the frill
+    # up off the plate, so the hip sits narrower and the waist sits taller than
+    # on a flat-banded jean of the same size.
+    #
+    # Terms are disjoint from "loose", "legging" and "short" - _canon returns
+    # the first set a token is found in, so a word in both would resolve by
+    # dict order.
+    "boyfriend": {"boyfriend", "boyfriends", "boyfriend_fit", "boyfriend_jean",
+                  "boyfriend_jeans", "boyfriend_pant", "boyfriend_pants",
+                  "paperbag", "paperbag_pant", "paperbag_pants", "paper_bag",
+                  "slouch", "slouchy", "slouch_fit"},
     "top": {"top", "tops", "tank_top", "tank_tops", "tank", "t_shirt", "tee", "tees"},
     # Sleeved upper body, pulled on over the head. Kept apart from "top", which
     # is the sleeveless/tank family: the two are graded on different bands and a
@@ -342,6 +468,20 @@ CATEGORY_TERMS = {
                  "sweatshirts", "jumper", "jumpers", "hoodie", "hoodies",
                  "hooded_sweatshirt", "crewneck", "crewnecks", "crew_neck",
                  "half_zip", "quarter_zip"},
+    # Sleeved knit that opens the whole way down the centre front. Split from
+    # pullover for the LAY, which is what a reference is for: a cardigan is laid
+    # with two front edges meeting on the centre line and the placket flat, and
+    # nothing in the pullover library shows that. Used as each other's
+    # reference, a pullover asks the model to close a cardigan's front and a
+    # cardigan asks it to cut one into a pullover.
+    #
+    # Terms are disjoint from pullover and fleece - _canon returns the first set
+    # a token is found in, so a word in both would resolve by dict order. Note
+    # "half_zip"/"quarter_zip" stay with pullover on purpose: those stop above
+    # the hem, so the garment still goes over the head.
+    "cardigan": {"cardigan", "cardigans", "cardi", "cardis", "button_front",
+                 "button_up", "button_through", "open_front", "duster",
+                 "shrug", "shrugs", "bolero", "boleros"},
     # Kept apart from "pullover" for the fabric, not the cut. The two share a
     # silhouette, so a fleece scored against the sweatshirt folder returns a
     # confident match on everything except the one attribute that matters: the
@@ -541,27 +681,58 @@ def score(q: dict, c: dict, color_weight: float) -> tuple[float, dict]:
 # Stage C - head-to-head visual pick
 # --------------------------------------------------------------------------
 
+# The question here has to be the one the reference actually answers. This
+# prompt used to ask for "the same STYLE of garment", and on
+# runs/20260827_095158 the model did exactly as asked: it rejected a 99.8 match
+# because the query was a multi-colour striped pullover and the candidate a
+# solid navy pullover with a teddy bear intarsia - "the pattern and
+# construction are fundamentally different, making them distinct styles of
+# garments". Every field that bears on the LAY had scored 1.0: pullover, scoop
+# neck, ribbed, same band, same coverage.
+#
+# It was right about style and wrong about the job. select_reference.py
+# desaturates the winner to greyscale before installing it, and SKILL.md says
+# it twice - a shape and lay reference, never a colour target, never a
+# construction reference. Colour and pattern are the two things guaranteed not
+# to travel, so rejecting on them vetoes matches the pipeline was built to
+# accept, and the only way through was a hand-typed --no-model-veto on every
+# run.
+#
+# The veto is still worth having. It is what catches a candidate that cleared
+# the numeric filter on attribute agreement while being the wrong shape to lay
+# - the schema cannot see silhouette, so nothing else would. It just has to
+# reject on shape rather than on print.
 COMPARE_PROMPT = """Image 1 is the QUERY garment (photographed flat, sometimes with a
 hangtag - ignore the tag). The following {n} images are candidate reference photos,
 labelled {labels}.
 
-Pick the ONE candidate that is the same style of garment as the query, judging cut
-and construction. For tops and bras that means neckline, strap construction, band
-and coverage; for bottoms it means rise, leg length, waistband and seam placement.
-Fabric finish matters either way. Colour matters less than cut and construction.
-Judge only the features the garment actually has - do not look for a neckline on a
-pair of leggings.
+The winner is used for ONE purpose: it is converted to greyscale and used as a LAY
+reference - a template for how the query garment should be posed and shaped when it
+is photographed flat. It is never a colour target and never a construction
+reference.
 
-This is a strict match, not a nearest-neighbour choice. The candidates have already
-passed a numeric filter, so a wrong pick is worse than no pick. If NONE of them is
-genuinely the same style of garment, answer "none". Do not stretch to fill the slot.
+So pick the ONE candidate that the query garment could be laid out to match: same
+garment shape and silhouette, same cut. For tops and bras that means neckline shape,
+strap or sleeve construction, band and coverage; for bottoms it means rise, leg
+length and waistband. Judge only the features the garment actually has - do not look
+for a neckline on a pair of leggings.
+
+These do NOT matter and are NOT reasons to reject a candidate:
+colour, colourway, stripes, prints, patterns, colour-blocking, logos, embroidery,
+intarsia or any applied graphic. A striped garment and a solid one in the same cut
+are the SAME LAY. All of it is discarded before the reference is used.
+
+This is a strict match on SHAPE, not a nearest-neighbour choice. The candidates have
+already passed a numeric filter, so a pick that cannot be laid the same way is worse
+than no pick. If NONE of them shares the query's cut and silhouette, answer "none".
+Do not stretch to fill the slot.
 
 Return ONE JSON object, nothing else:
 {{"pick": "<label>" or "none",
-  "confidence": <0-100 integer, how sure you are the pick is the same style>,
+  "confidence": <0-100 integer, how sure you are the pick works as a lay reference>,
   "runner_up": "<label>" or "none",
-  "reason": "<two sentences max>",
-  "differences": "<what still differs between query and your pick, one sentence>"}}"""
+  "reason": "<two sentences max, about shape and cut>",
+  "differences": "<what still differs in shape between query and your pick, one sentence>"}}"""
 
 
 def compare_multi(client: Client, query_small: Path, cands: list[tuple[str, Path]]) -> dict:

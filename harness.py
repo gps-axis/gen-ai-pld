@@ -1423,20 +1423,31 @@ def pre_clean(workspace: Path, run_dir: Path, python: str) -> Path | None:
     caller falls back to the raw input and says so. A non-empty failure list is
     NOT survivable and parks the run - see the caller.
     """
-    script = workspace / "tools" / "clean.py"
+    # segment.py, not clean.py. The fal object-removal endpoint this step used
+    # to call has been restricted since 2026-08-27 and every run crashed here.
+    # The self-hosted segmentation service does the half that is available -
+    # background dropped, garment on a white plate - and does not remove a tag,
+    # ticket or pin. Those are named by describe.py under TO REMOVE and asked
+    # for in the prompt instead.
+    #
+    # No outline gate runs against a segmentation, so this returns no failures.
+    # The gate existed to catch a generative eraser silently redrawing the
+    # garment; a segmenter either finds the garment or does not, and segment.py
+    # checks that itself before writing anything.
+    script = workspace / "tools" / "segment.py"
     out = run_dir / "archive" / "offset_upload.jpg"
     if not script.exists():
         TR.warn("step0", f"no {script}; matching against the raw input")
         return None, []
-    print(c(BOLD, "\nstep 0a · pre-clean") +
-          c(DIM, "  (so the reference is matched against the clean image)"),
-          flush=True)
-    TR.rule("step 0a - pre-clean")
+    print(c(BOLD, "\nstep 0a · segment") +
+          c(DIM, "  (background dropped, so the reference is matched against "
+                 "the clean image)"), flush=True)
+    TR.rule("step 0a - segment")
     with TR.console_component("step0"):
         rc = stream_subprocess([python, str(script), "--run", str(run_dir)],
                                cwd=script.parent, comp="step0")
     if rc == 0 and out.exists():
-        TR.info("step0", "pre-clean ok", out=str(out))
+        TR.info("step0", "segmentation ok", out=str(out))
         return out, []
 
     # Which kind of failure this is decides whether the run may continue, so
@@ -1517,7 +1528,8 @@ def force_ship(workspace: Path, run_dir: Path, python: str, n: int) -> bool:
 
 def select_reference(workspace: Path, run_dir: Path, python: str,
                      category: str | None, threshold: float,
-                     query: Path | None = None) -> int:
+                     query: Path | None = None,
+                     silhouette: bool = False) -> int:
     """Step 0: install the lay reference, before the agent gets a turn.
 
     This is deliberately not the agent's job. Choosing the reference is a
@@ -1540,6 +1552,11 @@ def select_reference(workspace: Path, run_dir: Path, python: str,
         cmd += ["--query", str(query), "--query-cleaned"]
     if category:
         cmd += ["--category", category]
+    if silhouette:
+        # Installs a line drawing of the winner instead of its photograph.
+        # Without this passed through, step 0 rewrites inputs/ on every run and
+        # an outline installed by hand survives exactly until the next one.
+        cmd += ["--silhouette"]
     # Flushed: the child writes straight to this terminal, so an unflushed
     # header appears after everything it was supposed to introduce.
     print(c(BOLD, "\nstep 0 · reference selection") +
@@ -1583,11 +1600,22 @@ def main():
     ap.add_argument("--no-reference-select", action="store_true",
                     help="Skip step 0 and run against whatever reference is "
                          "already sitting in inputs/.")
+    # Back ON by default. It was switched off on 2026-08-27 when the fal
+    # object-removal endpoint started answering 403 and every run crashed here;
+    # step 0a now calls the self-hosted segmentation service instead, which is
+    # reachable and costs nothing.
     ap.add_argument("--no-pre-clean", action="store_true",
-                    help="Do not pre-clean the off-set photo before matching "
-                         "the reference. The match is then made against the raw "
-                         "input, tag and room included, and prepare.py cleans "
-                         "on the agent's first turn as it used to.")
+                    help="Skip step 0a. The reference is then matched against "
+                         "the raw input, background and all, and the generator "
+                         "is handed a photo that still has the room in it.")
+    ap.add_argument("--reference-outline", action="store_true",
+                    help="Install a line drawing of the reference instead of "
+                         "its photograph. The lay reference is the second image "
+                         "sent to the generator, and while it is a photograph "
+                         "of a garment the model sometimes draws that garment "
+                         "too - roughly 2 to 3 candidates in 10 come back "
+                         "holding two. An outline carries the pose and contains "
+                         "no garment to copy.")
     ap.add_argument("--ship-on-cap", type=int, default=4, metavar="N",
                     help="If the run ends with output/ empty and generated "
                          "images in archive/, the harness ships the N most "
@@ -1758,7 +1786,7 @@ def main():
                 print(c(DIM, f"    {f}"))
         rc = select_reference(workspace, run_dir, tools.python,
                               args.reference_category, args.reference_threshold,
-                              query=clean)
+                              query=clean, silhouette=args.reference_outline)
         # 2 and 1 are different answers and must not leave here as the same
         # code. 2 is "the library has nothing close enough, a human has to
         # upload a hero" - the pipeline worked and gave its verdict. 1 is the

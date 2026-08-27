@@ -172,8 +172,14 @@ def main() -> int:
     ap.add_argument("--reference", type=Path, default=C.INPUTS / "reference_image.jpg")
     ap.add_argument("--upload-long-side", type=int, default=4096,
                     help="long side of the copy that gets uploaded")
+    # Default OFF, matching harness.py: the pre-clean's object-removal endpoint
+    # is restricted (403) and every attempt ends in a traceback. --clean puts it
+    # back if the account regains access.
     ap.add_argument("--no-clean", dest="clean", action="store_false",
-                    help="skip the automatic tag/background pre-clean")
+                    default=False,
+                    help="skip the automatic tag/background pre-clean (default)")
+    ap.add_argument("--clean", dest="clean", action="store_true",
+                    help="re-enable the fal pre-clean")
     ap.add_argument("--out", type=Path, help="run folder (default runs/<stamp>)")
     a = ap.parse_args()
 
@@ -232,13 +238,29 @@ def main() -> int:
     # can disagree with the first. clean.py is run below only when step 0 did
     # not leave one - a direct `prepare.py` outside the harness, or a step 0
     # that failed - which keeps this script usable on its own.
+    # An upload already on disk is step 0a's segmentation, and it is kept
+    # WHATEVER --clean says. That ordering matters: step 0 matched the reference
+    # against this exact image, so replacing it with a raw copy here would leave
+    # the reference chosen from one picture and the generation made from
+    # another. The old code only kept it when `a.clean` was true, and a.clean is
+    # by then a record of whether cleaning WORKED, not of what was asked for -
+    # so a failed clean quietly threw away a good segmentation too.
+    # Two different questions, and conflating them is what broke this before.
+    # `have_clean` - is there a prepared upload on disk? Segmentation satisfies
+    # it. `props_removed` - has anything ATTACHED to the garment been taken
+    # out? Only clean.py's generative eraser ever did that, and it is the one
+    # that answers 403. Segmentation drops the background and leaves the hang
+    # tag, ticket and pins exactly where they were, so a segmented image is
+    # clean to look at and still dirty to describe.
     up_path = run / "archive" / "offset_upload.jpg"
-    if a.clean and up_path.exists():
+    have_clean = up_path.exists()
+    props_removed = False
+    if have_clean:
         w, h = Image.open(up_path).size
         print(f"pre-cleaned  archive/offset_upload.jpg {w}x{h}  "
-              f"{up_path.stat().st_size/1e6:.1f} MB  (from step 0, not redone)")
+              f"{up_path.stat().st_size/1e6:.1f} MB  (from step 0a, not redone)")
     elif a.clean:
-        print("no pre-cleaned upload from step 0; cleaning now.")
+        print("no pre-cleaned upload from step 0a; cleaning now.")
         import subprocess
         r = subprocess.run([sys.executable, str(Path(__file__).with_name("clean.py")),
                             "--run", str(run), "--off-set", str(a.off_set),
@@ -248,14 +270,9 @@ def main() -> int:
         if r.returncode != 0 or not up_path.exists():
             print("  pre-clean failed; falling back to a plain downscaled copy.")
             a.clean = False
-    if not a.clean:
-        if up_path.exists():
-            # --no-clean is explicit, so it is honoured - but step 0 matched the
-            # reference against the cleaned image, and this replaces it with a
-            # raw one. The two are then describing different pictures.
-            print("  WARNING: --no-clean is overwriting the pre-cleaned upload "
-                  "step 0 produced. The reference was chosen by matching that "
-                  "image; this one still has the tag and the background.")
+        else:
+            have_clean = props_removed = True
+    if not have_clean:
         up = off.convert("RGB")
         up.thumbnail((a.upload_long_side, a.upload_long_side), Image.LANCZOS)
         up.save(up_path, quality=95, subsampling=0,
@@ -263,18 +280,58 @@ def main() -> int:
         print(f"upload copy  {up.width}x{up.height}  "
               f"{up_path.stat().st_size/1e6:.1f} MB  (NOT pre-cleaned)")
 
-    # Inventory the construction from the CLEANED image. generate.py appends
-    # this to every prompt, so each draw is anchored to one written spec rather
-    # than to whatever the re-lay model infers - which is where invented seams
-    # and lost topstitching have come from.
+    # NO letterboxing here, and the reason is worth keeping.
+    #
+    # The stacked-sweater ghost looked like an aspect problem: the source is
+    # landscape 4096x3072, every generation is 3:4 portrait, so the model was
+    # handed a wide picture and asked for a tall one, and the leftover band was
+    # where the second garment grew. Padding the source to 3:4 was the obvious
+    # fix and it was WRONG - runs/20260827_104532 went from two ghosts in ten to
+    # five or six. Padding leaves the garment filling 56% of the frame instead
+    # of 100%, and more empty canvas gave the model MORE room to put a second
+    # copy in, not less. C.pad_to_aspect is kept for callers that want it, but
+    # the source is sent at its own shape.
+    #
+    # The ghost is not geometric. Across three runs no prompt has ever said how
+    # many garments to draw; generate.py now says it outright.
+
+    # Inventory the construction. generate.py appends this to every prompt, so
+    # each draw is anchored to one written spec rather than to whatever the
+    # re-lay model infers - which is where invented seams and lost topstitching
+    # have come from.
+    #
+    # This used to be gated on `a.clean`, which is why runs/20260827_095355 has
+    # no inventory at all: the pre-clean 403'd, the failure handler reassigned
+    # a.clean from "should we clean" to "did cleaning work", and the gate read
+    # the second meaning. Worse, the only warning about a missing inventory
+    # lived INSIDE the block, so the one case that needed it printed nothing.
+    #
+    # The gate is gone. The inventory now runs from whatever image is actually
+    # on disk, and it runs free on the local model, so there is no spend to
+    # protect by skipping it. What the clean used to remove is instead recorded
+    # by describe.py under TO REMOVE and asked for in the prompt.
     desc = run / "archive" / "garment_description.md"
-    if a.clean and not desc.exists():
+    if not desc.exists():
         import subprocess
-        r = subprocess.run([sys.executable, str(Path(__file__).with_name("describe.py")),
-                            "--run", str(run)], capture_output=True, text=True)
+        cmd = [sys.executable, str(Path(__file__).with_name("describe.py")),
+               "--run", str(run)]
+        if not props_removed:
+            # Keyed on props_removed, NOT on whether the image was cleaned up.
+            # A segmented image looks clean - white plate, no room - while still
+            # carrying every tag and pin that was pinned to the garment, and
+            # that is exactly the case where describe.py needs telling. Left
+            # unsaid it inventories them as construction, and a prompt written
+            # from a raw input once asked for the tag to "stay in place" while
+            # all four candidates kept it.
+            cmd.append("--dirty-source")
+        r = subprocess.run(cmd, capture_output=True, text=True)
         print(r.stdout.rstrip() or r.stderr.rstrip())
-        if not desc.exists():
-            print("  no construction inventory; prompts will not carry one.")
+    if not desc.exists():
+        # Outside the block on purpose. A missing inventory is the single
+        # failure most likely to go unnoticed, so it warns whether the step was
+        # skipped, crashed, or was never reached.
+        print("  WARNING: no construction inventory; prompts will not carry "
+              "one, and nothing downstream will anchor the construction.")
 
     # Step 0 measured what the reference carries beyond the lay. That is worth
     # a clause of the agent's own prompt as well as the one generate.py appends
@@ -305,7 +362,16 @@ def main() -> int:
     print("NO prompt written. Look at both images, then write archive/prompt.txt.")
 
     w, h = Image.open(up_path).size
-    C.log(run, f"prepared, upload {w}x{h}{'' if a.clean else ' (not cleaned)'}")
+    # Reports what the image actually IS, in the two dimensions that differ.
+    # It read `a.clean` before, which by this point means "did clean.py work",
+    # so a perfectly good segmentation was logged as "(not cleaned)" - the same
+    # conflation that cost the construction inventory. Both facts are recorded
+    # because they are separately actionable: a raw background is a prompt
+    # problem, attached props are a TO REMOVE problem.
+    state = ("background dropped" if have_clean else "RAW - background included")
+    if not props_removed:
+        state += ", tag/pins not removed"
+    C.log(run, f"prepared, upload {w}x{h} ({state})")
     print(f"\nRUN_DIR={run}")
     return 0
 

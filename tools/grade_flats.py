@@ -316,6 +316,58 @@ def face_of(client: Client, small: Path) -> dict:
             "why": str(v.get("why", ""))[:200]}
 
 
+# Asked of the vision model rather than measured, because the geometry does not
+# separate. See the removed-detector note in common.py: the duplicate usually
+# OVERLAPS the original, so it is one connected component, and a backdrop
+# gradient makes phantom ones. A model looking at the picture answers this
+# immediately.
+#
+# The wording works hard on the partial case. The full stacked copies are easy
+# and were never the ones that shipped; the ones that got through were a collar
+# and a pair of shoulders fading out at the top edge, which a model will happily
+# call "one garment, slightly cropped" unless it is told that a fragment counts.
+COUNT_PROBE = """This is meant to be a product photograph of ONE garment on a
+plain background.
+
+Count the garments. Include any PARTIAL or FADED one: a second collar, neckline,
+shoulder, sleeve or cuff appearing anywhere in the frame counts as another
+garment even if it is blurred, cut off by the edge, semi-transparent, or clearly
+a duplicate of the main one. A garment overlapping or sitting behind the main
+garment still counts.
+
+Do not count the garment's own parts - its two sleeves, its neckband, its hem -
+as separate garments. One sweater with two sleeves is ONE garment.
+
+Return ONE JSON object, nothing else:
+{"garments": <integer>,
+ "extra": "<what the additional garment or fragment is and where, or empty>",
+ "why": "<one short sentence>"}"""
+
+
+def count_garments(client: Client, small: Path) -> dict:
+    """How many garments are in this frame? More than one is a hard reject.
+
+    The failure this exists for shipped in three consecutive runs - a second
+    sweater stacked above the first, or the top of one fading in - because
+    every geometric metric is computed on the largest connected blob and the
+    ghost was discarded before anything could measure it.
+    """
+    try:
+        v = parse_json_blob(client.chat(
+            [image_part(small), text_part(COUNT_PROBE)],
+            max_tokens=250, temperature=0.0))
+        n = int(v.get("garments", 1))
+    except Exception as e:  # noqa: BLE001 - a dropped probe must not reject
+        # Fails OPEN on purpose. A probe that errors is a broken server, not a
+        # broken image, and rejecting every candidate on an outage would be a
+        # worse failure than the one being prevented. It says so in the record.
+        return {"garments": 1, "ok": True, "extra": "",
+                "why": f"probe failed: {type(e).__name__}"}
+    return {"garments": n, "ok": n <= 1,
+            "extra": str(v.get("extra", ""))[:200],
+            "why": str(v.get("why", ""))[:200]}
+
+
 def face_verdict(ref_face: dict, cand_face: dict) -> dict:
     """Is this candidate showing a different face from the source?
 
@@ -515,6 +567,22 @@ REGIONS = {           # name -> (top, bottom) as a fraction of the garment bbox
 # --profile only overrides that.
 REGIONS_BY_PROFILE = {
     "leggings": REGIONS,
+    # The leggings bands, renamed for what a woven bottom carries at each
+    # height. Same numbers on purpose - see PROFILE_TERMS in common.py for the
+    # measurement that says the geometry holds. The names are not cosmetic: they
+    # are what stage 3 tells the model to look at, and "waistband" alone does
+    # not ask about a fly.
+    "loose": {"waistband/fly": (0.00, 0.22),
+              "pockets/rise": (0.18, 0.45),
+              "hems": (0.80, 1.00)},
+    # Same bands as loose - see PROFILE_TERMS in common.py for the check that
+    # says the geometry holds on a gathered waist too. The top band is renamed
+    # because what stage 3 has to catch there is different: the gathering
+    # itself, which a generation flattens into a plain band, and the frill,
+    # which it drops entirely.
+    "boyfriend": {"waistband/gathers/frill": (0.00, 0.22),
+                  "pockets/rise": (0.18, 0.45),
+                  "hems": (0.80, 1.00)},
     "bras": {"band": (0.62, 1.00), "cups/centre": (0.25, 0.68),
              "straps": (0.00, 0.30)},
     # A pullover's bands are vertical spans at FULL garment width (crop_region
@@ -525,6 +593,13 @@ REGIONS_BY_PROFILE = {
     "pullovers": {"collar/shoulders": (0.00, 0.28),
                   "chest/sleeves": (0.22, 0.62),
                   "hem/cuffs": (0.76, 1.00)},
+    # The pullover's bands, renamed for the placket. Every band names it because
+    # it runs the whole height, and it is what stage 3 has to catch here: a
+    # generation closes the front into a pullover, drifts the button spacing, or
+    # loses the buttonhole side. "chest/sleeves" never asks about any of that.
+    "cardigans": {"neckline/placket top": (0.00, 0.28),
+                  "placket/buttons/sleeves": (0.22, 0.62),
+                  "placket foot/hem/cuffs": (0.76, 1.00)},
     # Fleece gets the pullover's three bands moved to where its hardware is.
     # The top band runs deeper because a stand collar or hood is taller than a
     # crewneck and its seam would otherwise fall on the join between bands,
@@ -1162,6 +1237,7 @@ def main() -> int:
                     client, ref, r["path"], regions, ref_box, r["box"],
                     args.expected_changes)
                 r["face"] = face_verdict(ref_face, face_of(client, r["_small"]))
+                r["count"] = count_garments(client, r["_small"])
                 stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
                 r["construction_from"] = f"judged {stamp[11:]}"
                 n_judged += 1
@@ -1171,26 +1247,36 @@ def main() -> int:
                 if not any(c.get("verdict") == "ERROR" for c in r["construction"]):
                     cache[r["name"]] = {**fp, "judged_at": stamp, "model": model,
                                         "verdicts": r["construction"],
-                                        "face": r["face"]}
+                                        "face": r["face"],
+                                        "count": r["count"]}
                 else:
                     cache.pop(r["name"], None)
             else:
                 r["construction"] = hit["verdicts"]
                 r["face"] = hit.get("face") or {}
+                # Records predating the duplicate check have no count. Treat
+                # that as unknown-but-passing rather than re-probing every
+                # cached candidate.
+                r["count"] = hit.get("count") or {"garments": 1, "ok": True}
                 r["construction_from"] = f"cached {hit.get('judged_at', '')[11:]}"
                 n_reused += 1
 
             note = (f"   ({r['construction_from']})" if not fresh else "")
             bad = [c for c in r["construction"] if c.get("verdict") == "MISMATCH"]
             flip = flipped(r)
+            dup = not (r.get("count") or {}).get("ok", True)
             head = ", ".join(filter(None, [
                 f"MISMATCH in {', '.join(c['region'] for c in bad)}" if bad else "",
-                "FLIPPED - shows the other face" if flip else ""]))
+                "FLIPPED - shows the other face" if flip else "",
+                f"{r['count']['garments']} GARMENTS - not one" if dup else ""]))
             settled(f"  {r['name']:<10}  {head or 'all regions match'}{note}")
             for c in bad:
                 print(f"                -> {c['region']}: {c.get('detail','')}")
             if flip:
                 print(f"                -> face: {flip.get('differs','')}")
+            if dup:
+                print(f"                -> duplicate: "
+                      f"{r['count'].get('extra') or r['count'].get('why','')}")
         # The same images judged twice give two different answers - this model
         # scored one candidate 100 then 60 on a rescale alone - so a second pass
         # over the same batch reuses the first pass's verdict instead of rolling
@@ -1223,6 +1309,18 @@ def main() -> int:
                 print("    the profile was ASSUMED, not read. That is the first "
                       "thing to rule out.")
 
+        n_dup = sum(1 for r in rows if not (r.get("count") or {}).get("ok", True))
+        if n_dup:
+            # Same reasoning as the flip note: several at once is the prompt,
+            # not the dice. The clause that suppresses it is appended by
+            # generate.py, so a run with duplicates is worth checking against
+            # the sent prompt rather than re-rolling.
+            print(f"\n  {n_dup} of {len(rows)} candidates contain MORE THAN ONE "
+                  f"GARMENT. That is a prompt fault, not a draw-by-draw one: "
+                  f"check that archive/prompt_*.txt still carries the "
+                  f"'DRAW EXACTLY ONE GARMENT' clause, and that the source is "
+                  f"not being sent with large empty margins, which gives the "
+                  f"model somewhere to put a second copy.")
         n_flip = sum(1 for r in rows if flipped(r))
         if n_flip:
             print(f"\n  {n_flip} of {len(rows)} candidates show the OTHER FACE of "
@@ -1258,9 +1356,24 @@ def main() -> int:
         # way. It is arguably worse than any single seam - it is the wrong side
         # of the product - but it is one fault, and pricing it as one keeps the
         # arithmetic something a reader can check.
+        # A duplicate garment is priced and disqualified exactly like a flip.
+        # It is one fault and it is fatal: the deliverable is a photograph of a
+        # product, and one showing two of them is not usable at any grade. It
+        # needs its own term because nothing else sees it - every geometric
+        # metric here runs on the largest connected blob, so the second garment
+        # is discarded before it can move a number. That is why cand_04 of
+        # runs/20260827_095355 ranked SECOND with a whole extra sweater in frame.
+        dup = not (r.get("count") or {}).get("ok", True)
+        r["duplicate"] = bool(dup)
         r["flipped"] = bool(flip)
-        r["penalty"] = round(args.construction_penalty * (len(mism) + bool(flip)), 1)
+        r["penalty"] = round(
+            args.construction_penalty * (len(mism) + bool(flip) + bool(dup)), 1)
         grade = base - r["penalty"]
+        if dup:
+            notes.append(
+                f"DUPLICATE GARMENT (-{args.construction_penalty:.0f}): "
+                f"{r['count'].get('garments')} garments in frame - "
+                f"{r['count'].get('extra') or r['count'].get('why', '')}")
         if flip:
             notes.append(f"FLIPPED (-{args.construction_penalty:.0f}): "
                          f"{flip.get('differs', '')}")
@@ -1271,7 +1384,7 @@ def main() -> int:
         # One chain, so nothing can set a status and have a later branch quietly
         # set it back. A flip disqualifies exactly as an altered region does: it
         # is the wrong side of the product, whatever the grade says.
-        if mism or flip:
+        if mism or flip or dup:
             r["status"] = "REJECT"
         elif grade >= args.min_grade:
             r["status"] = "PASS"

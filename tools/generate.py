@@ -37,6 +37,35 @@ import common as C
 # separate runs.
 HARD_CAP = int(os.environ.get("LAYDOWN_MAX_IMAGES", "5"))
 
+# nano-banana-pro/edit takes a `system_prompt` alongside the scene prompt, and
+# this project was not using it. That is the channel the duplicate-garment
+# failure needed: the endpoint accepts a list of image_urls with no way to mark
+# one of them as reference rather than content, so image 1 and image 2 arrive as
+# two pictures that each contain a sweater and the model decides for itself what
+# to do with the second one. Roughly two in ten came back holding both.
+#
+# Everything tried before this was scene-prompt persuasion, and the scene prompt
+# is read as a description of the picture to make - which is why naming the
+# failure there made it worse rather than better (8 in 10 on
+# runs/20260827_110352). A system instruction is read as a standing rule about
+# the job instead, so the role of each input can be stated once, up front, in
+# the register where it belongs.
+#
+# Phrased positively throughout, for the reason recorded on the count clause
+# below: naming the thing to avoid is how a diffusion model is told to draw it.
+SYSTEM = (
+    "You are a product photography retoucher. You produce catalogue flat lays: "
+    "one garment, photographed from directly above, lying flat and square on a "
+    "plain white background. "
+    "The first input image is the product. Its construction, colour, pattern, "
+    "texture and proportions are reproduced exactly as they are. "
+    "Any further input image is a layout guide. It shows how the garment should "
+    "be arranged and it is reference material rather than content: it "
+    "contributes arrangement only, and its own subject stays out of the "
+    "picture you produce. "
+    "Every image you return is a single photograph of one garment."
+)
+
 
 # What a prompt has to say, and what it must not, with the run that paid for
 # each rule. The skill has documented these refusals for some time; until now
@@ -185,7 +214,9 @@ def main() -> int:
                          "you re-roll a specific draw, or deliberately keep one "
                          "while the prompt changes around it.")
     ap.add_argument("--resolution", default="4K", choices=["1K", "2K", "4K"])
-    ap.add_argument("--aspect-ratio", default="3:4")
+    # Shared with prepare.py, which letterboxes the source to this same shape.
+    # If they disagree the padding stops working and the ghost comes back.
+    ap.add_argument("--aspect-ratio", default=C.ASPECT)
     ap.add_argument("--max-total", type=int, default=HARD_CAP,
                     help=f"images allowed per run folder, counting everything "
                          f"already on disk. Currently {HARD_CAP}. Cannot be "
@@ -328,6 +359,24 @@ def main() -> int:
                       "or feature that is not visibly present."]
         if absent:
             block += ["", f"It specifically does NOT have: {absent}"]
+
+        # What the pre-clean used to erase before the model ever saw it. That
+        # step no longer runs - fal's object-removal endpoint is restricted -
+        # so image 1 still contains the tag, the pins and the hanger, and the
+        # only thing standing between them and the output is this sentence.
+        # Stated as objects to omit rather than as "clean the image", because
+        # a named list is the form these models act on most reliably.
+        gone = describe.removals(txt)
+        if gone:
+            block += ["",
+                      "Image 1 has NOT been retouched. These are in the photo "
+                      "but are NOT part of the garment, and none of them may "
+                      "appear in the output: " + "; ".join(gone) + ".",
+                      "Remove them completely and reconstruct the garment "
+                      "underneath - no tag, no pin, no clip, no hanger, no "
+                      "outline, shadow or gap where one used to be."]
+            print(f"prompt asks for {len(gone)} non-garment item(s) to be "
+                  f"removed: {', '.join(g[:40] for g in gone)}")
         prompt = prompt.rstrip() + "\n".join(block) + "\n"
         print(f"prompt carries construction "
               f"{'from the SPEC SHEET (authoritative)' if grounded else 'inferred from the photo (NOT-PRESENT only)'}"
@@ -341,8 +390,38 @@ def main() -> int:
     # It is appended here rather than left to the prompt the agent writes,
     # because the brief has been skipped on four separate runs and because step
     # 0 measured this - the agent is not in a position to know it.
+    # The pose half of this clause had to be made explicit and made to WIN.
+    # Saying image 2 is the lay reference is not enough on its own: the prompts
+    # the agent writes all carry "keep the garment exactly as in image 1",
+    # "untouched", "adding nothing", repeated and emphatic, and the model reads
+    # that as covering pose as well as construction. On runs/20260827_101946 the
+    # source has its sleeves angled inward with a bend at the elbow, image 2 has
+    # them straight down at the sides, and most candidates came back with the
+    # SOURCE pose - the reference was out-argued by the louder instruction.
+    #
+    # So the split is now stated as a rule with a winner named for each half:
+    # image 1 owns what the garment IS, image 2 owns how it LIES, and where they
+    # disagree about lying, image 2 wins. Without the last part the model has no
+    # way to resolve the conflict and defaults to changing the least.
     risk = reference_risk(run)
     clause = ["\n\n---",
+              # PHRASED POSITIVELY, ON PURPOSE. This clause used to spell the
+              # failure out - "no second copy, no partial copy, no collar or
+              # cuff of another garment, however faint" - and the duplicate rate
+              # went UP, from 2 in 10 on runs/20260827_101946 to 8 in 10 on
+              # runs/20260827_110352, the worst measured. Both clauses were
+              # verified present in the sent prompt, so it was not ignored.
+              #
+              # Naming the thing eight times is how a diffusion model is told to
+              # draw it. Negation is not reliably represented: the tokens that
+              # land are "second copy", "another garment", "collar", and the
+              # "no" in front of them carries far less weight than it does in
+              # conversation. So the count is now stated once, as a fact about
+              # what the frame contains, and the word for the failure never
+              # appears.
+              "The frame contains one garment, centred, surrounded by empty "
+              "white background on all sides.",
+              "",
               "IMAGE 2 IS A LAY REFERENCE ONLY. It shows how the garment should "
               "be ARRANGED - how it lies, how straps or legs are positioned, how "
               "square and symmetric the lay is. Take NOTHING else from it. Every "
@@ -350,6 +429,74 @@ def main() -> int:
               "of hardware comes from image 1 and only from image 1. If image 2 "
               "shows construction image 1 does not have, it belongs to a "
               "different product: do not reproduce it.",
+              "",
+              # Also positive, for the same reason as the count above. This
+              # named the poses to avoid - "creased, angled, arms folded or
+              # turned in" - which is a list of things to draw as far as a
+              # diffusion model is concerned. It describes the target pose only,
+              # and settles the conflict by naming which image wins rather than
+              # by describing what image 1 got wrong.
+              # DESCRIBED IN WORDS, not by pointing at image 2. The first
+              # version of this clause said "MATCH THE POSE IN IMAGE 2 ... image
+              # 2 is the authority ... follow image 2 every time", and the
+              # duplicate rate tracked it exactly: every run carrying it came in
+              # at 60-80% (runs/20260827_104532, _110352, _111218), against
+              # 20-44% on the two runs before it existed (_101946, _095355).
+              # The extra garments are reported by the grader as "faded,
+              # semi-transparent" - reference-like.
+              #
+              # That is the clause doing its job too well. Told to match image 2
+              # and that image 2 wins, the model reproduces image 2 - and image
+              # 2 contains a garment, so a second garment is drawn. The old
+              # layout-only clause below already establishes what image 2 is
+              # for; this one only needs to say what the finished lay looks
+              # like, which it can do without naming the picture at all.
+              #
+              # TRIED AND REVERTED: a sentence describing the body outline -
+              # "the body lies open and flat to its full width, each side seam
+              # pulled straight from underarm to hem so the outline down each
+              # side is one clean continuous line". It was added because this
+              # clause names the sleeves, the shoulders, the hem and the tilt
+              # but never the body, and on runs/20260827_122117 every candidate
+              # kept the SOURCE's outline, bowed out at the stomach, while the
+              # reference lies with its sides straight.
+              #
+              # It did not work and it was not free. Two runs carried it -
+              # _123706 at 7/10 duplicates and _124623 at 6/10, against 2-6 on
+              # the six runs before it - and the second of those had both
+              # suspected confounders removed (the agent's prompt no longer
+              # called image 2 "a different garment", and the sentence no longer
+              # ended on the word "mirror"), so neither of those explains the
+              # rate. Meanwhile it bought nothing measurable: mean silhouette
+              # IoU against the source over the clean candidates of the three
+              # runs on this garment went 0.849 without it, 0.813, then 0.849
+              # with it. Same outline, more ghosts.
+              #
+              # The lesson is the one already written above, and it applies to
+              # the garment as well as to image 2: every additional sentence
+              # about the garment's own body is another mention of the subject,
+              # and this model answers a repeated subject with a second copy.
+              # Straightening the stomach has to come from somewhere other than
+              # more prompt - the agent's own "must not stretch or slim it"
+              # line, and the fact that grade_flats scores silhouette against
+              # the source, both pin the shape to image 1.
+              "LAY THE GARMENT SQUARE AND FLAT. Sleeves or legs straight down "
+              "at the sides, evenly spaced and symmetric, each cuff clear of "
+              "the body. Shoulders level, hem level and parallel to the bottom "
+              "of the frame, the garment upright and centred with no rotation "
+              "or tilt. This is how the finished flat lies, whatever "
+              "arrangement the garment happens to be in when photographed.",
+              "",
+              # Keeps the scoping that fixed the folded-arm problem - "keep it
+              # unchanged" was being read as covering pose - without pointing at
+              # image 2 as something to reproduce. The re-lay is now framed as
+              # the task itself rather than as copying a picture.
+              "Any instruction above to keep the garment unchanged, untouched or "
+              "exactly as in image 1 refers to its CONSTRUCTION, COLOUR, PATTERN "
+              "and TEXTURE only. It never refers to the pose. Re-laying the "
+              "garment flat and square IS the task, so moving a sleeve, "
+              "straightening a hem or squaring the body is required, not a "
+              "change to be avoided.",
               "",
               # The flip is not a construction error and no construction clause
               # prevents it: every seam can be correct and the garment still
@@ -365,6 +512,10 @@ def main() -> int:
                    f"product in: {', '.join(risk['terms'])}. "
                    + (f"What was observed: {risk['line']} " if risk.get("line") else "")
                    + "None of that is on the product in image 1. Do not add it."]
+    # The blunt closer that used to live here - "ONE GARMENT ONLY. RETURN A
+    # SINGLE GARMENT IN THE IMAGE." - is gone with the rest of the negation. It
+    # was the last thing the model read and it repeated the subject one more
+    # time. The count is stated once, positively, above.
     prompt = prompt.rstrip() + "\n".join(clause) + "\n"
     if risk.get("flagged"):
         print(f"prompt hardened against reference bleed: "
@@ -373,6 +524,8 @@ def main() -> int:
                  if risk.get("silhouette") else ""))
     else:
         print("prompt carries the layout-only clause for image 2")
+    print("prompt makes image 2 authoritative for pose - sleeve angle, cuff "
+          "spacing, hem line and centring follow the reference, not the source")
 
     if a.dry_run:
         print(f"\n--- the full prompt as sent ({len(prompt.split())} words) "
@@ -428,14 +581,24 @@ def main() -> int:
     ph = hashlib.sha256(prompt.encode()).hexdigest()[:8]
     snap = arch / f"prompt_{ph}.txt"
     if not snap.exists():
-        snap.write_text(prompt)
+        # The system instruction is sent on every call and is not part of the
+        # scene prompt, so it is recorded here too. Without it a snapshot only
+        # accounts for half of what the model was told, and reading back a run
+        # to work out why it behaved as it did is most of what this file is for.
+        # Appended after the prompt, and NOT part of `ph`, so changing it does
+        # not silently rewrite the identity of an existing prompt.
+        snap.write_text(prompt.rstrip() + "\n\n<!-- system_prompt sent with "
+                        "every call in this run:\n" + SYSTEM + "\n-->\n")
         print(f"prompt {ph} ({len(prompt.split())} words) -> {snap.name}")
+        print(f"       + system instruction ({len(SYSTEM.split())} words): "
+              f"image 2 declared reference-not-content, one garment per image")
     else:
         print(f"prompt {ph} (unchanged)")
 
     def one(i: int):
         args = {"prompt": prompt, "image_urls": [src_url, ref_url],
                 "num_images": 1, "output_format": "png",
+                "system_prompt": SYSTEM,
                 "resolution": a.resolution, "aspect_ratio": a.aspect_ratio,
                 "seed": seeds[i]}
         for attempt in (1, 2):

@@ -3,10 +3,22 @@
 
     python tools/describe.py --run runs/<stamp>
 
-Runs a hosted vision model over the CLEANED source and writes
+Runs the self-hosted Qwen vision model over the CLEANED source and writes
 `archive/garment_description.md`. `generate.py` then appends it to every prompt
 automatically, so each draw is anchored to the same written inventory rather
 than to whatever the re-lay model infers from the pixels that pass.
+
+This step used to call Gemini through fal's `openrouter/router/vision` while
+every other vision step in the project - step 0's attribute read, grading, the
+harness's own view_image - already talked to the local server. That split was
+history, not a decision: this file was written against the hosted route and
+never revisited. It now uses the same server as the rest, so the pipeline has
+one vision model, no per-run charge and no outside dependency.
+
+The prompts below still carry the failure modes of the hosted models in their
+comments. Those are kept deliberately - they record what a VLM asked about
+garment construction gets wrong, which is a property of the task rather than of
+any one model, and they are why the audit at the bottom of this file exists.
 
 Why this exists: invented and lost construction has been the most persistent
 failure on this project - a candidate growing topstitching the product does not
@@ -26,8 +38,16 @@ import re
 from pathlib import Path
 
 import common as C
+from vision import (Client, DEFAULT_BASE_URL, DEFAULT_MODEL, ensure_small,
+                    image_part, text_part)
 
-ENDPOINT = "openrouter/router/vision"
+# The cleaned source is a 4K plate. The local server takes the image inline as
+# base64 rather than by URL, so it is downscaled first - but to 1536, not the
+# 1024 the other vision steps use. Those steps judge silhouette, colour and
+# lay, which survive a small frame; this one is asked to resolve topstitching
+# and seam finishes, and a missed stitch line here becomes a NOT-PRESENT claim
+# telling the generator to delete real construction.
+MAX_DIM = 1536
 
 # Transcription beats inference. Five attempts at getting a positive seam list
 # out of a VLM looking at a photograph all fabricated - gemini invented an
@@ -60,6 +80,18 @@ SYSTEM = ("You are a technical garment analyst writing a construction spec for "
           "back pocket unless it is genuinely visible in this frame. You never "
           "infer construction from what garments of this type usually have. You "
           "never describe the background, the framing or the lay.")
+
+# Appended when the source has not been pre-cleaned. Since the object-removal
+# endpoint went 403 every run is in this state, so the model is looking at the
+# tag, the pins and whatever the garment is hanging from. Left unsaid it writes
+# them up as construction, and a prompt built from that asks an image model to
+# keep them - which is how a run once shipped four candidates still wearing the
+# hang tag.
+DIRTY = (" This photograph has NOT been retouched. It may still show a hang "
+         "tag, price ticket, safety or straight pins, clips, a hanger, tissue "
+         "or stuffing. None of those are part of the garment. Never count them "
+         "as construction, as an applied element, or as a panel or seam - they "
+         "belong only in the TO REMOVE list.")
 
 # The candidate vocabulary is DERIVED per garment, not hardcoded. A fixed list
 # is legwear wearing a disguise: "side seam down the leg" is meaningless on a
@@ -112,7 +144,26 @@ topstitched.
 **Applied elements** - logos, labels, prints, hardware, and where. If none, say
 none.
 
-## Part 2 - NOT PRESENT
+## Part 2 - TO REMOVE
+
+Items ATTACHED TO or SITTING ON the garment that are not part of it, and must
+not appear in the final image: hang tags, swing tickets, price tickets, barcode
+or size stickers, safety pins, straight pins, clips, clamps, hangers, hanger
+hooks, tissue, stuffing, foam inserts, props, hands, mannequin parts.
+
+The test is whether it was ADDED FOR THE PHOTO. If it would still be on the
+garment in a customer's wardrobe, it is part of the garment and does NOT go on
+this list. In particular, a sewn-in woven brand label, neck label, size label or
+care label IS part of the garment - keep it, and do not list it here.
+
+Under the heading `**TO REMOVE**`, list each one you can see, with where it is,
+one per line. Write `none` if the garment is on its own - that is the normal
+answer and you should not hunt for something to list.
+
+These are NOT construction. Do not list any of them in Part 1 or Part 3, and do
+not describe them as though they were part of the garment.
+
+## Part 3 - NOT PRESENT
 
 Go through this list one item at a time and decide for each whether it is
 visible on THIS garment. Then output, under the heading `**NOT PRESENT**`, a
@@ -233,6 +284,68 @@ def _phrase_in(item: str, text: str) -> bool:
     return any(b[i:i + len(a)] == a for i in range(len(b) - len(a) + 1))
 
 
+def removals(text: str) -> list[str]:
+    """The TO REMOVE list: what is in the photo but is not the garment.
+
+    This exists because the pre-clean does not run any more - fal's
+    object-removal endpoint is restricted - so the tag, pins and hanger are
+    still in the pixels the generator is handed. Naming them explicitly is the
+    replacement: the prompt asks for them to be taken out, rather than them
+    having been erased beforehand.
+
+    Read only. Anything here is a non-garment object, never construction.
+    """
+    up = text.upper()
+    if "TO REMOVE" not in up:
+        return []
+    tail = text[up.index("TO REMOVE"):].split("\n", 1)[-1]
+    # Stops at whatever section follows, at this file's own audit comment, and
+    # at a markdown rule, so re-reading an annotated file cannot parse the
+    # annotation back in.
+    for stop in ("## Part", "**NOT PRESENT", "**UNCERTAIN", "<!--", "\n---"):
+        tail = tail.split(stop)[0]
+    out = []
+    for line in tail.splitlines():
+        item = line.strip(" .-*\t")
+        # A sewn-in label is part of the garment and stays. The prompt says so,
+        # and the model still lists it about half the time - runs/20260827_101946
+        # named "White woven size label (visible inside the back neckline)" and
+        # the prompt duly told the generator to erase it, which is the same
+        # class of damage as a false NOT-PRESENT claim. Wording did not hold at
+        # temperature 0.2, so it is enforced here instead.
+        low = item.lower()
+        if any(k in low for k in ("woven label", "woven size", "neck label",
+                                  "size label", "care label", "brand label",
+                                  "sewn-in", "sewn in", "interior label",
+                                  "inside label", "wash label")):
+            continue
+        # The model writes the section twice - once as the `## Part 2 - TO
+        # REMOVE` heading and once as the `**TO REMOVE**` marker - and the
+        # index above lands on the first. Without this the marker line itself
+        # is parsed as an item, and the prompt asks the generator to remove a
+        # thing called "TO REMOVE".
+        if _squash(item) in ("toremove", "") or item.startswith("#"):
+            continue
+        if 2 < len(item) < 120 and item.lower() not in ("none", "none.", "n/a"):
+            out.append(item)
+    return out
+
+
+def _strip_removals(head: str) -> str:
+    """Drop the TO REMOVE block out of the positive half before it is used to
+    contradict a NOT-PRESENT claim. Both sections sit above NOT PRESENT, and
+    without this a tag named in both halves reads as "Part 1 says it IS there"
+    - true of the photograph, but the garment does not have a hang tag, and the
+    reason recorded would be wrong."""
+    up = head.upper()
+    if "TO REMOVE" not in up:
+        return head
+    i = up.index("TO REMOVE")
+    rest = head[i:]
+    j = rest.find("## Part")
+    return head[:i] + (rest[j:] if j != -1 else "")
+
+
 def audit_absent(text: str, attrs: dict | None = None) -> dict:
     """Which NOT-PRESENT claims are safe to send to the generator.
 
@@ -259,8 +372,12 @@ def audit_absent(text: str, attrs: dict | None = None) -> dict:
     up = text.upper()
     if "NOT PRESENT" not in up:
         return {"present": text, "absent": [], "keep": [], "dropped": []}
-    head = text[:up.index("NOT PRESENT")]
-    tail = text[up.index("NOT PRESENT"):].split("\n", 1)[-1]
+    # rindex, not index: the model writes the section twice, as a `## Part 3 -
+    # NOT PRESENT` heading and again as the `**NOT PRESENT**` marker above the
+    # list. Taking the first put the marker line inside the list, so the first
+    # absence parsed came out as "NOT PRESENT**\nzip".
+    head = _strip_removals(text[:up.index("NOT PRESENT")])
+    tail = text[up.rindex("NOT PRESENT"):].split("\n", 1)[-1]
     # Stop at the UNCERTAIN section and at this function's own audit comment -
     # re-reading a file it has already annotated must not parse the annotation
     # back in as more claims.
@@ -292,42 +409,65 @@ def audit_absent(text: str, attrs: dict | None = None) -> dict:
     return {"present": head, "absent": items, "keep": keep, "dropped": dropped}
 
 
-def vocabulary(image: Path, model: str) -> tuple[list[str], float]:
-    """Ask what features THIS category of garment commonly has."""
-    import fal_client
-    r = fal_client.subscribe(ENDPOINT, arguments={
-        "image_urls": [fal_client.upload_file(str(image))],
-        "prompt": VOCAB_ASK, "model": model,
-        "temperature": 0.3, "max_tokens": 600}, with_logs=False)
-    out = (r.get("output") or "").strip()
-    cost = float((r.get("usage") or {}).get("cost") or 0.0)
+def _vocab_once(client: Client, image: Path) -> list[str]:
+    out = client.chat([image_part(ensure_small(image, MAX_DIM)),
+                       text_part(VOCAB_ASK)],
+                      max_tokens=600, temperature=0.3).strip()
     items = [x.strip(" .-") for x in out.replace("\n", ",").split(",")]
-    items = [x for x in items if 3 < len(x) < 70]
-    return (items or FALLBACK), cost
+    return [x for x in items if 3 < len(x) < 70]
 
 
-def describe(image: Path, model: str, vocab: list[str]) -> tuple[str, float]:
-    import fal_client
-    r = fal_client.subscribe(ENDPOINT, arguments={
-        "image_urls": [fal_client.upload_file(str(image))],
-        "prompt": ASK.format(checklist="\n".join(f"- {i}" for i in vocab)),
-        "system_prompt": SYSTEM,
-        "model": model, "temperature": 0.2, "max_tokens": 1500,
-    }, with_logs=False)
-    text = (r.get("output") or "").strip()
-    cost = float((r.get("usage") or {}).get("cost") or 0.0)
-    return text, cost
+def vocabulary(client: Client, image: Path) -> list[str]:
+    """Ask what features THIS category of garment commonly has.
+
+    The prompt asks for 30 to 40 and the local model does not reliably give
+    that. Two failures seen on real runs, in both directions: one answer parsed
+    down to 3 usable items, and another ran to 136 by degenerating into
+    variations on one word ("cup shaped, cup contoured, cup sculpted...").
+    Neither is a hard error - both return text, so `items or FALLBACK` passes
+    them straight through - and both damage the step, because the checklist
+    IS the negative inventory. Three items means almost nothing gets
+    adjudicated; 136 pads the absent list with filler for the generator to act
+    on.
+
+    So the length is checked rather than assumed: retry once, then top up from
+    the neutral fallback, and cap. A short list is the worse of the two - it
+    silently removes the half of this file that suppresses invention.
+    """
+    items = _vocab_once(client, image)
+    if len(items) < 12:
+        items = _vocab_once(client, image) or items
+    if len(items) < 12:
+        # Top up rather than replace: what the model did name is specific to
+        # this garment and worth keeping ahead of the generic list.
+        seen = {i.lower() for i in items}
+        items += [f for f in FALLBACK if f.lower() not in seen]
+    return items[:40]
 
 
-def from_bom(bom: Path, model: str) -> tuple[str, float]:
+def describe(client: Client, image: Path, vocab: list[str],
+             dirty: bool = False) -> str:
+    # Roomier than the hosted call's 1500: Part 1 plus an item-by-item verdict
+    # on 30-40 checklist entries is a long answer, and truncation lands in the
+    # NOT-PRESENT list - the half that matters. Local tokens are free, so there
+    # is no reason to run this near the edge.
+    return client.chat(
+        [image_part(ensure_small(image, MAX_DIM)),
+         text_part(ASK.format(checklist="\n".join(f"- {i}" for i in vocab)))],
+        max_tokens=2000, temperature=0.2,
+        system=SYSTEM + (DIRTY if dirty else "")).strip()
+
+
+def from_bom(client: Client, bom: Path) -> str:
     """Read the construction off the spec sheet rather than guessing it."""
-    import fal_client
-    r = fal_client.subscribe(ENDPOINT, arguments={
-        "image_urls": [fal_client.upload_file(str(bom))],
-        "prompt": BOM_ASK, "model": model,
-        "temperature": 0, "max_tokens": 1500}, with_logs=False)
-    return (r.get("output") or "").strip(), \
-        float((r.get("usage") or {}).get("cost") or 0.0)
+    # Larger than MAX_DIM: a spec sheet is dense small type and this is a
+    # transcription task, so 1536 is how a "1/4in SS" callout becomes an
+    # unreadable smudge. It still goes through ensure_small rather than in raw -
+    # the sheet is typically a PNG, image_part() labels its bytes as JPEG, and
+    # sips does the conversion that makes that label true.
+    return client.chat([image_part(ensure_small(bom, 2048)),
+                        text_part(BOM_ASK)],
+                       max_tokens=2000, temperature=0.0).strip()
 
 
 def query_attrs(run: Path) -> dict:
@@ -386,13 +526,21 @@ def main() -> int:
                     help="default <run>/archive/offset_upload.jpg, i.e. the "
                          "CLEANED source - describing the dirty original would "
                          "inventory the hang tag as construction")
-    ap.add_argument("--model", default="google/gemini-2.5-flash")
+    ap.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    ap.add_argument("--model", default=DEFAULT_MODEL,
+                    help="default: whichever model the server lists first")
+    ap.add_argument("--timeout", type=int, default=300)
     ap.add_argument("--bom", type=Path,
                     help="construction spec sheet. Defaults to "
                          "inputs/Design_BOM.png when it exists. When present it "
                          "is the AUTHORITY and the photo is not asked to supply "
                          "construction at all.")
     ap.add_argument("--out", type=Path)
+    ap.add_argument("--dirty-source", action="store_true",
+                    help="the image still has its tag, pins and hanger. Tells "
+                         "the model they are not construction and belong in "
+                         "TO REMOVE. Set by prepare.py whenever the pre-clean "
+                         "did not run, which is currently always.")
     a = ap.parse_args()
 
     run = a.run or C.session_run_dir()
@@ -401,21 +549,30 @@ def main() -> int:
         return print(f"Not found: {img}. Run prepare.py first.") or 1
     out = a.out or run / "archive" / "garment_description.md"
 
-    C.fix_ca_bundle()
-    C.load_fal_key()
+    client = Client(a.base_url, a.model, a.timeout)
+    try:
+        model = client.resolve_model()
+    except Exception as e:  # noqa: BLE001 - any failure to reach it reads alike
+        # prepare.py runs this as a subprocess and only checks whether the file
+        # appeared, so the reason has to be on stdout or it is lost.
+        print(f"cannot reach the vision server at {client.base_url}: {e}\n"
+              f"  start it, or set QWEN_BASE_URL / --base-url. Without it "
+              f"there is no construction inventory and every prompt goes out "
+              f"unanchored.")
+        return 1
 
     bom = a.bom if a.bom is not None else C.INPUTS / "Design_BOM.png"
     if bom.exists():
-        print(f"reading spec  {bom.name} via {ENDPOINT} ({a.model})  "
+        print(f"reading spec  {bom.name} via {model}  "
               f"<- AUTHORITATIVE, not inferred from the photo")
-        text, cost = from_bom(bom, a.model)
+        text = from_bom(client, bom)
         if text:
             text, orient = strip_orientation(text)
             out.write_text(f"<!-- source: {bom.name} (spec sheet, transcribed) "
                            f"-->\n\n" + text + "\n")
             words = len(text.split())
             up = text.upper()
-            print(f"              -> {out.name}  {words} words  ${cost:.4f}")
+            print(f"              -> {out.name}  {words} words")
             if "NOT PRESENT" not in up:
                 print("  WARNING: the sheet yielded no NOT-PRESENT section.")
             # A transcribed sheet is authoritative, but a transcription can
@@ -423,25 +580,37 @@ def main() -> int:
             # safe direction is the same either way: do not tell the model to
             # remove something that may be there.
             report_absent(out, text, query_attrs(run), orient)
-            C.log(run, f"construction from spec sheet, {words} words", cost * 100)
+            # Zero cents, and still logged: the run tally is also the record of
+            # which steps ran, and a step that stops charging must not stop
+            # appearing.
+            C.log(run, f"construction from spec sheet, {words} words")
             return 0
         print("  spec sheet yielded nothing; falling back to the photograph.")
 
-    print(f"describing    {img.name} via {ENDPOINT} ({a.model})  "
+    print(f"describing    {img.name} via {model}  "
           f"<- INFERRED from the photo, no spec sheet found")
-    vocab, c1 = vocabulary(img, a.model)
+    vocab = vocabulary(client, img)
     print(f"              category checklist: {len(vocab)} features derived "
           f"for this garment type")
-    text, c2 = describe(img, a.model, vocab)
-    cost = c1 + c2
+    text = describe(client, img, vocab, dirty=a.dirty_source)
     if not text:
         return print("The vision model returned nothing.") or 1
 
     text, orient = strip_orientation(text)
     out.write_text(text + "\n")
     words = len(text.split())
-    print(f"              -> {out.name}  {words} words"
-          + (f"  ${cost:.4f}" if cost else ""))
+    print(f"              -> {out.name}  {words} words")
+    rm = removals(text)
+    if rm:
+        print(f"              TO REMOVE: {len(rm)} non-garment item(s) in the "
+              f"photo - the prompt will ask for these to be taken out:")
+        for r in rm:
+            print(f"    {r[:100]}")
+    elif a.dirty_source:
+        # Worth saying. The source is known to be unretouched, so "nothing to
+        # remove" is a claim about the photograph, not a step that was skipped.
+        print("              TO REMOVE: none found - the model says the "
+              "garment is on its own in this frame.")
     up = text.upper()
     if "NOT PRESENT" not in up:
         print("  WARNING: no NOT-PRESENT section. That is the half that "
@@ -468,7 +637,7 @@ def main() -> int:
         # not sent, so the file no longer has to be fixed by hand before
         # generating - which was the previous instruction, and was never done.
         report_absent(out, text, query_attrs(run), orient)
-    C.log(run, f"described garment, {words} words", cost * 100)
+    C.log(run, f"described garment, {words} words")
     return 0
 
 
