@@ -1079,3 +1079,278 @@ def seam_energy(path: Path, mask: np.ndarray) -> float:
                             # number in the table and is not one
     e = ndimage.laplace(ndimage.gaussian_filter(a, 1))
     return float(e[inner].std())
+
+
+# --------------------------------------------------------------------------
+# Prompt guardrails
+#
+# One definition, imported by promptfile.py (for prompt_show) and generate.py
+# (for the refusal). They used to live in generate.py alone, which meant the
+# only way to discover a rule was to hit it with money on the line.
+#
+# Two tiers, and the split is deliberate:
+#
+#   PROBLEMS refuse the run. Each one is a mechanism that provably corrupts the
+#   output - not a matter of taste - and --force is the only way past.
+#
+#   WARNINGS print and generate anyway. These are judgement calls. The old
+#   pipeline refused on the word count and the must-mention list too, because
+#   the prompt was written blind in one shot and never seen again. The prompt is
+#   now sectioned and inspectable for free with prompt_show, so a short prompt is
+#   a thing the model can see and decide about rather than a wall.
+# --------------------------------------------------------------------------
+
+# Asking for transparency produces a painted checkerboard: the endpoint cannot
+# output an alpha channel, and a real run came back with a literal grey-and-white
+# checker pattern counted as 1587-3135 background specks.
+FORBID_TRANSPARENT = ("transparent", "transparency", "alpha channel",
+                      "remove the background", "background removed",
+                      "removed background", "no background")
+
+# Paperwork and fasteners: still a warning, but the reason changed.
+#
+# It is now handled by a STANDING CLAUSE that generate.py appends to every
+# prompt - "any pin, clip, tack, hanger, hook, price ticket or swing tag that was
+# holding it in place for the shot is gone", paired with "everything sewn into
+# the garment stays exactly as it is". It had to become standing because
+# segment.py drops the BACKGROUND and nothing else, so these survive into image 1
+# every time and nothing else removes them - and on runs/20260827_223611 not one
+# prompt section mentioned them, so they shipped.
+#
+# So the agent no longer needs to ask, and asking again is the risk this warning
+# now guards. Repeating a standing instruction in the agent's own words is how
+# the two end up disagreeing about what counts as a label: the clause carefully
+# separates the temporary fastening (goes) from the sewn-in label and logo
+# (stays), and a second, looser sentence about "labels" undoes that distinction.
+# Naming a thing repeatedly is also how a diffusion model is told to draw it -
+# the measured case was a prompt that described a hang tag and asked it to STAY
+# IN PLACE, and four candidates grew one that had never been sent.
+WARN_PAPERWORK = ("hang tag", "hangtag", "swing tag", "price ticket",
+                  "ticket", "barcode", "hanger", "tag", "label", "pin",
+                  "pins", "clip", "clips", "tack", "tacks")
+
+# Naming which FACE of the garment is shown is how it comes back flipped: one
+# batch opened "the garment is shown from the back" and seven of ten candidates
+# returned the reverse face, every seam correct and the garment inside out.
+#
+# The rule used to fire on the bare phrase "viewed from", which is too wide.
+# "flat lay viewed from directly above" is the correct camera for this job and
+# has nothing to do with which face is up. So a viewpoint phrase is only a
+# problem when it carries a FACE word, and the overhead vocabulary is allowed
+# outright.
+FACE_WORDS = ("back", "front", "rear", "reverse", "side", "underside",
+              "inside", "inside out", "wrong side", "three-quarter",
+              "three quarter", "behind")
+
+OVERHEAD_WORDS = ("above", "directly above", "from above", "overhead",
+                  "top-down", "top down", "birds eye", "bird's eye",
+                  "plan view", "straight down", "looking down")
+
+# The phrasings that introduce a viewpoint. Each is checked for a FACE_WORD
+# within the window that follows it.
+#
+# Every lead here is unambiguous camera language. A bare "from the" was tried and
+# removed: it turns ordinary construction wording into a refusal - "the placket
+# runs from the collar to the hem, with the front band ribbed" has "from the"
+# and "front" eleven words apart and means nothing about which face is up. A
+# false refusal is worse than a missed one, because the skill already tells the
+# model not to name a face; this is the backstop, not the instruction.
+VIEWPOINT_LEADS = ("viewed from", "shown from", "seen from", "photographed from",
+                   "shot from", "taken from", "rendered from", "captured from")
+
+# ...and the compact forms that are a viewpoint all by themselves.
+VIEWPOINT_PHRASES = ("back view", "front view", "rear view", "side view",
+                     "reverse view", "reverse side", "wrong side", "inside out",
+                     "from behind", "three-quarter view", "three quarter view",
+                     "flipped over", "turned over", "opposite side",
+                     "the other side")
+
+VIEWPOINT_WINDOW = 40      # chars after a lead in which a face word counts
+
+# Absolutes that ask for MORE than flat: they push the model past relaxing the
+# handling folds and into repainting the fabric as a smooth surface, which is
+# this project's documented redraw driver. A warning, not a refusal - the
+# wording is a judgement call, and metrics.py measures the consequence directly
+# as a wrinkle ratio that falls too far.
+SOFTEN = ("wrinkle-free", "wrinkle free", "no creases", "no wrinkles",
+          "completely smooth", "perfectly smooth", "freshly steamed",
+          "steamed and pressed", "ironed", "no fold lines", "flawless")
+
+# What a prompt is expected to say. Advisory - see the tier note above.
+MUST_MENTION = (
+    ("flatness", ("flat", "flatly", "flatness", "laid flat", "lay flat"),
+     "the model adds volume and 3D shaping unless told not to"),
+    ("wrinkles", ("wrinkle", "crease", "rumple", "fold line", "steamed",
+                  "pressed"),
+     "de-wrinkling is the job; it does not happen by default"),
+    ("the background", ("background", "backdrop", "plate", "white studio"),
+     "an unmentioned backdrop comes back grey, textured or replaced"),
+)
+
+# Checked separately from MUST_MENTION, and with WORD BOUNDARIES, because the
+# obvious way is broken. MUST_MENTION matches substrings on purpose - "flat" has
+# to catch "flatly" and "flatness" - but a substring test for the limbs matches
+# "arm" inside "garment", and every prompt in this project says "garment". The
+# guard would have been permanently satisfied and never once fired.
+#
+# It exists because the sleeve angle came out of the appended clause: that clause
+# used to state a pose for every garment, so a prompt that never mentioned
+# sleeves still got one - the wrong one, whenever the reference disagreed. Now
+# the clause is silent on the angle, and a prompt that does not name it leaves
+# the most visible thing about a laydown to chance.
+LIMB_WORDS = ("sleeve", "sleeves", "cuff", "cuffs", "arm", "arms",
+              "leg", "legs")
+
+LIMB_WHY = ("the standing clause sets symmetry and level, not the ANGLE. Read it "
+            "off image 2 and say it here - splayed wide away from the body, "
+            "angled down at 45 degrees, hanging straight at the sides - and say "
+            "how far the cuffs sit from the body. Nothing else decides it.")
+
+MIN_WORDS = 120
+
+GREYSCALE_WORDS = ("greyscale", "grayscale", "grey", "gray", "tone",
+                   "colourless", "colorless", "outline", "silhouette",
+                   "line drawing", "desaturated", "black and white")
+
+
+def _overhead_span(low: str, at: int) -> bool:
+    """Is the viewpoint starting at `at` an overhead one?
+
+    Checked before any face match so the whitelist wins outright. The window is
+    generous on purpose: "viewed from directly above the garment" puts three
+    words between the lead and the whitelist term.
+    """
+    window = low[at:at + VIEWPOINT_WINDOW]
+    return any(w in window for w in OVERHEAD_WORDS)
+
+
+def viewpoint_hits(prompt: str) -> list[str]:
+    """Face-naming viewpoint phrases in `prompt`, overhead ones excluded."""
+    low = prompt.lower()
+    hits: list[str] = []
+
+    for phrase in VIEWPOINT_PHRASES:
+        if phrase in low:
+            hits.append(phrase)
+
+    # Several leads can point at the same face word - "is shown from the back"
+    # matches both "shown from" and, on an earlier draft of this list, "from
+    # the". Report the offending spot once, keyed by where the face word sits.
+    claimed: set[int] = set()
+    for lead in VIEWPOINT_LEADS:
+        start = 0
+        while True:
+            at = low.find(lead, start)
+            if at < 0:
+                break
+            start = at + len(lead)
+            if _overhead_span(low, at):
+                continue                    # "viewed from directly above" - fine
+            window = low[at:at + VIEWPOINT_WINDOW]
+            m = next((m for f in FACE_WORDS
+                      if (m := re.search(rf"\b{re.escape(f)}\b", window))), None)
+            if m and (at + m.start()) not in claimed:
+                claimed.add(at + m.start())
+                hits.append(f"{lead} ... {m.group(0)}")
+
+    seen, out = set(), []
+    for h in hits:                          # stable order, no duplicates
+        if h not in seen:
+            seen.add(h)
+            out.append(h)
+    return out
+
+
+def check_prompt(prompt: str, reference: Path | None = None,
+                 min_words: int = MIN_WORDS) -> tuple[list[str], list[str]]:
+    """(problems, warnings). Problems refuse the run; warnings only print.
+
+    `reference` is optional: when it is a greyscale image, a prompt that never
+    says so is warned about, because read as a colour target it desaturates the
+    garment.
+    """
+    low = prompt.lower()
+    problems: list[str] = []
+    warnings: list[str] = []
+
+    # ---- problems ---------------------------------------------------------
+    hits = [w for w in FORBID_TRANSPARENT if w in low]
+    if hits:
+        problems.append(
+            f"asks for a transparent or removed background "
+            f"({', '.join(hits)}) - the endpoint cannot output an alpha channel "
+            f"and paints a checkerboard into the pixels instead. Ask for a plain "
+            f"white plate.")
+
+    hits = viewpoint_hits(prompt)
+    if hits:
+        problems.append(
+            f"names which face of the garment is shown ({', '.join(hits)}) - "
+            f"this is how it comes back flipped, and seven of ten candidates in "
+            f"one batch did. Say nothing about sides; the appended clause already "
+            f"asks for the same face as image 1. Overhead camera wording - "
+            f"'viewed from directly above', 'top-down' - is fine and is not this.")
+
+    # ---- warnings ---------------------------------------------------------
+    hits = [w for w in WARN_PAPERWORK
+            if re.search(rf"\b{re.escape(w)}\b", low)]
+    if hits:
+        warnings.append(
+            f"names paperwork or fasteners ({', '.join(hits)}) - this is already "
+            f"handled. Every prompt carries a standing clause saying that any "
+            f"pin, clip, tack, hanger, hook, ticket or swing tag holding the "
+            f"garment up is gone from the finished photograph, and that "
+            f"everything SEWN IN - seams, stitching, brand and care labels, "
+            f"embroidery, logos - stays exactly as it is. Delete your version: "
+            f"two sets of words about labels is how the sewn-in ones get removed "
+            f"along with the temporary ones. Say something here only if this "
+            f"garment has an unusual case the clause cannot know about.")
+
+    n = len(prompt.split())
+    if n < min_words:
+        warnings.append(
+            f"{n} words, under the {min_words}-word guide. Short prompts leave "
+            f"the lay, the flatness and the construction to the model's own "
+            f"judgement, which is the thing being replaced.")
+
+    for name, words, why in MUST_MENTION:
+        if not any(w in low for w in words):
+            warnings.append(f"never mentions {name} - {why}")
+
+    if not any(re.search(rf"\b{w}\b", low) for w in LIMB_WORDS):
+        warnings.append(f"never says where the sleeves or legs go - {LIMB_WHY}")
+
+    hits = [w for w in SOFTEN if w in low]
+    if hits:
+        warnings.append(
+            f"asks for absolute smoothness ({', '.join(hits)}). Relaxing handling "
+            f"folds is the job; ironing the knit out of existence is a redraw, and "
+            f"the wrinkle ratio falls just as far in that direction. Prefer "
+            f"'relax the folds so the fabric lies flat, keep the knit's real "
+            f"texture'.")
+
+    if reference is not None:
+        try:
+            greyscale = Image.open(reference).mode == "L"
+        except Exception:       # noqa: BLE001 - an unreadable reference fails later
+            greyscale = False
+        if greyscale and not any(w in low for w in GREYSCALE_WORDS):
+            warnings.append(
+                "never says image 2 is greyscale - read as a colour target it "
+                "desaturates the garment.")
+
+    return problems, warnings
+
+
+def format_findings(problems: list[str], warnings: list[str]) -> str:
+    """One rendering of check_prompt's output, so every caller reads the same."""
+    lines = []
+    if problems:
+        lines.append(f"{len(problems)} problem(s) - these refuse the run:")
+        lines += [f"  REFUSE  {p}" for p in problems]
+    if warnings:
+        lines.append(f"{len(warnings)} warning(s) - printed, not blocking:")
+        lines += [f"  warn    {w}" for w in warnings]
+    if not lines:
+        lines.append("no problems, no warnings.")
+    return "\n".join(lines)

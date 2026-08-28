@@ -28,7 +28,17 @@ fi
 # the agent cannot start a second folder to get a second helping of the image
 # budget. Set it yourself to resume an existing folder.
 export LAYDOWN_SESSION="${LAYDOWN_SESSION:-$(date +%Y%m%d_%H%M%S)}"
-export LAYDOWN_MAX_IMAGES="${LAYDOWN_MAX_IMAGES:-5}"
-echo "  session   $LAYDOWN_SESSION  (max $LAYDOWN_MAX_IMAGES images)"
+export LAYDOWN_MAX_IMAGES="${LAYDOWN_MAX_IMAGES:-10}"
+# The ceiling, not necessarily this run's budget - --max-images lowers it, and
+# the harness prints what it actually settled on a few lines later.
+echo "  session   $LAYDOWN_SESSION  (ceiling $LAYDOWN_MAX_IMAGES images)"
 
-exec "$PY" "$HERE/harness.py" "$@"
+# The skill is the operating manual and there is only one, so it does not need
+# naming on every invocation. An explicit --skill or --skill-file still wins.
+SKILL_ARGS=()
+case " $* " in
+  *" --skill "*|*" --skill-file "*) ;;
+  *) [ -f "$HERE/task/SKILL.md" ] && SKILL_ARGS=(--skill-file "$HERE/task/SKILL.md") ;;
+esac
+
+exec "$PY" "$HERE/harness.py" "${SKILL_ARGS[@]}" "$@"

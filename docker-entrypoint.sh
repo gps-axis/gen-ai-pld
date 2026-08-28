@@ -1,52 +1,52 @@
 #!/usr/bin/env bash
-# One image in, up to four re-laid flats out.
+# Two images in, one re-laid flat out.
 #
 # This exists so the host never has to know the harness's internal layout. The
-# harness insists on inputs/off_set_image.jpg next to its own source and writes
-# its picks to runs/<session>/output/, so the caller would otherwise have to
-# bind-mount over the source tree and go hunting for a timestamped folder.
-# Here the caller mounts a photo at /in and a folder at /out.
+# harness works from inputs/ next to its own source and writes to a timestamped
+# runs/<session>/ folder, so the caller would otherwise have to bind-mount over
+# the source tree and go hunting. Here the caller mounts photos at /in and a
+# folder at /out.
 #
 #   docker run --rm -v "$PWD/inputs:/in:ro" -v "$PWD/out:/out" \
 #     -v pld-cache:/app/.cache -e FAL_KEY -e QWEN_API_KEY \
 #     pld-harness /in/off_set_image.jpg
 #
+# TWO inputs are needed now: the garment photo and the reference laydown to aim
+# at. The reference used to be found by searching a 45-image library baked into
+# the image; that search is gone and the caller supplies it. By default it is
+# whatever /in/reference*.{jpg,png} matches, or name it with -e REFERENCE=... .
+#
 # Anything after the image path is passed straight to harness.py.
 #
 # Exit codes:
 #
-#    0   the run delivered what it was asked for
-#    1   the run broke
-#    2   this script was called wrong (no image, missing credential)
-#    3   fewer images than EXPECTED_PICKS - a legitimate outcome, but not the
-#        one that was asked for
-#   20   no reference: nothing in library_reference/ is close enough to this
-#        garment, so a human has to upload a hero. A verdict, not a fault.
+#    0   the run delivered
+#    1   the run broke, or had a budget and produced nothing
+#    2   this script was called wrong (no image, no reference, missing credential)
+#    3   the harness reported success but nothing reached /out
+#   20   RESERVED AND UNREACHABLE. It used to mean "no library reference is close
+#        enough to this garment, upload a hero". There is no library and no
+#        search, so nothing returns it. Kept documented rather than deleted so a
+#        caller that still branches on it keeps parsing.
+#   21   the segmenter returned an image with most of the garment missing
 set -uo pipefail
 
 PY=/app/.venv/bin/python
 IN_DIR="${IN_DIR:-/in}"
 OUT_DIR="${OUT_DIR:-/out}"
-EXPECTED_PICKS="${EXPECTED_PICKS:-4}"
 
-# harness.py's code for the hero miss, mirrored here so the two cannot drift.
-#
-# NO_REFERENCE_EXIT=0 delivers that outcome as a clean exit instead. It is for a
-# caller that reads `outcome` out of result.json and routes on it rather than on
-# the exit status - Kestra fails a task on any non-zero code, so a flow that
-# answers a hero miss by asking someone to upload one has to be told in a file.
-# The default stays 20: a shell that never opens result.json must not read a
-# miss as a run that worked.
+# Mirrored from harness.py so the two cannot drift.
 EXIT_NO_REFERENCE=20
+EXIT_UNCLEAN_SOURCE=21
 NO_REFERENCE_EXIT="${NO_REFERENCE_EXIT:-$EXIT_NO_REFERENCE}"
 
 die() { echo "entrypoint: $*" >&2; exit 2; }
 
 # --- which image are we laying out? ----------------------------------------
 #
-# An explicit path wins. With none, /in must hold exactly one image: guessing
-# between several would mean a run that silently laid out the wrong garment,
-# and the run costs real money at fal.ai.
+# An explicit path wins. With none, /in must hold exactly one candidate image:
+# guessing between several would mean silently laying out the wrong garment, and
+# the run costs real money at fal.ai.
 INPUT=""
 if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then
     INPUT="$1"
@@ -54,15 +54,15 @@ if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then
     [ -f "$INPUT" ] || die "no such image: $INPUT"
 else
     [ -d "$IN_DIR" ] || die "no image given and $IN_DIR is not mounted."
-    # maxdepth 1 keeps inputs/others/ out of it; reference_greyscale.jpg is an
-    # output of step 0, not a candidate input, and the user's inputs folder has
-    # one sitting in it from the last native run.
+    # maxdepth 1 keeps inputs/others/ out of it, and anything named reference* is
+    # the OTHER input rather than a candidate for this one.
     mapfile -t FOUND < <(find "$IN_DIR" -maxdepth 1 -type f \
         \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \
            -o -iname '*.tif' -o -iname '*.tiff' -o -iname '*.webp' \) \
-        ! -name '.*' ! -iname 'reference_greyscale.*' | sort)
+        ! -name '.*' ! -iname 'reference*' | sort)
     case ${#FOUND[@]} in
-        0) die "no image found in $IN_DIR (looked for jpg/png/tif/webp)." ;;
+        0) die "no garment image found in $IN_DIR (looked for jpg/png/tif/webp,
+  ignoring anything named reference*)." ;;
         1) INPUT="${FOUND[0]}" ;;
         *) printf 'entrypoint: %d images in %s - name the one you want:\n' \
                "${#FOUND[@]}" "$IN_DIR" >&2
@@ -71,280 +71,199 @@ else
     esac
 fi
 
-# --- gate run? --------------------------------------------------------------
+# --- and what are we laying it out LIKE? ------------------------------------
+REFERENCE="${REFERENCE:-}"
+if [ -z "$REFERENCE" ]; then
+    mapfile -t REFS < <(find "$IN_DIR" -maxdepth 1 -type f -iname 'reference*' \
+        ! -name '.*' 2>/dev/null | sort)
+    [ ${#REFS[@]} -gt 0 ] && REFERENCE="${REFS[0]}"
+fi
+[ -n "$REFERENCE" ] || die "no reference laydown.
+  Mount one at $IN_DIR/reference_greyscale.jpg, or name it with -e REFERENCE=...
+  It is the flat the garment is being laid out to match. There is no library to
+  search any more - the caller chooses it."
+[ -f "$REFERENCE" ] || die "no such reference: $REFERENCE"
+
+# --- how many images may this run buy? --------------------------------------
 #
-# --reference-only stops after step 0: it picks the reference and reports
-# whether the library could serve this garment at all, without starting the
-# agent or spending anything at fal. The delivery below has to know, or it
-# measures a run that was never going to generate against four images and
-# reports it short.
-REFERENCE_ONLY=""
-for arg in "$@"; do
-    [ "$arg" = "--reference-only" ] && REFERENCE_ONLY=1
-done
+# 0 is a legitimate and useful setting: the loop runs, the model writes a prompt,
+# generate refuses, and nothing is billed. It is how you smoke-test a deployment.
+export LAYDOWN_SESSION="${LAYDOWN_SESSION:-$(date +%Y%m%d_%H%M%S)}"
+export LAYDOWN_MAX_IMAGES="${LAYDOWN_MAX_IMAGES:-10}"
 
 # --- credentials ------------------------------------------------------------
 #
-# Checked here rather than discovered 40 turns in, when the agent finally calls
-# generate.py and the run has already spent its context.
-#
-# A gate run never reaches fal, so it is not asked for the key. That is the
-# point of running it as its own step: the cheap question gets answered without
-# the expensive credential.
-[ -n "$REFERENCE_ONLY" ] || [ -n "${FAL_KEY:-}" ] \
-    || die "FAL_KEY is not set - pass it with -e FAL_KEY."
+# Checked here rather than discovered 20 turns in, when the model finally calls
+# generate and the run has already spent its context. A zero-budget run never
+# reaches fal, so it is not asked for the key - that is the point of running one.
+if [ "$LAYDOWN_MAX_IMAGES" -gt 0 ]; then
+    [ -n "${FAL_KEY:-}" ] || die "FAL_KEY is not set - pass it with -e FAL_KEY.
+  (LAYDOWN_MAX_IMAGES=0 runs the loop without it and bills nothing.)"
+fi
 [ -n "${QWEN_API_KEY:-}" ] || die "QWEN_API_KEY is not set - pass it with -e QWEN_API_KEY.
-  Both models read it; on the host it comes from .qwen_key, which is
-  deliberately not baked into the image."
-
-# --- one run, one folder ----------------------------------------------------
-#
-# The image budget is enforced by counting images in the run folder, so the
-# stamp is set once here and inherited by every tool the agent starts.
-export LAYDOWN_SESSION="${LAYDOWN_SESSION:-$(date +%Y%m%d_%H%M%S)}"
-export LAYDOWN_MAX_IMAGES="${LAYDOWN_MAX_IMAGES:-5}"
+  It is deliberately not baked into the image."
 
 RUN_DIR="/app/runs/$LAYDOWN_SESSION"
 mkdir -p /app/inputs "$RUN_DIR" "$OUT_DIR" || die "cannot write to $OUT_DIR"
 
-# The harness reads inputs/off_set_image.jpg by name. Copy rather than symlink:
-# step 0 writes its chosen reference back into inputs/, so this directory has
-# to be writable even when the caller mounted their photos read-only.
+# Copied rather than symlinked: /in is usually mounted read-only and the harness
+# writes derived images beside these.
 cp "$INPUT" /app/inputs/off_set_image.jpg || die "could not stage $INPUT"
+# The extension is preserved because PIL opens by content but writes by suffix,
+# and the harness desaturates this file on its way into the run folder.
+REF_EXT="${REFERENCE##*.}"
+REF_STAGED="/app/inputs/reference_input.${REF_EXT:-jpg}"
+cp "$REFERENCE" "$REF_STAGED" || die "could not stage $REFERENCE"
 
 echo "  input     $INPUT"
+echo "  reference $REFERENCE"
 echo "  session   $LAYDOWN_SESSION  (max $LAYDOWN_MAX_IMAGES images)"
 echo "  text      ${QWEN_BASE_URL:-http://10.11.245.41:8091 (default)}"
-echo "  vision    ${REFMATCH_BASE_URL:-http://10.11.243.169:8080/v1 (default)}"
+echo "  segmenter ${SEGMENT_URL:-http://10.11.245.41:8780/segment (default)}"
 echo
 
-# --yolo is required, not a preference: Approver.ok() refuses every mutating
-# tool when stdin is not a TTY, so without it the agent is denied on its first
-# real step and burns the run arguing with itself.
-"$PY" /app/harness.py --skill-file /app/task/SKILL.md --yolo "$@"
+# --yolo is required, not a preference: Approver.ok() refuses every mutating tool
+# when stdin is not a TTY, so without it the model is denied on its first real
+# step and burns the run arguing with itself.
+"$PY" /app/harness.py \
+    --skill-file /app/task/SKILL.md \
+    --source /app/inputs/off_set_image.jpg \
+    --reference "$REF_STAGED" \
+    --yolo "$@"
 RC=$?
 
 # --- deliver ----------------------------------------------------------------
 #
-# Run unconditionally: a run that failed halfway still leaves useful picks and
-# always leaves the logs that explain what went wrong.
-shopt -s nullglob
-PICKS=("$RUN_DIR"/output/*.png "$RUN_DIR"/output/*.jpg)
+# Run unconditionally: a run that failed halfway still leaves a candidate worth
+# looking at, and always leaves the logs that explain what went wrong.
+DELIVER=()
+if [ -e "$RUN_DIR/output/best.png" ]; then
+    cp -p "$RUN_DIR/output/best.png" "$OUT_DIR/${OUTPUT_NAME:-best.png}"
+    DELIVER+=("${OUTPUT_NAME:-best.png}")
+fi
 
-# What actually gets delivered. Normally the picks - the agent's shortlist.
-#
-# SHIP_CANDIDATES=1 delivers every generated candidate instead, ordered picks
-# first. That exists for a caller that needs a FIXED-SIZE set: the agent is
-# free to ship three of four when the fourth is a garment the model redrew
-# rather than re-laid, and no instruction reliably overrides that - it read the
-# skill, which says fewer than four is a correct answer, and it is right to.
-#
-# Shipping all of them is only defensible because these are OPTIONS for a
-# person to choose from downstream, not a finished delivery. The grading is not
-# discarded: it becomes the order. Position 1 is the pick the agent defended
-# hardest and the last position is the one it argued against, so a reviewer
-# reading top-down sees its judgement even though nothing was withheld.
-DELIVER=("${PICKS[@]}")
+# SHIP_CANDIDATES=1 delivers every attempt beside the winner, so a reviewer can
+# see what was rejected. Named by their run-folder stems, which are stable and
+# already carry the ordering the model generated them in.
 if [ -n "${SHIP_CANDIDATES:-}" ] && [ -d "$RUN_DIR/archive" ]; then
-    mapfile -t ORDERED < <("$PY" - "$RUN_DIR" <<'PY'
-import pathlib, re, sys
-
-run = pathlib.Path(sys.argv[1])
-cands = {p.stem: p for p in sorted((run / "archive").glob("cand_*.png"))}
-
-# A pick is named pick2_cand_06.png, or pick1_best_cand_10.png for the winner,
-# so the candidate it came from is the trailing cand_NN. Recovering that is
-# what lets the picks lead the ordering without duplicating their bytes.
-ordered, seen = [], set()
-for pick in sorted((run / "output").glob("pick*")):
-    m = re.search(r"(cand_\d+)$", pick.stem)
-    if m and m.group(1) in cands and m.group(1) not in seen:
-        seen.add(m.group(1))
-        ordered.append(cands[m.group(1)])
-
-ordered += [p for stem, p in cands.items() if stem not in seen]
-for p in ordered:
-    print(p)
-PY
-    )
-    if [ ${#ORDERED[@]} -gt 0 ]; then
-        DELIVER=("${ORDERED[@]}")
-    fi
-fi
-
-if [ ${#DELIVER[@]} -gt 0 ] && [ -z "${OUTPUT_PATTERN:-}" ]; then
-    cp -p "${DELIVER[@]}" "$OUT_DIR"/
-fi
-
-# --- what happened, in one word ---------------------------------------------
-#
-# Settled here, before result.json is written, so the receipt and the exit code
-# cannot disagree. The short-delivery MESSAGE still prints at the end, next to
-# the delivery count it is talking about; only the verdict moves up.
-#
-# Neither a gate run nor a hero miss is measured against EXPECTED_PICKS. Both
-# deliver nothing on purpose, and calling that short would bury the real answer
-# under a complaint about the images it was never going to make.
-SHORT=""
-if [ -z "$REFERENCE_ONLY" ] && [ "$RC" -ne "$EXIT_NO_REFERENCE" ] \
-   && [ ${#DELIVER[@]} -lt "$EXPECTED_PICKS" ]; then
-    SHORT=1
-    [ "$RC" -eq 0 ] && RC=3
-fi
-
-case "$RC" in
-    0)  OUTCOME=ok
-        [ -n "$REFERENCE_ONLY" ] && OUTCOME=reference_selected ;;
-    "$EXIT_NO_REFERENCE") OUTCOME=no_reference ;;
-    3)  OUTCOME=short ;;
-    *)  OUTCOME=error ;;
-esac
-
-# Flat, positional names for a caller that declared its outputs up front and
-# cannot know what the files will be called - Kestra's outputFiles is the case
-# this exists for: it fails the task on a name it did not find, and the run
-# folder yields pick1_best_cand_07.png, which no one can predict.
-#
-# The original names are deliberately NOT also copied here: six files for three
-# deliverables made a working directory nobody could count, and the run folder
-# still has them under their real names.
-if [ -n "${OUTPUT_PATTERN:-}" ]; then
-    n=0
-    for p in "${DELIVER[@]}"; do
-        n=$((n + 1))
-        [ "$n" -gt "$EXPECTED_PICKS" ] && break
-        cp -p "$p" "$OUT_DIR/${OUTPUT_PATTERN//\{n\}/$n}"
+    for cand in "$RUN_DIR"/archive/cand_*.png; do
+        [ -e "$cand" ] || continue
+        cp -p "$cand" "$OUT_DIR/$(basename "$cand")"
+        DELIVER+=("$(basename "$cand")")
     done
-
-    # The prompt the run actually used. archive/prompt.txt is what the agent
-    # sent to fal; the --task string is the fallback when a run died before
-    # writing one, so the field is never empty.
-    if [ -e "$RUN_DIR/archive/prompt.txt" ]; then
-        cp -p "$RUN_DIR/archive/prompt.txt" "$OUT_DIR/used_prompt.txt"
-    else
-        printf '%s\n' "no prompt recorded - the run did not reach generate" \
-            > "$OUT_DIR/used_prompt.txt"
-    fi
 fi
 
-# --- the receipt, whatever happened -----------------------------------------
-#
-# steps.log and LOG.md flat at the top level, created empty when the run never
-# wrote them. A caller that collects files by name cannot reach into logs/, and
-# the one run that most needs explaining - the one that shipped nothing - is
-# exactly the run that produces neither file.
-for f in steps.log LOG.md; do
-    if [ -e "$RUN_DIR/$f" ]; then
-        cp -p "$RUN_DIR/$f" "$OUT_DIR/$f"
-    else
-        : > "$OUT_DIR/$f"
-    fi
-done
+# Settled before result.json is written, so the receipt and the exit code cannot
+# disagree. A harness that reported success while nothing reached /out is an
+# entrypoint-level delivery failure and has its own code.
+SHORT=""
+if [ "$RC" -eq 0 ] && [ ${#DELIVER[@]} -eq 0 ]; then
+    SHORT=1
+fi
 
-# These used to be written only under OUTPUT_PATTERN, on the reasoning that a
-# caller declaring image names is the caller that declared these too. That tied
-# the machine-readable answer to a knob about image FILENAMES, which is fine
-# until a caller wants the answer without wanting images - the hero-miss gate
-# generates nothing by design and its whole output is this file. Written every
-# run now; three small files are not worth a coupling nobody can see.
-"$PY" - "$RUN_DIR" "$OUT_DIR" "$LAYDOWN_SESSION" "${#PICKS[@]}" \
-    "$OUTCOME" "$RC" > "$OUT_DIR/result.json" <<'PY'
-import json, sys, pathlib
-run, out, session, n = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], int(sys.argv[4])
-outcome, rc = sys.argv[5], int(sys.argv[6])
-# `outcome` is the field a caller routes on, and the reason it exists is that
-# not every non-zero exit is a failure: "no_reference" means the library had
-# nothing close enough and a human has to upload a hero, which is a business
-# answer that happens to end the run. `exit_code` is kept alongside it for
-# anyone debugging the run rather than routing it.
-#
-# `picks` is the count the AGENT stood behind, which is the number worth
-# reading downstream. It is deliberately not the number of delivered files:
-# under SHIP_CANDIDATES those differ, and that gap is the useful signal - three
-# picks against four images says the last one was shipped over an objection.
-rec = {"session": session, "outcome": outcome, "exit_code": rc, "picks": n,
-       "images": sorted(p.name for p in pathlib.Path(out).glob("generated_*.png"))}
-for name, key in (("reference_selection.json", "reference"),
-                  ("archive/grade_results.json", "grades")):
-    f = run / name
-    if f.exists():
+# `status`, `attempts` and `images_used` come from the transcript rather than
+# being re-derived here: the harness already resolved them, including the
+# coercion that turns finish("done") with nothing generated into no_candidates.
+"$PY" - "$RUN_DIR" "$OUT_DIR" "$LAYDOWN_SESSION" "$RC" "$LAYDOWN_MAX_IMAGES" \
+    > "$OUT_DIR/result.json" <<'PY'
+import json, pathlib, re, sys
+
+run, out = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+session, rc, budget = sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+
+status, summary, best = None, "", None
+t = run / "transcript.jsonl"
+if t.exists():
+    for line in t.read_text().splitlines():
         try:
-            rec[key] = json.loads(f.read_text())
+            rec = json.loads(line)
         except ValueError:
-            pass
+            continue
+        if rec.get("kind") in ("finish", "end"):
+            d = rec.get("data", {})
+            d = d.get("result", d)
+            status = d.get("status", status)
+            summary = d.get("summary", summary) or summary
+            best = d.get("best") or best
+        if rec.get("kind") == "end":
+            best = rec.get("data", {}).get("shipped") or best
+
+attempts = sorted(p.stem for p in (run / "archive").glob("cand_*.png")
+                  if re.fullmatch(r"cand_\d+", p.stem))
+
+# `outcome` is the field a caller routes on; `exit_code` is for whoever is
+# debugging rather than routing. They are not the same question: "the model
+# judged nothing here shippable" is a real answer that happens to end the run.
+outcome = {
+    "done": "delivered",
+    "budget_exhausted": "delivered_at_budget",
+    "gave_up": "nothing_shippable",
+    "no_candidates": "no_candidates",
+}.get(status, "error" if rc else "delivered")
+
+rec = {
+    "session": session,
+    "outcome": outcome,
+    "exit_code": rc,
+    "status": status,
+    "summary": summary,
+    "best": best,
+    "images_used": len(attempts),
+    "budget": budget,
+    "attempts": attempts,
+    # `picks` is kept, and is 1 or 0: this pipeline delivers one image now, not a
+    # ranked four. A caller that counted picks still counts something true.
+    "picks": 1 if (out / "best.png").exists() else 0,
+    "images": sorted(p.name for p in out.glob("*.png")),
+    # Retired with the reference search and the grader. Held as null rather than
+    # dropped so a downstream parser that reads them keeps working.
+    "reference": None,
+    "grades": None,
+}
 print(json.dumps(rec, indent=2, default=str))
 PY
 
-# --- the evidence for a hero miss -------------------------------------------
-#
-# Flat at the top level, not only inside logs/, and written whatever happened.
-# These three ARE the deliverable of a run that found no reference: the receipt
-# a caller routes on, the scores behind it, and the contact sheet a person looks
-# at before deciding whether to shoot a new hero or widen the category. A
-# collector that names the files it wants cannot reach into logs/ to get them.
-#
-# reference_selection.json is created even when step 0 never ran, on the same
-# rule as steps.log and LOG.md above: declaring it must never be the reason a
-# task fails. `null` says "not asked", which is neither true nor false.
-for f in reference_selection.json match_results.json result_top_matches.jpg; do
-    [ -e "$RUN_DIR/$f" ] && cp -p "$RUN_DIR/$f" "$OUT_DIR/$f"
-done
-if [ ! -e "$OUT_DIR/reference_selection.json" ]; then
-    printf '{"match_found": null, "note": "step 0 did not run"}\n' \
-        > "$OUT_DIR/reference_selection.json"
-fi
-
 # The text artefacts are the only way to explain a run that shipped nothing, so
-# they come out even when runs/ is not mounted. All small except run.log, which
-# is the full trace and can reach a few MB on a long run - worth every byte on
-# the run someone is asking questions about, and dwarfed by one delivered PNG.
+# they come out even when runs/ is not mounted. Every copy is guarded: three of
+# the files this used to take unconditionally belonged to the reference search
+# and no longer exist, and `cp` of a missing file is a non-zero exit inside a
+# script whose whole job is to report the run's own status.
 mkdir -p "$OUT_DIR/logs"
-for f in steps.log LOG.md run.log transcript.jsonl reference_selection.json \
-         match_results.json result_top_matches.jpg; do
+for f in steps.log LOG.md run.log transcript.jsonl \
+         archive/lineage.json archive/prompt_sections.json \
+         archive/notes.json archive/best.json archive/seeds.json; do
     [ -e "$RUN_DIR/$f" ] && cp -p "$RUN_DIR/$f" "$OUT_DIR/logs/"
+done
+# The two images the run was actually about, so a reviewer never has to guess
+# what the model was looking at.
+for f in source_clean.jpg reference.jpg; do
+    [ -e "$RUN_DIR/archive/$f" ] && cp -p "$RUN_DIR/archive/$f" "$OUT_DIR/logs/"
 done
 
 echo
-if [ -n "$REFERENCE_ONLY" ]; then
-    # "delivered 0 image(s)" would be the truth and still the wrong thing to
-    # say: a gate run was never asked for images, and reporting the count it
-    # did not produce reads as a shortfall.
-    echo "  gate run  --reference-only; no images were asked for"
-else
-    echo "  delivered ${#DELIVER[@]} image(s) to $OUT_DIR"
-fi
-if [ -z "$REFERENCE_ONLY" ] && [ -n "${SHIP_CANDIDATES:-}" ]; then
-    # Say it plainly. Under SHIP_CANDIDATES the delivered count no longer means
-    # "images the agent stood behind", and a reviewer who assumes it does is
-    # being told the wrong thing by a number that used to be trustworthy.
-    echo "  of which  ${#PICKS[@]} were picked; the rest ship ranked, unfiltered"
-fi
+echo "  delivered ${#DELIVER[@]} file(s) to $OUT_DIR"
 echo "  logs      $OUT_DIR/logs"
 
-# Shipping fewer than four is a legitimate outcome - the skill says so, and
-# padding the list would be worse. But it is never the outcome you asked for,
-# so it must not exit 0 and read as success in a pipeline. (The verdict itself
-# was settled above, before result.json was written; this is the explanation.)
 if [ -n "$SHORT" ]; then
-    echo "entrypoint: expected $EXPECTED_PICKS images, got ${#DELIVER[@]}." >&2
-    echo "  See $OUT_DIR/logs/steps.log and LOG.md for what the run decided." >&2
+    echo "entrypoint: the harness exited 0 but nothing reached $OUT_DIR." >&2
+    echo "  See $OUT_DIR/logs/steps.log and result.json for what the run did." >&2
+    exit 3
 fi
 
-# The hero miss leaves by its own door. Nothing here failed: the matcher looked
-# at every garment in the library, none of them was close enough to lay this one
-# against, and that is the answer. Exiting 1 for it put a correct verdict in the
-# same list as an unreachable model server, and a failure list that fills with
-# non-failures is a list people stop reading.
+if [ "$RC" -eq "$EXIT_UNCLEAN_SOURCE" ]; then
+    echo
+    echo "  outcome   the segmenter returned an image missing most of the"
+    echo "            garment. Nothing was generated from it, on purpose."
+    echo "  look at   $OUT_DIR/logs/run.log"
+fi
+
+# Unreachable, and kept so that if it ever DOES fire the script says something
+# true rather than falling through to a bare exit code nobody can place.
 if [ "$RC" -eq "$EXIT_NO_REFERENCE" ]; then
     echo
-    echo "  outcome   no reference - the library has nothing close enough to"
-    echo "            this garment. Someone has to upload a hero for it."
-    echo "  evidence  $OUT_DIR/reference_selection.json"
-    echo "            $OUT_DIR/result_top_matches.jpg  (what came closest)"
-    if [ "$NO_REFERENCE_EXIT" -ne "$EXIT_NO_REFERENCE" ]; then
-        echo "  exit      $NO_REFERENCE_EXIT (NO_REFERENCE_EXIT); the outcome is"
-        echo "            in result.json, not in the exit status"
-    fi
+    echo "  outcome   exit 20, which this pipeline no longer produces - there is"
+    echo "            no reference search left to fail. Treat it as a bug."
     exit "$NO_REFERENCE_EXIT"
 fi
+
 exit "$RC"

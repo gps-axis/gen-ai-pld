@@ -146,8 +146,8 @@ def main() -> int:
     print(f"             -> {out.name}  {im.width}x{im.height}  "
           f"{out.stat().st_size/1e6:.1f} MB  ({why})")
     print("             background dropped to white. A hang tag, ticket, pin "
-          "or clip ON the garment is NOT removed by this step - describe.py "
-          "lists those and the prompt asks for them.")
+          "or clip ON the garment is NOT removed by this step - look at the "
+          "result, and ask for anything you can still see in the prompt.")
     C.log(run, f"segmented {a.off_set.name}, background dropped")
     return 0
 

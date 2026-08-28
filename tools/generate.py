@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """The only billed step. One call per image, run concurrently.
 
-    python tools/generate.py --run runs/<stamp> --num 5 --resolution 2K
+    python tools/generate.py --run runs/<stamp> --num 2 --resolution 2K
+    python tools/generate.py --run runs/<stamp> --num 1 --source cand_03
+    python tools/generate.py --run runs/<stamp> --dry-run     # free, prints it
 
 One image per call with its own seed, so each is an independent sample rather
 than one batch the server draws together - which is what a shortlist needs.
-Concurrency keeps the wave inside the harness's 900s bash timeout; ten serial
-generations measured ~595s on this project.
+
+`--source` is what makes iteration possible. It defaults to the segmented
+original, but it takes any candidate name, so a generation can start from an
+earlier attempt and fix one remaining defect instead of re-rolling the whole
+thing. Every candidate's parent and chain depth are recorded in lineage.json,
+because a chained edit drifts from the real garment in a way a single edit does
+not, and depth is the only cheap warning of it.
 
 Numbering continues from what is already in the folder, so topping up needs no
-arguments. `--max-total` is a hard ceiling on images per run, enforced here
-because task text is advisory and has been overridden on real runs.
+arguments. Candidates are numbered by SUBMISSION order, so cand_03 is always the
+third seed however the wave happens to land.
 
-Candidates are numbered by SUBMISSION order, so cand_03 is always the third seed
-however the wave happens to land.
+`--max-total` is a hard ceiling on images per run, enforced here because task
+text is advisory and has been overridden on real runs.
 """
 
 from __future__ import annotations
@@ -23,19 +30,25 @@ import hashlib
 import json
 import os
 import re
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 
 from PIL import Image
 
-import common as C
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import common as C  # noqa: E402
+import metrics as M  # noqa: E402
+import promptfile as P  # noqa: E402
 
 # The operator's ceiling on images per run folder. Set it here, or per run with
 # LAYDOWN_MAX_IMAGES=8 ./run.sh ...  --max-total can lower it but never raise it,
 # because the agent chooses that flag and task text has been overridden on four
 # separate runs.
-HARD_CAP = int(os.environ.get("LAYDOWN_MAX_IMAGES", "5"))
+HARD_CAP = int(os.environ.get("LAYDOWN_MAX_IMAGES", "10"))
 
 # nano-banana-pro/edit takes a `system_prompt` alongside the scene prompt, and
 # this project was not using it. That is the channel the duplicate-garment
@@ -67,343 +80,160 @@ SYSTEM = (
 )
 
 
-# What a prompt has to say, and what it must not, with the run that paid for
-# each rule. The skill has documented these refusals for some time; until now
-# nothing enforced them, which is worse than not having them - a guardrail
-# nobody can rely on still gets relied on.
-MUST_MENTION = (
-    ("flat", ("flat", "flatly", "flatness", "laid flat", "lay flat"),
-     "the model adds volume and 3D shaping unless told not to"),
-    ("wrinkles", ("wrinkle", "crease", "rumple", "fold line", "steamed",
-                  "pressed"),
-     "de-wrinkling is the job; it does not happen by default"),
-    ("background", ("background", "backdrop", "plate", "white studio"),
-     "an unmentioned backdrop comes back grey, textured or replaced"),
-)
+# --------------------------------------------------------------------------
+# Naming, lineage and the upload cache
+# --------------------------------------------------------------------------
 
-# Asking for transparency produces a painted checkerboard: the endpoint cannot
-# output an alpha channel, and a real run came back with a literal grey-and-white
-# checker pattern counted as 1587-3135 background specks. cutout.py adds real
-# transparency locally, afterwards, for free.
-FORBID_TRANSPARENT = ("transparent", "transparency", "alpha channel",
-                      "remove the background", "background removed",
-                      "removed background", "no background")
-
-# The source is pre-cleaned before the prompt is written, so there is no tag
-# left to keep or remove - and naming one invites the model to draw one. A run
-# that described the raw input's hang tag and asked that it "stay in place" got
-# four candidates that grew a tag which was not in the image sent.
-FORBID_PAPERWORK = ("hang tag", "hangtag", "swing tag", "price ticket",
-                    "ticket", "barcode", "hanger", "tag", "label")
-
-# Naming a viewpoint is how a garment comes back flipped. The describe pass
-# writes what it thinks it is looking at - "shown from the back", "two back
-# panels forming the criss-cross straps" - the agent copies it into the prompt,
-# and the model does as it is told: seven of ten candidates in one batch came
-# back showing the reverse face, every seam correct and the garment inside out.
-# The clause this script appends already fixes the face; nothing in the agent's
-# own prompt needs to mention a side at all, so any mention is a risk with no
-# upside.
-FORBID_ORIENTATION = ("shown from the back", "shown from the front",
-                      "from behind", "reverse side", "viewed from",
-                      "back view", "front view", "rear view", "inside out",
-                      "wrong side")
-
-# Absolutes that ask for MORE than flat: they push the model past relaxing the
-# handling folds and into repainting the fabric as a smooth surface, which is
-# this project's documented redraw driver. A warning, not a refusal - the
-# wording is a judgement call and the grade now measures the consequence
-# directly, scoring texture distance from the source in both directions.
-SOFTEN = ("wrinkle-free", "wrinkle free", "no creases", "no wrinkles",
-          "completely smooth", "perfectly smooth", "freshly steamed",
-          "steamed and pressed", "ironed", "no fold lines", "flawless")
+CAND_RE = re.compile(r"^cand_(\d+)$")          # generated - counts against budget
+DERIVED_RE = re.compile(r"^cand_(\d+)[sp]+$")  # segmented / polished - not a buy
 
 
-def check_prompt(prompt: str, reference: Path,
-                 min_words: int = 120) -> tuple[list[str], list[str]]:
-    """(problems, warnings). Problems refuse the run; warnings only print."""
-    low = prompt.lower()
-    out, warn = [], []
-
-    n = len(prompt.split())
-    if n < min_words:
-        out.append(f"{n} words, under the {min_words}-word floor. Short prompts "
-                   f"leave the lay, the flatness and the construction to the "
-                   f"model's own judgement, which is what is being replaced.")
-
-    for name, words, why in MUST_MENTION:
-        if not any(w in low for w in words):
-            out.append(f"never mentions {name} - {why}")
-
-    try:
-        greyscale = Image.open(reference).mode == "L"
-    except Exception:  # noqa: BLE001 - an unreadable reference fails later anyway
-        greyscale = False
-    if greyscale and not any(w in low for w in
-                             ("greyscale", "grayscale", "grey", "gray", "tone",
-                              "colourless", "colorless", "outline", "silhouette",
-                              "line drawing")):
-        out.append("never says image 2 is greyscale - read as a colour target, "
-                   "it desaturates the garment")
-
-    hits = [w for w in FORBID_TRANSPARENT if w in low]
-    if hits:
-        out.append(f"asks for a transparent or removed background "
-                   f"({', '.join(hits)}) - the model cannot output alpha and "
-                   f"paints a checkerboard into the pixels instead. Ask for a "
-                   f"plain white plate; cutout.py adds transparency afterwards.")
-
-    hits = [w for w in FORBID_PAPERWORK if re.search(rf"\b{re.escape(w)}\b", low)]
-    if hits:
-        out.append(f"mentions paperwork ({', '.join(hits)}) - the source is "
-                   f"already cleaned, so there is none to keep or remove, and "
-                   f"naming it makes the model draw one. If this garment has a "
-                   f"genuine sewn-in label that must survive, --force says so "
-                   f"deliberately.")
-
-    hits = [w for w in FORBID_ORIENTATION if w in low]
-    if hits:
-        out.append(f"names a viewpoint ({', '.join(hits)}) - this is how a "
-                   f"garment comes back flipped, and seven of ten candidates in "
-                   f"one batch did. This script already appends a clause saying "
-                   f"to show the same face as image 1; say nothing about sides "
-                   f"yourself.")
-
-    hits = [w for w in SOFTEN if w in low]
-    if hits:
-        warn.append(f"asks for absolute smoothness ({', '.join(hits)}). Relaxing "
-                    f"handling folds is the job; ironing the knit out of "
-                    f"existence is a redraw, and the grade scores texture "
-                    f"DISTANCE from the source, so an over-smoothed candidate "
-                    f"loses points in the same direction as a creased one. "
-                    f"Prefer 'relax the folds so the fabric lies flat, keep the "
-                    f"knit's real texture'.")
-    return out, warn
+def generated(arch: Path) -> list[Path]:
+    """Billed images only. cand_03s.png is a segmentation of cand_03, not a
+    second purchase, so it must never move the counter or the numbering."""
+    return sorted(p for p in arch.glob("cand_*.png") if CAND_RE.match(p.stem))
 
 
-def reference_risk(run: Path) -> dict:
-    """What step 0 found the reference carrying beyond the lay, if anything.
+def resolve_source(run: Path, name: str) -> Path:
+    """"source", a candidate name, or a path - to an actual file.
 
-    Written by select_reference.py into reference_selection.json before a penny
-    is spent. Missing or unreadable is not an error - it means step 0 did not
-    run, and the generic clause is sent on its own.
+    Names rather than paths are the interface the model sees, so it cannot land
+    a generation on something outside the run folder and orphan its lineage.
     """
-    f = Path(run) / "reference_selection.json"
+    arch = Path(run) / "archive"
+    if name in ("source", "src", "original", ""):
+        return arch / "source_clean.jpg"
+    if CAND_RE.match(name) or DERIVED_RE.match(name):
+        return arch / f"{name}.png"
+    return Path(name)
+
+
+def lineage_path(run: Path) -> Path:
+    return Path(run) / "archive" / "lineage.json"
+
+
+def load_lineage(run: Path) -> dict:
+    f = lineage_path(run)
     if not f.exists():
         return {}
     try:
-        sel = json.loads(f.read_text())
+        return json.loads(f.read_text())
     except (json.JSONDecodeError, OSError):
         return {}
-    risk = dict(sel.get("construction_risk") or {})
-    risk["silhouette"] = bool(sel.get("silhouette"))
-    return risk
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--run", type=Path, required=True)
-    ap.add_argument("--reference", type=Path, default=C.INPUTS / "reference_image.jpg")
-    ap.add_argument("-n", "--num", type=int, default=10)
-    ap.add_argument("--concurrency", type=int, default=5,
-                    help="calls in flight. Lower if fal rate-limits.")
-    ap.add_argument("--base-seed", type=int, default=1000,
-                    help="image i uses base_seed + i, recorded in seeds.json")
-    ap.add_argument("--seed", type=int,
-                    help="exact seed for this call. With --num 1 this is how "
-                         "you re-roll a specific draw, or deliberately keep one "
-                         "while the prompt changes around it.")
-    ap.add_argument("--resolution", default="4K", choices=["1K", "2K", "4K"])
-    # Shared with prepare.py, which letterboxes the source to this same shape.
-    # If they disagree the padding stops working and the ghost comes back.
-    ap.add_argument("--aspect-ratio", default=C.ASPECT)
-    ap.add_argument("--max-total", type=int, default=HARD_CAP,
-                    help=f"images allowed per run folder, counting everything "
-                         f"already on disk. Currently {HARD_CAP}. Cannot be "
-                         f"raised above LAYDOWN_MAX_IMAGES ({HARD_CAP}) - that "
-                         f"is the operator's ceiling, not the agent's.")
-    ap.add_argument("--force", action="store_true",
-                    help="generate anyway when the prompt looks incomplete")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="assemble the full prompt - yours plus the "
-                         "construction inventory and the image-2 clause this "
-                         "script appends - print it, and stop before anything "
-                         "is uploaded or billed. The only way to read what the "
-                         "model will actually receive without paying for it.")
-    ap.add_argument("--ignore-clean-gate", action="store_true",
-                    help="generate from a source the pre-clean gate REJECTED. "
-                         "This is a decision to pay for images of a garment "
-                         "that is already known to be damaged; it is recorded "
-                         "in steps.log as such.")
-    a = ap.parse_args()
+def record(run: Path, name: str, entry: dict) -> None:
+    data = load_lineage(run)
+    data[name] = entry
+    lineage_path(run).parent.mkdir(parents=True, exist_ok=True)
+    lineage_path(run).write_text(json.dumps(data, indent=2) + "\n")
 
-    run = a.run
-    arch = run / "archive"
-    src = arch / "offset_upload.jpg"
-    prompt_file = arch / "prompt.txt"
-    if not src.exists():
-        return print(f"Not found: {src}. Run prepare.py first.") or 1
-    if not prompt_file.exists():
-        return print(f"No {prompt_file}.\n"
-                     f"prepare.py does not write one - look at both images, "
-                     f"then write it yourself. See "
-                     f"{arch / 'prompt_brief.md'}.") or 1
-    if not a.reference.exists():
-        return print(f"Not found: {a.reference}") or 1
 
-    # The last free moment. Everything below this line is billed, and there is
-    # no point buying ten independent draws of a garment the pre-clean step
-    # already reported as damaged - they all inherit the damage, and every check
-    # downstream then agrees the garment always looked like that.
-    clean = C.clean_verdict(run)
-    if clean["checked"] and not clean["ok"] and not a.ignore_clean_gate:
-        print("REFUSING TO GENERATE: the pre-clean gate rejected this source.")
-        for f in clean["fails"]:
-            print(f"  - {f}")
-        print(f"  audit: {arch / 'clean_audit.json'}")
-        print("  The cleaned upload is on disk so it can be looked at, but the "
-              "garment in it is not the garment in the photograph. A run that "
-              "generated from one of these spent its whole image budget "
-              "(150c) on a source that was never usable, and the pins the "
-              "clean failed to remove then showed up as a construction "
-              "MISMATCH on all ten candidates.")
-        print("  Fix the clean - or --ignore-clean-gate to pay for it anyway, "
-              "on the record.")
-        C.log(run, f"generation REFUSED: pre-clean gate failed ({clean['fails'][0][:40]})")
-        return 1
-    if clean["checked"] and not clean["ok"]:
-        print(f"--ignore-clean-gate: generating from a source the gate rejected "
-              f"({clean['why'][:80]})")
+def depth_of(run: Path, source_name: str) -> int:
+    """How many generations away from the original source this input already is.
 
-    prompt = prompt_file.read_text()
+    Segmentation does not count: it drops a background, it does not redraw
+    anything, so a segmented candidate sits at its parent's depth. Only a fal
+    call adds a hop, because only a fal call can invent detail.
+    """
+    if source_name in ("source", "src", "original", ""):
+        return 0
+    entry = load_lineage(run).get(source_name)
+    if not entry:
+        return 0
+    return int(entry.get("depth", 0))
 
-    # Checked before the money, on the agent's own text only - the blocks
-    # appended below are this script's and are not the agent's to get wrong.
-    complaints, warnings = check_prompt(prompt, a.reference)
-    for w in warnings:
-        print(f"prompt WARNING: {w}")
-    if complaints and not a.force:
-        print(f"REFUSING TO GENERATE: {prompt_file} is not ready.")
-        for cpt in complaints:
-            print(f"  - {cpt}")
-        print(f"  Fix {prompt_file.name} and run again, or --force to send it "
-              f"as it stands. See {arch / 'prompt_brief.md'}.")
-        C.log(run, f"generation REFUSED: prompt ({len(complaints)} problem(s), "
-                   f"{complaints[0][:40]})")
-        return 1
-    if complaints:
-        print(f"--force: sending a prompt with {len(complaints)} unresolved "
-              f"problem(s)")
-        for cpt in complaints:
-            print(f"  - {cpt}")
 
-    # The construction inventory rides on EVERY prompt, automatically. It is
-    # measured from the cleaned source by a hosted vision model, and it is the
-    # anchor against invented seams - especially its NOT-PRESENT section. It is
-    # appended rather than left to the agent because instructions in this skill
-    # have been skipped on four separate runs.
-    # What gets injected depends on where the construction CAME from.
-    #
-    # From a spec sheet, both halves ship: it is authored ground truth, and its
-    # negative statements are the strongest thing available - this project's
-    # sheet says "No inseam with oval gusset", which is precisely the seam two
-    # different VLMs invented when guessing from the photograph.
-    #
-    # From the photograph, only the NOT-PRESENT half ships. The positive list is
-    # open-ended recall and fabricated on all five attempts, at both model
-    # tiers; sending it under "reproduce exactly this" is what put a topstitched
-    # seam down each leg of every candidate in a real run.
-    desc_file = arch / "garment_description.md"
-    if desc_file.exists():
-        txt = desc_file.read_text()
-        up = txt.upper()
-        grounded = "spec sheet, transcribed" in txt[:200]
+def uploads_path(run: Path) -> Path:
+    return Path(run) / "archive" / "uploads.json"
 
-        # Every NOT-PRESENT claim becomes "the garment specifically does NOT
-        # have this" in the prompt, so a false one tells an image model to
-        # delete real construction. They are audited here, at the last free
-        # moment, rather than trusted: on a real run the list named "Pearl
-        # embellishments" while the same document described four of them, and
-        # named "Racerback straps" and "Pullover style" for a garment step 0
-        # had measured as exactly those. All four were sent.
-        import describe
-        audit = describe.audit_absent(txt, describe.query_attrs(run))
-        absent = ", ".join(audit["keep"])
-        if audit["dropped"]:
-            print(f"construction inventory: {len(audit['dropped'])} "
-                  f"NOT-PRESENT claim(s) withheld as contradicted")
-            for item, why in audit["dropped"]:
-                print(f"  {item:<32} {why}")
 
-        block = ["\n\n---"]
-        if grounded and "**CONSTRUCTION**" in txt:
-            spec = txt.split("**CONSTRUCTION**", 1)[1]
-            spec = spec.split("**NOT PRESENT", 1)[0].strip()
-            # describe.py already strips these at write time; doing it again
-            # here costs nothing and covers a description written before that
-            # existed, or edited by hand since.
-            spec, dropped_orient = describe.strip_orientation(spec)
-            for s in dropped_orient:
-                print(f"  orientation claim withheld from the prompt: {s[:80]}")
-            block += [
-                "CONSTRUCTION SPEC, taken from this product's own spec sheet. "
-                "This is what the garment is genuinely built with:", "", spec, "",
-                "This lists what EXISTS on the garment, not what is visible from "
-                "this side. Reproduce only the construction you can actually see "
-                "in image 1 - do not add a seam or panel from this list that is "
-                "not visibly there."]
-        else:
-            block += ["The garment has NO construction beyond what is visible in "
-                      "image 1. Reproduce only the seams, panels and details you "
-                      "can actually see - add no seam, panel line, topstitching "
-                      "or feature that is not visibly present."]
-        if absent:
-            block += ["", f"It specifically does NOT have: {absent}"]
+def upload_cached(run: Path, path: Path, fal_client) -> str:
+    """fal URL for `path`, keyed by CONTENT hash.
 
-        # What the pre-clean used to erase before the model ever saw it. That
-        # step no longer runs - fal's object-removal endpoint is restricted -
-        # so image 1 still contains the tag, the pins and the hanger, and the
-        # only thing standing between them and the output is this sentence.
-        # Stated as objects to omit rather than as "clean the image", because
-        # a named list is the form these models act on most reliably.
-        gone = describe.removals(txt)
-        if gone:
-            block += ["",
-                      "Image 1 has NOT been retouched. These are in the photo "
-                      "but are NOT part of the garment, and none of them may "
-                      "appear in the output: " + "; ".join(gone) + ".",
-                      "Remove them completely and reconstruct the garment "
-                      "underneath - no tag, no pin, no clip, no hanger, no "
-                      "outline, shadow or gap where one used to be."]
-            print(f"prompt asks for {len(gone)} non-garment item(s) to be "
-                  f"removed: {', '.join(g[:40] for g in gone)}")
-        prompt = prompt.rstrip() + "\n".join(block) + "\n"
-        print(f"prompt carries construction "
-              f"{'from the SPEC SHEET (authoritative)' if grounded else 'inferred from the photo (NOT-PRESENT only)'}"
-              + (f"; absent: {absent[:60]}" if absent else ""))
+    Keyed by content rather than by "we already uploaded this process" because
+    the same file is now sent across many separate generate calls in one run -
+    the source goes up on every single one - and because a chained edit re-sends
+    a candidate that was itself uploaded earlier. Hashing also means a file whose
+    bytes changed uploads again instead of silently reusing a stale URL.
+    """
+    digest = C.md5(path)
+    f = uploads_path(run)
+    cache = {}
+    if f.exists():
+        try:
+            cache = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            cache = {}
+    hit = cache.get(digest)
+    if hit:
+        print(f"  {path.name}: already uploaded (content hash {digest[:8]})")
+        return hit
+    print(f"  {path.name}: uploading...")
+    try:
+        url = fal_client.upload_file(str(path))
+    except Exception as e:  # noqa: BLE001 - the model reads this, not a traceback
+        detail = str(e)
+        hint = ("FAL_KEY is not valid - check .env, or the environment the "
+                "container was started with."
+                if "401" in detail or "Unauthorized" in detail else
+                "fal.ai could not be reached. Nothing was billed.")
+        raise RuntimeError(f"upload of {path.name} failed: {hint}\n"
+                           f"  ({type(e).__name__}: {detail[:200]})") from e
+    cache[digest] = url
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(cache, indent=2) + "\n")
+    return url
 
-    # The lay reference is image 2, and the model cannot tell which parts of it
-    # are "how this should be arranged" and which are "how that other product is
-    # built". So every prompt says it, and when step 0 found the reference
-    # differing in construction terms, this names the exact words it found.
-    #
-    # It is appended here rather than left to the prompt the agent writes,
-    # because the brief has been skipped on four separate runs and because step
-    # 0 measured this - the agent is not in a position to know it.
-    # The pose half of this clause had to be made explicit and made to WIN.
-    # Saying image 2 is the lay reference is not enough on its own: the prompts
-    # the agent writes all carry "keep the garment exactly as in image 1",
-    # "untouched", "adding nothing", repeated and emphatic, and the model reads
-    # that as covering pose as well as construction. On runs/20260827_101946 the
-    # source has its sleeves angled inward with a bend at the elbow, image 2 has
-    # them straight down at the sides, and most candidates came back with the
-    # SOURCE pose - the reference was out-argued by the louder instruction.
-    #
-    # So the split is now stated as a rule with a winner named for each half:
-    # image 1 owns what the garment IS, image 2 owns how it LIES, and where they
-    # disagree about lying, image 2 wins. Without the last part the model has no
-    # way to resolve the conflict and defaults to changing the least.
-    risk = reference_risk(run)
+
+# --------------------------------------------------------------------------
+# The clause this script appends to every prompt
+# --------------------------------------------------------------------------
+
+def pose_clause() -> str:
+    """Opt-in: take the LIMB GEOMETRY off image 2 instead of describing it.
+
+    Off by default, and the reason is measured. Pointing at image 2 for pose is
+    what produced 60-80% duplicate garments on runs/20260827_104532, _110352 and
+    _111218, against 20-44% on the two runs before that clause existed. Told to
+    reproduce image 2, the model reproduces image 2, and image 2 contains a
+    garment. That is why every other pose instruction here is written in words.
+
+    But words have a ceiling, and runs/20260827_222231 found it: the agent wrote
+    "both sleeves splayed wide away from the body, angled down at roughly 30
+    degrees, cuffs well clear of the body" - which is the reference, correctly
+    described - and the generator returned the sleeves tucked in anyway. A sleeve
+    angle is a geometric fact about a picture, and describing a picture in words
+    is lossy in a way that pointing at it is not.
+
+    So this exists, opt-in, for the case where the words have already failed.
+    Three things keep the ghost risk down, and all three are deliberate:
+
+      * it names the MEASUREMENT to copy - angle to the body, cuff distance from
+        the sides, hem line - rather than "the pose", which reads as "the picture"
+      * it is one sentence. The version that cost 60-80% was three emphatic ones
+        ("image 2 is the authority ... follow image 2 every time")
+      * it closes by re-anchoring the subject to image 1, so the last thing read
+        is which garment is being drawn
+
+    A duplicate that gets through is a bad draw, not a bad prompt: change the
+    seed. That escape did not exist when this was first tried.
+    """
+    return (
+        "\n\nFor the arrangement only, read the geometry off image 2: place the "
+        "sleeves at the same angle away from the body as the sleeves in image 2, "
+        "with the cuffs the same distance out from the sides and the hem sitting "
+        "the same way. Geometry only - the garment being photographed is the one "
+        "in image 1.\n")
+
+
+def lay_clause(chained: bool) -> str:
+    """The standing rules, appended to whatever the model wrote.
+
+    Appended here rather than left to the model because every one of these was
+    paid for by a measured failure, and because instructions in the skill have
+    been skipped on four separate runs.
+    """
     clause = ["\n\n---",
               # PHRASED POSITIVELY, ON PURPOSE. This clause used to spell the
               # failure out - "no second copy, no partial copy, no collar or
@@ -436,61 +266,62 @@ def main() -> int:
               # diffusion model is concerned. It describes the target pose only,
               # and settles the conflict by naming which image wins rather than
               # by describing what image 1 got wrong.
-              # DESCRIBED IN WORDS, not by pointing at image 2. The first
-              # version of this clause said "MATCH THE POSE IN IMAGE 2 ... image
-              # 2 is the authority ... follow image 2 every time", and the
-              # duplicate rate tracked it exactly: every run carrying it came in
-              # at 60-80% (runs/20260827_104532, _110352, _111218), against
-              # 20-44% on the two runs before it existed (_101946, _095355).
-              # The extra garments are reported by the grader as "faded,
-              # semi-transparent" - reference-like.
               #
-              # That is the clause doing its job too well. Told to match image 2
-              # and that image 2 wins, the model reproduces image 2 - and image
-              # 2 contains a garment, so a second garment is drawn. The old
-              # layout-only clause below already establishes what image 2 is
-              # for; this one only needs to say what the finished lay looks
-              # like, which it can do without naming the picture at all.
+              # DESCRIBED IN WORDS, not by pointing at image 2. The first
+              # version said "MATCH THE POSE IN IMAGE 2 ... image 2 is the
+              # authority ... follow image 2 every time", and the duplicate rate
+              # tracked it exactly: every run carrying it came in at 60-80%
+              # (runs/20260827_104532, _110352, _111218), against 20-44% on the
+              # two runs before it existed (_101946, _095355). Told to match
+              # image 2 and that image 2 wins, the model reproduces image 2 -
+              # and image 2 contains a garment, so a second garment is drawn.
               #
               # TRIED AND REVERTED: a sentence describing the body outline -
               # "the body lies open and flat to its full width, each side seam
-              # pulled straight from underarm to hem so the outline down each
-              # side is one clean continuous line". It was added because this
-              # clause names the sleeves, the shoulders, the hem and the tilt
-              # but never the body, and on runs/20260827_122117 every candidate
-              # kept the SOURCE's outline, bowed out at the stomach, while the
-              # reference lies with its sides straight.
+              # pulled straight from underarm to hem". Two runs carried it,
+              # _123706 at 7/10 duplicates and _124623 at 6/10 against 2-6
+              # before, and mean silhouette IoU went 0.849 without it, 0.813,
+              # then 0.849 with it. Same outline, more ghosts. Every additional
+              # sentence about the garment's own body is another mention of the
+              # subject, and this model answers a repeated subject with a second
+              # copy.
+              # THE SLEEVE ANGLE USED TO BE HARDCODED HERE and it was wrong.
+              # This sentence read "Sleeves or legs straight down at the sides,
+              # evenly spaced and symmetric, each cuff clear of the body", which
+              # was correct for exactly as long as the reference was auto-picked
+              # from a 45-image house-style library where every laydown posed
+              # the sleeves that way.
               #
-              # It did not work and it was not free. Two runs carried it -
-              # _123706 at 7/10 duplicates and _124623 at 6/10, against 2-6 on
-              # the six runs before it - and the second of those had both
-              # suspected confounders removed (the agent's prompt no longer
-              # called image 2 "a different garment", and the sentence no longer
-              # ended on the word "mirror"), so neither of those explains the
-              # rate. Meanwhile it bought nothing measurable: mean silhouette
-              # IoU against the source over the clean candidates of the three
-              # runs on this garment went 0.849 without it, 0.813, then 0.849
-              # with it. Same outline, more ghosts.
+              # The operator now supplies the reference, and it can pose the
+              # sleeves any way it likes. On runs/20260827_215408 the reference
+              # had them splayed wide at ~35 degrees; this clause said "straight
+              # down at the sides", the agent wrote its own pose section to
+              # AGREE with the clause - "both sleeves brought in from their
+              # splayed position, close to the body" - and all eight candidates
+              # came back with the sleeves tucked in. The clause did not just
+              # lose to the reference, it talked the agent out of it.
               #
-              # The lesson is the one already written above, and it applies to
-              # the garment as well as to image 2: every additional sentence
-              # about the garment's own body is another mention of the subject,
-              # and this model answers a repeated subject with a second copy.
-              # Straightening the stomach has to come from somewhere other than
-              # more prompt - the agent's own "must not stretch or slim it"
-              # line, and the fact that grade_flats scores silhouette against
-              # the source, both pin the shape to image 1.
-              "LAY THE GARMENT SQUARE AND FLAT. Sleeves or legs straight down "
-              "at the sides, evenly spaced and symmetric, each cuff clear of "
-              "the body. Shoulders level, hem level and parallel to the bottom "
-              "of the frame, the garment upright and centred with no rotation "
-              "or tilt. This is how the finished flat lies, whatever "
-              "arrangement the garment happens to be in when photographed.",
+              # So this now carries only what is true of every laydown -
+              # symmetry, level shoulders and hem, no tilt, centred, in frame -
+              # and the sleeve and leg ANGLE belongs to the agent's own `pose`
+              # section, written from looking at image 2.
+              #
+              # It stays described IN WORDS rather than as "match image 2":
+              # pointing at image 2 for pose is what produced 60-80% duplicate
+              # garments (runs/20260827_104532, _110352, _111218) against 20-44%
+              # before it existed. Told to reproduce image 2, the model
+              # reproduces image 2, and image 2 contains a garment.
+              "LAY THE GARMENT SQUARE AND FLAT. Both sleeves arranged "
+              "symmetrically with each other, each cuff clear of the body and "
+              "clear of the hem. Shoulders level, hem level and parallel to the "
+              "bottom of the frame, the garment upright and centred with no "
+              "rotation or tilt, the whole garment inside the frame. This is how "
+              "the finished flat lies, whatever arrangement the garment happens "
+              "to be in when photographed.",
               "",
               # Keeps the scoping that fixed the folded-arm problem - "keep it
               # unchanged" was being read as covering pose - without pointing at
-              # image 2 as something to reproduce. The re-lay is now framed as
-              # the task itself rather than as copying a picture.
+              # image 2 as something to reproduce.
               "Any instruction above to keep the garment unchanged, untouched or "
               "exactly as in image 1 refers to its CONSTRUCTION, COLOUR, PATTERN "
               "and TEXTURE only. It never refers to the pose. Re-laying the "
@@ -505,160 +336,319 @@ def main() -> int:
               "Show the same face of the garment as image 1, exterior toward the "
               "camera - do not flip the garment or show its interior or reverse "
               "side. Image 2 defines only how flat and square the garment lies, "
-              "never which side faces up."]
-    if risk.get("flagged"):
+              "never which side faces up.",
+              "",
+              # STANDING, on every prompt, because it has to be and because the
+              # agent kept forgetting. Segmentation drops the BACKGROUND only -
+              # its own docstring says so - so a pin, clip, tag or hanger holding
+              # the garment up for the photograph survives into image 1 every
+              # single time. Nothing else removes it. On runs/20260827_223611 not
+              # one prompt section mentioned them and the pins duly shipped.
+              #
+              # The whole clause turns on ONE distinction, which is the thing the
+              # agent got wrong in both directions: what was holding the garment
+              # up is temporary and goes; what is sewn into the garment is the
+              # product and stays. Stated as a description of the finished
+              # photograph rather than as a list of things not to draw, because
+              # negation is what made the old tag failure worse.
+              #
+              # Asking for removal DOES work here, which is worth recording
+              # because the old skill implied the opposite: a run whose prompt
+              # named "the small pin or hook and thread loop at the top centre of
+              # the fur collar" came back with it gone. The failure that scared
+              # everyone off was a prompt asking a tag to STAY IN PLACE, which is
+              # the opposite instruction.
+              "The finished photograph shows the garment by itself. Any pin, "
+              "clip, tack, hanger, hook, price ticket or swing tag that was "
+              "holding it in place for the shot is gone, and the fabric it was "
+              "holding lies flat and closed where it used to be.",
+              "",
+              "Everything sewn into the garment stays exactly as it is and is "
+              "reproduced unchanged: every seam and stitch line, the sewn-in "
+              "brand and care labels, embroidery, appliqué, and any printed, "
+              "woven or knitted logo. Those are the product."]
+
+    if chained:
+        # NEW WITH CHAINING, AND UNMEASURED - there is no run history behind
+        # this one yet, unlike everything above it.
+        #
+        # The reasoning: on a chained edit, image 1 is no longer a photograph.
+        # It is an earlier generation, so its construction has already been
+        # through the model once and any invented detail in it now arrives
+        # labelled "the product, reproduced exactly as it is". Left unsaid, the
+        # standing rules above would ask for that invention to be preserved
+        # faithfully, and each further hop would harden it. Saying image 1 is an
+        # in-progress retouch of a real garment is the closest available framing
+        # to the truth.
         clause += ["",
-                   f"Specifically, image 2 was measured as differing from this "
-                   f"product in: {', '.join(risk['terms'])}. "
-                   + (f"What was observed: {risk['line']} " if risk.get("line") else "")
-                   + "None of that is on the product in image 1. Do not add it."]
-    # The blunt closer that used to live here - "ONE GARMENT ONLY. RETURN A
-    # SINGLE GARMENT IN THE IMAGE." - is gone with the rest of the negation. It
-    # was the last thing the model read and it repeated the subject one more
-    # time. The count is stated once, positively, above.
-    prompt = prompt.rstrip() + "\n".join(clause) + "\n"
-    if risk.get("flagged"):
-        print(f"prompt hardened against reference bleed: "
-              f"{', '.join(risk['terms'])}"
-              + ("  (reference is an outline map, so there is nothing to copy)"
-                 if risk.get("silhouette") else ""))
-    else:
-        print("prompt carries the layout-only clause for image 2")
-    print("prompt makes image 2 authoritative for pose - sleeve angle, cuff "
-          "spacing, hem line and centring follow the reference, not the source")
+                   "Image 1 is an earlier retouch of this product, not the "
+                   "original photograph. Treat it as work in progress: keep what "
+                   "is already correct, change only what the instructions above "
+                   "ask for, and where a detail looks uncertain or invented, "
+                   "render it plainly rather than elaborating on it."]
+
+    return "\n".join(clause) + "\n"
+
+
+# --------------------------------------------------------------------------
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--run", type=Path, required=True)
+    ap.add_argument("--reference", type=Path,
+                    help="default <run>/archive/reference.jpg")
+    ap.add_argument("--source", default="source",
+                    help="'source', a candidate name like cand_03, or a path")
+    ap.add_argument("-n", "--num", type=int, default=1)
+    ap.add_argument("--concurrency", type=int, default=5,
+                    help="calls in flight. Lower if fal rate-limits.")
+    ap.add_argument("--base-seed", type=int, default=1000,
+                    help="image i uses base_seed + i, recorded in seeds.json")
+    ap.add_argument("--seed", type=int, help="force one seed for every image")
+    ap.add_argument("--resolution", default="2K", choices=("1K", "2K", "4K"))
+    ap.add_argument("--aspect-ratio", default=C.ASPECT)
+    ap.add_argument("--max-total", type=int, default=HARD_CAP,
+                    help=f"images per run folder. Ceiling {HARD_CAP}; "
+                         f"this can lower it, never raise it.")
+    ap.add_argument("--match-pose", action="store_true",
+                    help="Take the sleeve angle and cuff spacing off image 2 "
+                         "instead of from the prompt's words. Use when the words "
+                         "have already failed. Raises the duplicate-garment rate "
+                         "- change the seed if one appears.")
+    ap.add_argument("--no-reference", action="store_true",
+                    help="send image 1 only, no lay reference")
+    ap.add_argument("--force", action="store_true",
+                    help="send a prompt the guardrails refused, on the record")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the assembled prompt and bill nothing")
+    a = ap.parse_args()
+
+    run = a.run
+    arch = run / "archive"
+    arch.mkdir(parents=True, exist_ok=True)
+    reference = a.reference or arch / "reference.jpg"
+
+    src = resolve_source(run, a.source)
+    if not src.exists():
+        print(f"Source not found: {src}")
+        if a.source != "source":
+            have = [p.stem for p in sorted(arch.glob("cand_*.png"))]
+            print(f"  candidates on disk: {', '.join(have) or '(none)'}")
+        return 1
+
+    use_ref = not a.no_reference
+    if use_ref and not reference.exists():
+        print(f"Reference not found: {reference}  (--no-reference sends image 1 "
+              f"alone)")
+        return 1
+
+    # ---- the prompt, and the guardrails, before any money --------------
+    prompt = P.render(run)
+    if not prompt.strip():
+        print(f"The prompt is empty. Fill it in with prompt_set, or "
+              f"tools/promptfile.py --run {run} --show to see the slots.")
+        return 1
+
+    problems, warnings = C.check_prompt(prompt, reference if use_ref else None)
+    for w in warnings:
+        print(f"prompt WARNING: {w}")
+    if problems and not a.force:
+        print(f"REFUSING TO GENERATE: the prompt is not ready.")
+        for p in problems:
+            print(f"  - {p}")
+        print("  Fix the section that carries it, or force=true to send it as "
+              "it stands.")
+        C.log(run, f"generation REFUSED: prompt ({len(problems)} problem(s), "
+                   f"{problems[0][:40]})")
+        return 1
+    if problems:
+        print(f"--force: sending a prompt with {len(problems)} unresolved "
+              f"problem(s)")
+        for p in problems:
+            print(f"  - {p}")
+
+    parent_depth = depth_of(run, a.source)
+    chained = a.source not in ("source", "src", "original", "")
+    prompt = prompt.rstrip() + lay_clause(chained)
+    if a.match_pose:
+        if not use_ref:
+            print("--match-pose needs image 2; it does nothing with "
+                  "--no-reference.")
+        else:
+            prompt = prompt.rstrip() + pose_clause()
+            print("--match-pose: the sleeve angle and cuff spacing come off "
+                  "image 2 rather than from your words.")
+            print("  This raises the odds of a SECOND garment in the frame - it "
+                  "ran 60-80% on the three runs that last pointed at image 2 for "
+                  "pose. Buy one or two, look, and change the seed if a "
+                  "duplicate turns up; the prompt is not what is wrong when it "
+                  "does.")
+
+    if chained:
+        print(f"chained edit: image 1 is {a.source} (depth {parent_depth}); the "
+              f"result will be depth {parent_depth + 1}")
+        if parent_depth >= 2:
+            print("  NOTE: two edits deep is where invented detail starts to "
+                  "harden. Measure against the ORIGINAL source, not against "
+                  f"{a.source}.")
+    print("prompt carries the layout-only clause for image 2"
+          if use_ref else "no lay reference: image 1 only")
+
+    phash = hashlib.sha256(prompt.encode()).hexdigest()[:8]
+    snap = arch / f"prompt_{phash}.txt"
+    if not snap.exists():
+        snap.write_text(f"<!-- system: {SYSTEM} -->\n\n{prompt}")
 
     if a.dry_run:
-        print(f"\n--- the full prompt as sent ({len(prompt.split())} words) "
-              f"{'-' * 30}\n")
+        print("\n" + "=" * 70)
         print(prompt)
-        print("-" * 74)
-        print("DRY RUN - nothing uploaded, nothing billed, no snapshot written.")
+        print("=" * 70)
+        print(f"\n--dry-run: nothing uploaded, nothing billed. "
+              f"Snapshot at {snap}")
         return 0
+
+    # ---- the budget -----------------------------------------------------
+    cap = min(a.max_total, HARD_CAP)
+    have = generated(arch)
+    left = cap - len(have)
+    if left <= 0:
+        print(f"REFUSING TO GENERATE: the image budget is spent - "
+              f"{len(have)}/{cap} used.")
+        print("  Everything on disk is already paid for. Pick the best of what "
+              "you have and finish.")
+        C.log(run, f"generation REFUSED: budget spent ({len(have)}/{cap})")
+        return 1
+    want = min(a.num, left)
+    if want < a.num:
+        print(f"budget: asked for {a.num}, {left} left of {cap} - generating "
+              f"{want}.")
 
     C.fix_ca_bundle()
     C.load_fal_key()
     import fal_client
     import requests
 
-    print("Uploading both inputs once, reused by every call...")
-    src_url = fal_client.upload_file(str(src))
-    ref_url = fal_client.upload_file(str(a.reference))
-
-    # Numbering continues from whatever is already here, so a top-up needs no
-    # bookkeeping. Every image is a candidate: at one resolution there is no
-    # such thing as a throwaway probe, and treating some as throwaway once
-    # discarded the three best images of a run.
-    cap = min(a.max_total, HARD_CAP)
-    if a.max_total > HARD_CAP:
-        print(f"--max-total {a.max_total} exceeds the operator ceiling of "
-              f"{HARD_CAP}; using {HARD_CAP}. Raise LAYDOWN_MAX_IMAGES to "
-              f"change it.")
-    existing = sorted(int(p.stem.split("_")[1]) for p in arch.glob("cand_*.png"))
-    have = len(existing)
-    room = cap - have
-    if room <= 0:
-        print(f"Run already holds {have} image(s), at the --max-total ceiling "
-              f"of {cap}. Measure and pick from those, or start a new "
-              f"run folder.")
+    try:
+        urls = [upload_cached(run, src, fal_client)]
+        if use_ref:
+            urls.append(upload_cached(run, reference, fal_client))
+    except RuntimeError as e:
+        print(f"REFUSING TO GENERATE: {e}")
+        C.log(run, "generation REFUSED: upload failed")
         return 1
-    n = min(a.num, room)
-    if n < a.num:
-        print(f"Asked for {a.num}, but {have} of {cap} are already "
-              f"here - generating {n}.")
 
-    start = (max(existing) + 1) if existing else 1
-    nums = list(range(start, start + n))
-    if a.seed is not None:
-        seeds = {i: a.seed + (i - start) for i in nums}
-    else:
-        seeds = {i: a.base_seed + i for i in nums}
-    name = lambda i: arch / f"cand_{i:02d}.png"
-
-    # Snapshot the prompt under its own hash. prompt.txt is a working file the
-    # agent rewrites between calls, so without this a run cannot say which
-    # wording produced which image - and answering that took reading file
-    # mtimes on a real run. Identical prompts reuse one snapshot.
-    ph = hashlib.sha256(prompt.encode()).hexdigest()[:8]
-    snap = arch / f"prompt_{ph}.txt"
-    if not snap.exists():
-        # The system instruction is sent on every call and is not part of the
-        # scene prompt, so it is recorded here too. Without it a snapshot only
-        # accounts for half of what the model was told, and reading back a run
-        # to work out why it behaved as it did is most of what this file is for.
-        # Appended after the prompt, and NOT part of `ph`, so changing it does
-        # not silently rewrite the identity of an existing prompt.
-        snap.write_text(prompt.rstrip() + "\n\n<!-- system_prompt sent with "
-                        "every call in this run:\n" + SYSTEM + "\n-->\n")
-        print(f"prompt {ph} ({len(prompt.split())} words) -> {snap.name}")
-        print(f"       + system instruction ({len(SYSTEM.split())} words): "
-              f"image 2 declared reference-not-content, one garment per image")
-    else:
-        print(f"prompt {ph} (unchanged)")
+    start = len(have)
+    # --seed sets the base for the WAVE, not one seed for every image in it.
+    # It used to be the latter, so `--seed 42 --num 2` sent seed 42 twice and
+    # bought the same picture at full price. A seed is the knob for escaping a
+    # bad draw, and the commonest way to use it is "try somewhere else, a couple
+    # at a time" - which was exactly the call that silently paid double.
+    base = a.seed if a.seed is not None else a.base_seed + start
+    seeds = [base + i for i in range(want)]
+    names = [f"cand_{start + i + 1:02d}" for i in range(want)]
 
     def one(i: int):
-        args = {"prompt": prompt, "image_urls": [src_url, ref_url],
+        args = {"prompt": prompt, "image_urls": urls,
                 "num_images": 1, "output_format": "png",
                 "system_prompt": SYSTEM,
                 "resolution": a.resolution, "aspect_ratio": a.aspect_ratio,
                 "seed": seeds[i]}
         for attempt in (1, 2):
             try:
-                r = fal_client.subscribe(C.ENDPOINT, arguments=args, with_logs=False)
+                r = fal_client.subscribe(C.ENDPOINT, arguments=args,
+                                         with_logs=False)
                 items = r.get("images", [])
                 if not items:
                     raise RuntimeError("no images returned")
                 img = Image.open(requests.get(items[0]["url"], stream=True,
                                               timeout=300).raw).convert("RGB")
                 return i, img, None
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - one bad call must not stop the wave
                 if attempt == 2:
                     return i, None, str(e)
                 time.sleep(3)
         return i, None, "unreachable"
 
-    print(f"{a.num} calls to {C.ENDPOINT} at {a.resolution} {a.aspect_ratio}, "
-          f"{a.concurrency} at a time")
-    got, t0 = [], time.time()
-    with ThreadPoolExecutor(max_workers=max(1, a.concurrency)) as pool:
-        futs = [pool.submit(one, i) for i in nums]
-        for f in as_completed(futs):
-            i, img, err = f.result()
+    print(f"generating {want} at {a.resolution} from {a.source}, prompt {phash}")
+    got, failed = [], []
+    with ThreadPoolExecutor(max_workers=a.concurrency) as pool:
+        futures = [pool.submit(one, i) for i in range(want)]
+        for fut in as_completed(futures):
+            i, img, err = fut.result()
             if err:
-                print(f"  [{i:2}] FAILED twice: {err}", flush=True)
+                failed.append((names[i], err))
+                print(f"  {names[i]}: FAILED - {err[:120]}")
                 continue
-            p = name(i)
-            img.save(p)
-            got.append(i)
-            print(f"  [{i:2}] {p.name}  {img.width}x{img.height}  "
-                  f"+{time.time()-t0:.0f}s", flush=True)
+            out = arch / f"{names[i]}.png"
+            img.save(out)
+            record(run, names[i], {
+                "parent": a.source,
+                "parent_kind": "generation" if chained else "source",
+                "depth": parent_depth + 1,
+                "prompt_hash": phash,
+                "seed": seeds[i],
+                "resolution": a.resolution,
+                "reference": str(reference) if use_ref else None,
+                "created": datetime.now().isoformat(timespec="seconds"),
+            })
+            got.append(names[i])
+            print(f"  {names[i]}: saved")
 
-    # Merge rather than overwrite: a split batch calls this twice, and the
-    # second call must not erase the first call's records.
-    #
-    # Resolution is recorded per image because it decides eligibility later. A
-    # probe generated at the SAME resolution as the final batch is a candidate
-    # in every respect - same model, same prompt, same pixels - and discarding
-    # it because of its filename threw away the three best images of a real run.
+    if not got:
+        C.log(run, f"generation produced nothing ({len(failed)} failed)")
+        return 1
+
+    # seeds.json, merged - one record per image, never overwritten wholesale
     sf = arch / "seeds.json"
-    try:
-        rec = json.loads(sf.read_text()) if sf.exists() else {}
-    except json.JSONDecodeError:
-        rec = {}
-    rec.update({name(i).stem: {"seed": seeds[i], "resolution": a.resolution,
-                               "prompt": ph} for i in sorted(got)})
-    sf.write_text(json.dumps(rec, indent=2))
+    book = {}
+    if sf.exists():
+        try:
+            book = json.loads(sf.read_text())
+        except (json.JSONDecodeError, OSError):
+            book = {}
+    for i, name in enumerate(names):
+        if name in got:
+            book[name] = {"seed": seeds[i], "resolution": a.resolution,
+                          "prompt": phash, "source": a.source}
+    sf.write_text(json.dumps(book, indent=2) + "\n")
 
     cents = len(got) * (C.PRICE_4K if a.resolution == "4K" else 0.15) * 100
-    total = have + len(got)
-    gate_note = (" FROM A SOURCE THE CLEAN GATE REJECTED"
-                 if clean["checked"] and not clean["ok"] else "")
-    print(f"\n{len(got)}/{n} in {time.time()-t0:.0f}s   "
-          f"run now holds {total}/{cap}")
-    if len(got) < n:
-        print("  WARNING: short. Do NOT re-run to top up - every image already "
-              "on disk is already billed. Measure what landed.")
-    C.log(run, f"generated {len(got)} at {a.resolution}, prompt {ph} "
-               f"({total} total){gate_note}", cents)
+    total = len(generated(arch))
+    C.log(run, f"generated {len(got)} at {a.resolution} from {a.source}, "
+               f"prompt {phash} ({total} total)", cents)
+
+    # ---- the free reading, attached to every new candidate --------------
+    # Run here rather than left to the model to ask for: the redraw is the one
+    # failure eyes miss, and a number nobody requested is a number that arrives
+    # in time to change the next decision.
+    source_clean = arch / "source_clean.jpg"
+    rows = []
+    if source_clean.exists():
+        print()
+        for name in got:
+            try:
+                m = M.compare(source_clean, arch / f"{name}.png")
+                m["depth"] = parent_depth + 1
+                rows.append(m)
+                print("  " + M.line(m, name))
+            except Exception as e:  # noqa: BLE001 - a measurement is not the delivery
+                print(f"  {name}: could not measure ({type(e).__name__}: {e})")
+    else:
+        print(f"\n  (no {source_clean.name}, so nothing to measure against)")
+
+    (arch / "last_generation.json").write_text(json.dumps({
+        "candidates": got, "failed": [n for n, _ in failed],
+        "source": a.source, "depth": parent_depth + 1,
+        "prompt_hash": phash, "resolution": a.resolution,
+        "cents": cents, "used": total, "cap": cap,
+        "metrics": rows,
+    }, indent=2) + "\n")
+
+    print(f"\n{len(got)} image(s), {cents:.1f}c. Budget {total}/{cap} used, "
+          f"{cap - total} left.")
+    if failed:
+        print(f"{len(failed)} failed and cost nothing: "
+              f"{', '.join(n for n, _ in failed)}")
     return 0
 
 

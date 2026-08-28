@@ -1,452 +1,455 @@
 ---
 name: laydown
-description: "Re-lay an off-set product photo so the garment sits square and wrinkle-free, keeping its real colour, texture and proportions. Write the prompt yourself from looking at the images, generate with fal.ai nano-banana-pro/edit, test what comes back, and deliver exactly 4 re-laid flats on a clean white plate, ranked best first."
+description: "Re-lay an off-set product photo so the garment lies flat and square like the reference laydown, keeping its real colour, texture and construction. Write the prompt yourself, generate with fal.ai, look at what comes back, and iterate until it is right or the images run out."
 ---
 
 # Laydown
 
 ## The goal
 
-Deliver **exactly 4 images** of this garment, as re-laid flats on a clean white
-plate, ranked best first.
+Image 1 is a real garment photographed off-set - pinned to a wall, creased,
+shadowed. Image 2 is what a finished ecommerce laydown looks like: square, flat,
+sleeves symmetric, clean white plate, no shadows.
 
-Cutouts are currently off. `--ship` delivers the generated flats themselves;
-pass `--cutout` if transparent-background PNGs are wanted again.
+Get image 1 to lie like image 2 **without redrawing it**. Same garment, same
+colour, same knit, same trim, same buttons, same construction. Only the pose, the
+creases and the plate change.
 
-**Always 4, even when fewer than 4 are good.** These are options a person
-chooses between downstream, not a finished delivery, and the caller needs a
-fixed-size set. So the ranking carries your judgement instead of the length:
-position 1 is the one you defend hardest, position 4 the one you would have
-withheld.
+Image 2 is a **different product**. Its collar, its trim and its tone are not
+yours. Take the lay and nothing else.
 
-That is a real cost and it is paid in `## Picking`. Every pick you would not
-have shipped on its own must be named there with the defect it carries -
-"generated_4 is cand_02, rejected for an added strap seam" - so a reviewer
-reading top-down knows where your confidence stops. A named defect is a
-warning; an unnamed one is a rubber stamp.
+## The loop
 
-## The reference is already chosen. Do not choose one.
+There is no fixed order. Every tool is available every turn.
 
-Before your first turn, the harness cleaned the source and then ran
-`tools/select_reference.py`: it scored every image in `library_reference/`
-against **the cleaned photo** - `<RUN_DIR>/archive/offset_upload.jpg`, tag
-erased and background dropped, the same image you write the prompt from - took
-the winner, desaturated it, and installed it at
+1. Look at both images. Say what actually differs - pose, creases, shadows,
+   anything still attached to the garment.
+2. Write the prompt with `prompt_set`, section by section. Check it with
+   `prompt_show`. Both free.
+3. `generate` one or two images. Look at what comes back.
+4. Decide: fix one prompt section and generate again from `source`, or take the
+   best candidate and generate from **that** to fix what is left.
+5. `pick_best` as soon as something is worth shipping. Update it as better ones
+   arrive.
+6. `finish` when it is good enough, or when the images run out.
+
+`segment` works on candidates too - a candidate that came back on a grey or
+speckled plate can be cleaned for free, and the cleaned form (`cand_03s`) is a
+name every other tool accepts.
+
+**What `segment` can and cannot rescue.** It drops the BACKGROUND: a grey plate,
+a soft shadow, specks. It does not choose between things standing on that
+background, so it cannot remove a **second garment** - measured on
+`runs/20260827_220727/archive/cand_05.png`, which came back with a duplicate
+sweater stacked behind the real one: segmenting it cleaned the plate perfectly,
+kept both sweaters, and tore a sleeve off the upper one. A duplicate is a bad
+draw, and the fix is a new seed, not a cleanup.
+
+## Look at the segmented source, never the raw photo
+
+`<RUN_DIR>/archive/source_clean.jpg` is the image fal.ai actually receives, and
+it is the one pinned as image 1 in your first message. `inputs/off_set_image.jpg`
+is the raw photo with the room, the wall and the shadow still in it.
+
+**Write the prompt from the segmented one.** Anything you describe from the raw
+file is something the generator was never sent - and describing it is how it gets
+drawn. A run wrote its prompt from the raw input, described the hang tag, asked
+that it "stay in place", and all four candidates came back wearing a tag that was
+not in the image sent. A test run of this loop reached for
+`inputs/off_set_image.jpg` on its second turn and started inspecting a thread
+loop that segmentation had already removed.
+
+The exact paths are printed in your first message. Use those.
+
+## Do not go exploring first
+
+Your first call should be `compare_images` on the two images you were given, and
+your second should be `prompt_set`.
+
+**Do not list the workspace, read previous runs, or grep the harness source.**
+None of it is an input. Three runs spent 44%, 54% and 51% of their context window
+on the source tree and old run folders before taking a single real step; one ran
+out of turns after two images with nothing picked. A zero-budget test run of this
+very loop still burned two turns on `ls runs/` and `grep budget harness.py` -
+both answers were already in its own system prompt.
+
+Everything you need is in this page, in the two images, and in `prompt_show`.
+`<script> --help` covers the rest.
+
+## The budget is the only scarce thing
+
+Images are capped for the whole run and the counter never refills. Everything
+else - looking, comparing, measuring, segmenting, rewriting the prompt - is free
+and unlimited, so there is never a reason to skip a look to save something.
+
+**Buy one or two at a time.** A batch spent in one wave cannot learn from itself.
+A run that generates all ten up front has made one decision; a run that generates
+two, looks, fixes a section, and generates two more has made three.
+
+**Separate a prompt problem from a bad draw, because the fix is different.**
+
+A **prompt problem** shows up in most or all of a batch, in the same way. Fix the
+section that governs it. Re-rolling will not help - the next draw obeys the same
+wrong instruction.
+
+A **bad draw** hits one candidate while its siblings, from the identical prompt,
+are fine. The commonest by far on this project is a **second garment in the
+frame** - a faint or stacked duplicate of the same sweater, which has run between
+2 and 8 in 10 on past batches. A stray shadow or one badly-posed sleeve can be
+the same thing. No wording fixes these; the appended clause already says the
+frame holds one garment, and saying it again makes it worse, because naming the
+thing is how a diffusion model is told to draw it.
+
+**Change the seed instead.** Same prompt plus same seed is the same picture, so a
+new seed samples somewhere else entirely:
 
 ```
-inputs/reference_greyscale.jpg
+generate(source="source", num=2, seed=500)
 ```
 
-That is the reference. There is exactly one, the inventory names it, and
-`library_reference/` is deliberately absent from the inventory because it is not
-an input - it is 45 photos of other garments. Do not go looking for it, do not
-weigh a second candidate, and do not swap the reference for one you prefer.
+The seed sets the base for the wave, so that gives you 500 and 501. Omit it and
+numbering just continues. When a batch is mostly right and one candidate is
+carrying a duplicate, a fresh seed on the *unchanged* prompt is the cheapest move
+available - you keep everything the prompt already got right.
 
-Pass it to `prepare.py` explicitly and absolutely:
+**What re-rolling will NOT fix** is a candidate the generator redrew: sending it
+back with a corrective prompt rerolls the dice on everything. One candidate
+scored badly, was re-sent with a correction, and came back worse, having added
+texture that was never there.
 
-```bash
---reference /Users/ulmarti/Desktop/PLD_Harness/inputs/reference_greyscale.jpg
+## Writing the prompt
+
+`prompt_show` lists six seeded sections and what belongs in each. Fill the ones
+that apply, add your own if the garment needs it, and edit **one section** when
+one thing is wrong - rewriting everything re-rolls every decision that was
+already right.
+
+Some standing clauses are appended automatically to every prompt: that the frame
+holds one garment, that image 2 is a lay reference only, that the lay is square
+and symmetric with the hem level, that the same face must show, and the
+pins-and-labels rule below. Do not write your own versions of these; you will be
+arguing with them.
+
+### Pins come off, sewn-in things stay - automatically
+
+Every prompt already says that any **pin, clip, tack, hanger, hook, price ticket
+or swing tag** holding the garment up for the photograph is gone from the
+finished picture, and that the fabric it was holding lies flat and closed. It
+also says that **everything sewn into the garment stays exactly as it is** -
+seams, stitch lines, sewn-in brand and care labels, embroidery, appliqué, and
+printed, woven or knitted logos.
+
+That distinction is the whole point: what was holding the garment up is
+temporary and goes, what is sewn into it is the product and stays.
+
+It is standing because it has to be. Segmentation drops the **background only**,
+so a pin or a hang tag attached to the garment survives into image 1 every time
+and nothing else removes it. On `runs/20260827_223611` not one prompt section
+mentioned them, and they shipped.
+
+**So do not write your own.** `prompt_show` warns you if you do. Two sets of
+words about "labels" is how the sewn-in ones get stripped along with the
+temporary ones, and naming a thing repeatedly is how a diffusion model is told to
+draw it - a prompt that described a hang tag and asked it to *stay in place* got
+four candidates that grew one they had never been sent. Add a sentence only for
+something genuinely unusual that the standing clause cannot know about.
+
+**And it is checked, both ways.** Your first message lists what is actually on
+the source - the fastenings that must go and the sewn-in detail that must stay -
+read off image 1 automatically. Then every candidate arrives with a **PINS AND
+LABELS** paragraph doing the same read on the result. So you can compare rather
+than guess:
+
+> SOURCE: a small pin/tack at the very top centre of the fur collar, and tiny
+> tacks at the lower hem near both side seams. The white brand label inside the
+> collar is present and intact.
+>
+> CANDIDATE: no pins, clips, tacks, hangers, tickets or string anywhere. The
+> ribbed cuffs, hem, placket and four front buttons are intact.
+
+Both halves matter. A candidate that lost the brand label or the embroidery along
+with the pins has failed the same instruction from the other side, and a clean
+garment missing its logo would otherwise read as a success. When the check says
+something is still there, or something sewn-in has gone, do not `pick_best` it.
+
+### The sleeve angle is yours, and nothing else sets it
+
+The standing clause fixes symmetry, level shoulders and a level hem. It says
+**nothing about the angle of the sleeves**, and that is deliberate: the reference
+is whatever the operator supplied, and it can pose them any way.
+
+So look at image 2 and write the angle into `pose` in your own words - splayed
+wide away from the body, angled down at roughly 45 degrees, hanging straight at
+the sides, cuffs level with the hem or above it. Be specific about how far the
+cuffs sit from the body, because that is the single most visible thing about a
+laydown and the thing a person notices first when it is wrong.
+
+**This is the most expensive mistake made on this project so far.** On
+`runs/20260827_215408` the reference had the sleeves splayed wide at about 35
+degrees. The clause used to read "sleeves straight down at the sides", the agent
+wrote its `pose` section to agree with the clause rather than with the picture -
+"both sleeves brought in from their splayed position, close to the body" - and
+all eight candidates, 120 cents' worth, came back with the sleeves tucked in.
+Everything else about them was right.
+
+If your `pose` never mentions sleeves, `prompt_show` warns you. Do not generate
+past that warning.
+
+### When the words fail: `match_pose`
+
+Words have a ceiling. On `runs/20260827_222231` the `pose` section read "both
+sleeves splayed wide away from the body, angled down at roughly 30 degrees,
+cuffs well clear of the body" - a correct description of the reference - and the
+sleeves still came back tucked in. A sleeve angle is a geometric fact about a
+picture, and describing a picture in words loses something that pointing at it
+does not.
+
+So when you have already described the pose correctly and been ignored:
+
+```
+generate(source="source", num=2, match_pose=True)
 ```
 
-The receipt is `<RUN_DIR>/reference_selection.json` - which library file was
-chosen, its score out of 100, the runner-up, a `differences` line naming what
-still differs between the off-set garment and the reference, and `query` /
-`query_cleaned` naming the image that was actually matched. If `query_cleaned`
-is `false` the match was made against the raw photo with the tag and the room
-still in it; that is worth a line in `## Notes`. **Read that
-`differences` line before writing your prompt** and quote the source filename
-and score in `## Setup`. It is the one place a real mismatch between the two
-images is written down, and the checklist behind the score has no field for
-most of what it catches.
+That takes the sleeve angle, the cuff spacing and the hem line off image 2
+directly. It composes with everything else - `source="cand_03"` sends your best
+candidate as image 1 and the reference as image 2, which is the move when the
+construction is already right and only the arms are wrong.
 
-The reference is greyscale on purpose - it is a shape and construction
-reference, never a colour target. `prepare.py` says so again in the brief.
+**It is off by default because it has a real cost.** Pointing at image 2 for pose
+is what drove the second-garment rate to 60-80% on three past runs, against
+20-44% without it: told to reproduce image 2, the model reproduces image 2, and
+image 2 contains a garment. Buy one or two, look at them, and if a duplicate
+turns up **change the seed** - the prompt is not what is wrong. Do not switch
+`match_pose` back off because a duplicate appeared; you would be trading the
+problem you fixed for the one you started with.
 
-## Start with prepare.py. Do not go exploring first.
-
-`tools/*.py` and `harness.py` are not inputs - the harness now refuses to read
-them. This page plus `--help` is all you need.
-
-**Do not list or read previous runs either.** They are not inputs and they are
-not context. Three runs spent 44%, 54% and 51% of the context window on source
-and old run folders before their first real step; one of them ran out of turns
-after two images, with nothing picked and no log.
-
-**Do not `ls` the inputs.** The workspace inventory at the top of this
-conversation already names every input file with its dimensions and an md5, and
-it is generated fresh each run. Read the filenames off it. Two runs in a row
-burned turns on `ls -la inputs/` and `ls -la inputs/others/` for names that were
-sitting in their own system prompt.
-
-Your first tool call should be `prepare.py`.
-
-## The tools
-
-Run everything from `tools/` with the project interpreter:
-
-```bash
-cd /Users/ulmarti/Desktop/PLD_Harness/tools && ../.venv/bin/python <script> ...
-```
+**Three things are refused outright**, because each has a measured failure behind
+it:
 
 | | |
 |---|---|
-| `prepare.py` | Checks the inputs, **verifies the pre-cleaned source** step 0 already produced at `archive/offset_upload.jpg` (it cleans only if step 0 did not), **inventories the construction**, and writes a prompt brief. Prints `RUN_DIR=` - carry it into everything else. Writes **no prompt**. |
-| `stage_batch.py --run R --target 4` | **How to buy images.** Generates 4, grades them free, and buys more only if fewer than 4 cleared - the shortfall, never a cushion. Stops on the target, on the image ceiling, or on a round that bought images and cleared none. On a real batch this reaches the same four picks for 5 images (75c) instead of 10 (150c). `--ship` finishes with `--ship-faithful`. |
-| `generate.py --run R --num N --resolution 2K` | The only billed step, and what `stage_batch.py` calls. $0.15 an image at 1K/2K, $0.30 at 4K. Numbering continues automatically, so topping up needs no extra arguments. **It refuses to spend on an unready prompt or a source the pre-clean gate rejected** - see `## The limits`. It appends the construction inventory and an image-2-is-layout-only clause to whatever you wrote; `--dry-run` prints the assembled prompt and bills nothing. |
-| `grade_flats.py --run R` | **Grades and picks.** Measures fidelity to the cleaned source - silhouette, colour, texture - then checks with the vision model that the generation did not redraw the garment's construction. Prints a ranking and a `KEEP` list, and writes `archive/metrics.json` and `archive/grade_results.json`. It picks its own crop regions from the garment type in `reference_selection.json` and prints the line `profile: ...` - read it. `--profile bras`, `--profile leggings`, `--profile pullovers` or `--profile fleeces` overrides that. Stage-3 verdicts are judged once and reused on later passes; `--rejudge` re-rolls one deliberately. |
-| `grade_flats.py --run R --expected-changes "..."` | Declares what the clean step legitimately removed - `"pearl-headed pins removed"` - so the judges do not report its absence as a defect. Use it whenever the cleaned source still shows paperwork, or whenever `## Results` would otherwise say every candidate altered every region. |
-| `grade_flats.py --run R --ship-faithful 4` | **The delivery command.** Ships the 4 best that stage 3 found intact, backfills by grade only if fewer than 4 are intact, and prints every exclusion and backfill with the regions each carries. Use this one. |
-| `grade_flats.py --run R --ship 4` | The blunt version: **top 4 by grade**, status ignored. Flagged regions are still printed per pick and written to `steps.log`. `--ship-clean-only` ships PASS only and ships fewer rather than backfill; `--cutout` adds transparent-background PNGs. |
-| `crop_pair.py --run R --cand NN --at REGION` | Matching 1:1 crop boxes for two images that sit differently in frame. The region names follow the garment - `straps neckline cups centre band left right` for a bra, `waistband hip crotch thigh knee hem centre left right` for legwear, `collar neckline shoulders chest body hem centre left right` for a pullover (`left`/`right` are the sleeves, cuff included), the same set for a fleece plus `hood placket pockets` (`placket` is the zip line top to hem, `pockets` the hand-pocket band), plus `top upper middle lower bottom` for any of them. Run it without `--at` and it prints the set for this run; if the garment was never identified it withholds the garment-specific names instead of guessing. Image A defaults to `<run>/archive/offset_upload.jpg`, the cleaned upload. |
-| `contact.py --run R` | Contact sheets of every candidate, cropped to the garment and sized to survive a vision call. Every crop box is checked against the source's, and a cell whose box is not credible says so rather than showing you a close-up of the wrong strip. |
-| `compare_images` | The vision tool. Two images in one call. |
+| naming which **face** is shown - "from the back", "front view", "reverse side" | one prompt opened "the garment is shown from the back" and seven of ten candidates came back inside-out, every seam correct |
+| asking for a **transparent** background | the endpoint cannot output alpha and paints a literal checkerboard into the pixels. Ask for plain white |
+| **"remove the background"** | it is already gone. Asking invites a new one |
 
-## The limits
+Overhead camera wording is fine and is not a viewpoint in this sense - "flat lay
+viewed from directly above", "top-down" all pass.
 
-- **One run means one folder, and one image budget.** `prepare.py` returns the
-  same folder every time you call it - calling it again does not start over and
-  does not reset the count. `generate.py` refuses to spend into any other
-  folder. The ceiling is set by the operator, not by you; `--max-total` can
-  lower it but never raise it. When the budget is spent, measure and pick from
-  what you have. Four candidates is the floor for a four-image delivery, so if
-  the budget ran out below that, ship what exists and say so in `## Picking` -
-  it is the one case where fewer than 4 is unavoidable rather than chosen.
-- **One prompt, written by you.** `prepare.py` leaves a brief in
-  `archive/prompt_brief.md`. Write `archive/prompt.txt` with a bash heredoc.
+**Warned, not blocked:**
 
-  **Look at `<RUN_DIR>/archive/offset_upload.jpg`, never
-  `inputs/off_set_image.jpg`.** The upload is the CLEANED image and the only one
-  the model ever receives - tag erased, background dropped, plate white. The raw
-  input still has the hang tag and a real-world background. A run wrote its
-  prompt from the raw input, described the tag, asked that it "stay in place",
-  and all four candidates grew a tag that was not in the image sent.
+- **Absolute smoothness** - "wrinkle-free", "freshly steamed", "no creases". This
+  is the redraw driver. It asks for more than flat and gets the knit repainted as
+  a smooth surface. Ask for relaxed folds with the texture kept.
+- **Naming a tag, pin, clip or label - it is already handled, so do not.** Every
+  prompt carries a standing clause covering this, and your own version fights it.
+  See below.
 
-  ```
-  compare_images(path_a="<RUN_DIR>/archive/offset_upload.jpg",
-                 path_b="<the reference named in your workspace inventory>",
-                 question="...")
-  ```
+## The three numbers
 
-  **The reference is `inputs/reference_greyscale.jpg`** - installed by step 0
-  before your first turn, and named in the workspace inventory with its md5.
-  Check the inventory rather than this page if the two ever disagree: it is
-  fingerprinted and current. A run once guessed `reference_image.jpg` from an
-  older copy of this page, found it missing, and spent two turns running `ls`
-  over `inputs/` to discover a name it had already been given. `prepare.py`
-  prints the reference it resolved - that line is authoritative.
+They arrive automatically under each new candidate. They are **advice, not a
+score** - nothing is blocked, ranked or rejected by them, and your eyes overrule
+them in both directions. They exist for the one failure eyes miss: the generator
+drawing a new garment that is already flat instead of re-laying the real one.
 
-  `generate.py` refuses a prompt under 120 words, one that never mentions
-  greyscale, flatness, wrinkles or the background, one that asks for a
-  **transparent** background (the model cannot output alpha and paints a
-  checkerboard instead - ask for plain white, `cutout.py` adds transparency
-  afterwards), and one that mentions a **tag, ticket, label, barcode or
-  hanger** at all - there is none left to keep or remove, and naming it makes
-  the model draw one. It prints every problem at once, so fixing them is one
-  turn. `--force` sends it anyway and records that it did; use it only for
-  something like a genuine sewn-in woven label that must survive.
+Always measured against the **original** source, never against a candidate's
+parent. Comparing to the parent measures one hop and calls a three-hop drift
+small.
 
-  It also refuses a prompt that **names a viewpoint** - "shown from the back",
-  "front view", "reverse side", "viewed from". That is how a garment comes back
-  flipped: one run's prompt opened "the garment is shown from the back" and
-  four of its ten candidates showed the other face, every seam correct. Say
-  nothing about sides; `generate.py` appends the clause that keeps the face
-  right.
+Measured on ten real candidates plus controls (`runs/20260827_143253`):
 
-  And it **warns** (does not refuse) on absolute smoothness - "wrinkle-free",
-  "no creases", "freshly steamed". Ask for relaxed folds and kept texture
-  instead; see clause 6 of the brief.
-- **Never re-run to top up a failed image.** Everything on disk is already
-  billed, and re-rolling one bad candidate with a tweaked prompt reliably makes
-  it worse.
-- **A source the pre-clean gate rejected is not generated from.** If step 0's
-  outline gate found part of the garment missing from the cleaned image, the
-  harness stops before your first turn (exit 21) and `generate.py` refuses to
-  spend. This is not a formality: a run whose gate reported the bottom edge of
-  the garment pulled in 16.7% carried on anyway and spent its entire 150c image
-  budget on a source that had already been rejected. If you meet the refusal,
-  look at `archive/clean_audit.json` and the cleaned image - do not reach for
-  `--ignore-clean-gate` to get past it.
+**Silhouette IoU - weak, and know why before you use it.** Its whole range is
+narrow. The same garment measured against itself across nothing but a background
+change scored **0.728**; a completely *different* garment scored **0.581**. The
+ten real candidates all landed between **0.633 and 0.661**. So a 0.02 difference
+between two candidates means nothing, and IoU cannot separate a good re-lay from
+a mediocre one. What it can do is catch a collapse: below about **0.58** you are
+not looking at the same object. Some IoU loss is correct - relaxing a folded
+sleeve genuinely changes the outline.
 
-`generate.py` appends `archive/garment_description.md` to every prompt
-automatically. **Never describe seams or panels yourself** - two vision models,
-asked what this garment has, both invented a seam down each leg, and the
-product's spec sheet says "No inseam". Your prompt needs one line saying the
-construction is reproduced exactly as specified and nothing is added.
+**Colour dE - the one that discriminates.** Under **1** is invisible, under about
+**2.5** is the same colourway, **5** is drifting, **8+** is a different colour.
+On the calibration batch the dE ordering reproduced the old pipeline's top three
+picks exactly, in order. Trust this one first.
 
-Where that inventory comes from is printed by `prepare.py` and recorded in
-`steps.log`:
+**Wrinkle ratio (candidate ÷ source) - not "lower is better".** It measures
+texture energy, and a generated image renders knit *crisper* than a soft studio
+photo, so normal candidates came back **1.25 to 1.55**, above the source rather
+than below it. Read it as a distance from 1 in either direction: far below - say
+**0.5** or less - means the knit was ironed out of existence, and far above -
+**2.0** or more - means something went wrong. The worst candidate in the batch
+sat at 2.62 with 438 background specks and dE 8.6; all three numbers agreed.
 
-- **`inputs/Design_BOM.png` present** - transcribed from the spec sheet, both
-  halves sent, authoritative. This is what you want.
-- **absent** - inferred from the photo, and only the NOT-PRESENT half is sent.
-  The positive half fabricated on all five attempts across two model tiers.
+**Specks** is a good tiebreaker when two candidates look alike: the cleanest of
+the ten had 27, the worst 438.
 
-**The NOT-PRESENT half is audited before it is sent, and you should read what
-it dropped.** Every item on that list becomes "the garment specifically does NOT
-have this" in the prompt, so a false one tells the model to delete real
-construction. A claim is withheld when the description's own Part 1 says the
-thing IS there, when step 0 measured an attribute that says it is there, or
-when no photograph could show it either way. On a real run that withheld
-`Pearl embellishments` (Part 1 described four of them), `Side seams` (Part 1
-located the pearls on them), and `Racerback straps` and `Pullover style` for a
-garment step 0 had measured as exactly those - all four had been sent.
-`describe.py` and `generate.py` both print the drops with reasons, and the
-description file carries them in a comment.
+## The lay check - read it, it is the one that catches the pose
 
-The source is already clean by the time you write the prompt: measured on this
-project, the hang tag and a clip were erased, the bench and shoes removed, the
-plate turned pure white, garment colour drift **0.4**, full resolution kept. So
-the re-lay prompt has only two jobs left - square the garment and de-wrinkle it.
-Asking it to remove a background or a tag now invites it to invent one.
+Every new candidate arrives with a **LAY vs the reference** paragraph under it,
+alongside the three numbers. It is a vision comparison of that candidate against
+image 2, asked automatically and for free, about the **pose and nothing else** -
+sleeve angle, how far the cuffs sit from the sides, whether the shoulders and hem
+are level and the garment is square.
 
-**Image 2 is a lay reference, never a construction reference.** Say that in your
-own words, and never write anything like "it is a shape and construction
-reference" - a real run's prompt said exactly that, and four of its ten
-candidates came back with the reference's V-neckline seam and topstitching down
-the straps, all four flagged by stage 3. `generate.py` appends a clause about it
-to every prompt automatically, and when step 0 measured the reference as
-differing in construction terms it names those words too. Read the
-`construction_risk` line in `reference_selection.json` and the clause in
-`archive/prompt_brief.md`: if it is flagged, that is the single most likely way
-this batch wastes money.
+It reads like this:
 
-You can read the full prompt - yours plus everything appended - without paying
-for it: `generate.py --run R --dry-run` prints it and stops before anything is
-uploaded.
+> In the reference the sleeves drop almost straight down, angled only about
+> 15-20° outward, with the cuffs ending near the side seams at the hem line. In
+> the first image the sleeves are folded diagonally inward at a steeper 30-40°
+> angle, with the cuffs tucked up high, well inside the body sides. **They do not
+> match: sleeves too far in and too high.**
 
-## The tests
+**This is the check the numbers cannot do.** IoU, dE and the wrinkle ratio all
+answer "is this still the same garment". None of them answers "did I hit the pose
+I was aiming at", and that is the question the reference exists for.
 
-`grade_flats.py --run R` runs all of them and prints a `KEEP` list. It grades in
-three stages and the third one is a door, not points on a scoreboard.
+It is automatic because it did not happen otherwise: on `runs/20260828_110544`
+the entire run contained two comparisons - source against reference to write the
+prompt, and source against a candidate to check fidelity - and **not one**
+comparing a candidate to the reference. Every candidate was checked for being the
+right garment and none for being the right shape, and the run shipped with the
+sleeves wrong.
 
-**Stage 1, measured against the cleaned source.** No model involved, so nothing
-here can be invented. Every term is a comparison with `archive/offset_upload.jpg`
-- the question is "is this still the same garment", not "is this a nice photo":
+**When it says they do not match, act on it.** Fix the `pose` section to say what
+it just told you, or reach for `match_pose=True` if you have already described it
+correctly. Do not `pick_best` a candidate whose lay check says the sleeves are
+wrong just because its numbers look good - they are answering a different
+question.
 
-| | |
+### A `!` line means the numbers are not evidence
+
+Any candidate printed with a `!` under it has a measurement problem, and the
+numbers on that line are noise rather than a bad score. **Do not quote them, do
+not rank on them, and do not put them in your rationale.** Look at the picture.
+
+The one that will bite you most is a **pale garment on a pale plate**. Cream on
+white gives chroma no colour to separate and luminance no contrast, so both cues
+collapse and the outline is simply not found. On `runs/20260827_220727` every one
+of six candidates measured this way - the mask covered 2.8% to 4.2% of frames the
+sweater filled - and the run shipped quoting "IoU 0.325" as if it meant
+something. It meant nothing.
+
+The opposite `!` line - the mask covering far MORE than the source - is worth
+acting on rather than ignoring: it usually means there is a **second garment in
+the frame**. Go and look, and if there is, change the seed.
+
+## Editing an edit
+
+Generating from a candidate is how you fix one remaining defect without losing
+what already worked. It also compounds drift: image 1 is then a generated image,
+so anything the model invented on the first pass arrives on the second labelled
+as the real product.
+
+`lineage.json` records the depth and it is printed with each candidate. **Two
+edits deep is where invented detail starts to harden.** At depth 2 or more, look
+at the candidate against the *original* source with `compare_images`, not against
+its parent, and check the trim and the seams specifically.
+
+Measured on this project, one chain, every number against the original source:
+
+| | dE | what happened |
+|---|---|---|
+| `cand_02` (depth 1) | **1.0** | one generation from the real photo - invisible drift |
+| `cand_02s` (depth 1) | **0.9** | segmented. No drift, because segmentation cannot add any |
+| `cand_03` (depth 2) | **2.3** | one more generation. Drift more than doubled in a single hop |
+
+Nothing there is broken - 2.3 is still the same colourway - but it is the shape
+of the cost, and it compounds. A second edit buys one fix and pays for it in
+fidelity, so spend it on a defect you can actually name.
+
+Segmenting a candidate does **not** add depth. It drops a background; it cannot
+invent anything. It can add background specks, though - `cand_02s` went from 41
+to 276 - so look at the plate afterwards rather than assuming it improved.
+
+## Look at every candidate
+
+Not just the ones that score well. A redrawn garment often looks *better* than a
+re-laid one, because clean invented stitching reads as good texture. Two runs
+that only inspected the top of their ranking shipped a candidate with an added
+strap seam and another with a reshaped waistband.
+
+`compare_images` puts two frames in one vision call. Use it whenever the question
+is how one differs from another - two separate `view_image` calls give you two
+independent descriptions, and the gap between two descriptions is not a measured
+difference. For a close look at a seam or a cuff, pass a box in source pixels;
+without one the whole frame is squeezed to 1024px and you see nothing of the kind.
+
+## The polish: automatic, at the very end
+
+**You do not need to call this.** After you `finish`, the harness runs the winner
+through a different model - `openai/gpt-image-2/edit` - with a narrow
+instruction: take the wrinkles out, change nothing else. `cand_04` becomes
+`cand_04p`, and that is what ships.
+
+It is automatic because it was optional and got skipped: on
+`runs/20260828_104807` the run went `pick_best` → write the log → `finish`, and
+the cleanup never happened. Anything that has to happen every time belongs in the
+harness, not in this page.
+
+**What that means for you: mark the right winner.** `pick_best` decides what gets
+polished, so the pose, the construction and the colour all have to be right
+before you finish. The polish cannot fix a bad pose, cannot remove a second
+garment, and will not rescue a weak candidate.
+
+The `polish` tool is still available if you want to see the result *before*
+finishing, or to pass a different instruction:
+
+```
+polish(candidate="cand_04")
+```
+
+If you do, the harness will not run it a second time on an already-polished pick.
+
+**It is judged against its PARENT, not against the original source** - the only
+place in this project where that is right. Everywhere else the question is "is
+this still the same garment as the photograph". Here the instruction was narrower
+- "identical to `cand_04` except the wrinkles" - so the parent is the contract,
+and measuring against the source would mix up what the generation changed with
+what the polish changed.
+
+It prints that comparison and **refuses to ship the polish** on three
+unambiguous failures, delivering the unpolished parent instead and saying why:
+
+- **ironed flat** - wrinkle ratio under 0.5, the knit repainted as a smooth
+  surface, which is a redraw wearing a tidy face.
+- **colour shifted** - dE over 3 against the parent.
+- **re-framed** - the garment now covers a very different share of the frame.
+
+Shape and scale are **reported, not enforced**. Three polishes measured so far:
+two at IoU ~0.834 where the sleeves and the framing had visibly moved, and one at
+**IoU 0.994, scale 1.00x, texture 0.90** that changed nothing but the creases.
+So a clean polish holds the outline almost exactly, and a reading in the 0.8s is
+real drift - but three is not a calibration, so it is left to the eye.
+
+The parent is untouched on disk in every case. **Look at the two side by side** -
+a cleanup that also changed the pose reads better on its own and worse against
+the reference.
+
+## Finishing
+
+`pick_best` names what ships. Call it early and update it - it costs nothing, and
+it means a run that gets cut off still delivers something you chose rather than
+whatever happened to be last.
+
+Then `finish` with an honest status:
+
+| status | means |
 |---|---|
-| `silh` | silhouette IoU against the source, both normalised to their own bounding boxes so re-centring and rescaling cost nothing. 0.95 scores 100, 0.70 scores 0. **35%** |
-| `col` | dE76 between the two garment colours. 1.0 or less scores 100 (invisible), 6.0 scores 0 (a different colourway). **20%** |
-| `wrink` | distance from the **source's own** texture energy, in either direction. Rougher means creases the re-lay failed to relax; smoother means the knit was ironed out of existence. **20%** |
-| `sym` | the silhouette against its own mirror, 1.00 to 0.80. Presentation, not fidelity - a redraw is usually *more* symmetric than the real garment, which is why it is only **15%** |
-| `bg` | backdrop lightness. `bg_lum` 0.99 scores 100, 0.90 scores 0 - anchored on the plate this pipeline actually produces, which sweeps 228-252 and never reaches pure white. Measured, not judged: the model rated a visibly grey backdrop 100/100. **10%** |
+| `done` | the result is good enough |
+| `budget_exhausted` | the images ran out; shipping the best of them |
+| `gave_up` | nothing here is worth shipping |
+| `no_candidates` | nothing was ever generated |
 
-`grade = 35% silh + 20% col + 20% wrink + 15% sym + 10% bg`, minus **15 per
-region stage 3 flagged as altered**, pass mark **62**.
-
-That pass mark is not comparable to the 80 the old presentation grade used, and
-neither are the numbers. This grades fidelity: on the batch it was calibrated
-against, faithful re-lays scored 63-74 and redraws 40-48.
-
-**Stage 2 is advisory and off by default.** Asking the vision model for 0-100
-scores saturated at 100/100 for every candidate including one with a visibly
-grey backdrop, and the pairwise tournament picked by slot 100% of the time.
-Neither feeds the grade. `--judge absolute` runs one anyway, printed beside the
-measurements.
-
-**Stage 3, the construction gate.** Three native-resolution crops of each
-candidate against the same crops of the cleaned source, one vision call each,
-asking only whether stitching, seams, pockets, waistband or labels changed.
-Which three regions depends on the garment, and `grade_flats.py` reads that off
-`reference_selection.json` itself - the `profile:` line at the top of its output
-says which set it used and where it got it. A line starting `WARNING:` there
-means the garment could not be established at all: grading still runs so you can
-look, but **`--ship` refuses outright** until `--profile bras`,
-`--profile leggings`, `--profile pullovers` or `--profile fleeces` says which. Do not reach for `--no-construction` to get
-past that - it does not lift the refusal, and it is the larger version of the
-same mistake.
-
-**A verdict is judged once and then reused.** Each candidate's stage-3 result is
-stored in `archive/metrics.json` against a fingerprint of what was compared -
-the candidate's bytes, the reference's bytes, and the crop bands - so grading
-again, or grading again with `--ship`, reuses it and prints `(cached 21:32:42)`
-instead of asking the model a second time. Only new images cost anything, and
-the second pass shows `0 judged, N reused` in about 0s. This is why the flags in
-your `## Results` table, the ones printed against each pick, and the ones in
-`metrics.json` are the same flags: they are one judgement, not three samples of
-a noisy one. If you want a second opinion, `--rejudge` takes one deliberately
-and overwrites the stored verdict, so there is still exactly one record.
-**Stage 3 also checks the FACE.** Each image is asked on its own whether it
-shows the outside or the inside of the garment, and its front or its back; a
-candidate whose answer differs from the source's is marked `FLIPPED`, costs the
-same 15 points as an altered region, and is rejected. It is asked per image and
-compared afterwards on purpose: the cheaper design - showing both crops and
-asking "same face?" - was built first and measured **blind**, answering SAME for
-a candidate mirrored left-for-right. A flip is invisible to every other test
-here, because the silhouette, the colour and the texture are all unchanged.
-Read the reason printed with each flag; the judge partly reasons from what
-garments of that type usually look like, so a flag is meant to be appealable.
-
-A **MISMATCH** marks the candidate REJECT **and costs it 15 points per altered
-region**, but REJECT still does not block delivery - `--ship` takes the top N by
-grade regardless. The penalty is there so the number and the label stop
-contradicting each other: a run once had to arbitrate between a 79.1 grade and
-three MISMATCH flags on the same image, and spent thirty turns on it. Every
-MISMATCH that ships is printed against its pick - put those in `## Notes`.
-
-**When every candidate is flagged the same way, suspect the check before the
-batch.** Each candidate is an independent draw, so they fail in independent
-ways: a real construction problem hits some of them, in different places, in
-different words. A flag on *all* of them in the *same* region, worded almost
-identically - "the band is missing", "no band visible" - is the signature of a
-crop that is not looking at the garment, not of ten identical mistakes. The
-usual cause is the wrong region set: a bra measured with the leggings bands puts
-`waistband` on empty plate above the straps and `hem` below the garment, and two
-empty crops compared against each other produce a confident verdict about
-nothing. `grade_flats.py` prints this warning itself when it sees it. Work it in
-this order:
-
-1. Read the `profile:` line. Does it name the garment you are actually looking
-   at, and did it *read* that or assume it?
-2. **Look at the cleaned source for something the clean was supposed to remove
-   and did not.** If a pin, clip or tag survived into `offset_upload.jpg`, every
-   candidate correctly leaves it out and every region comes back MISMATCH for
-   it. That is one defect in the source, reported ten times. Declare it:
-   `grade_flats.py --run R --expected-changes "the three pearl-headed pins,
-   removed"`, which re-judges (the flag is part of the verdict fingerprint).
-   On the batch this was written for that took the flags from 30 of 30 down to
-   12 of 30, and the twelve that remained were four candidates with genuinely
-   invented topstitching.
-3. Put one flagged pair in front of your own eyes -
-   `crop_pair.py --run R --cand NN --at <the flagged region>` - and check the
-   crop contains the thing the judge says changed.
-4. Only then treat it as a per-candidate defect and appeal it image by image.
-
-Appealing ten identical flags one at a time costs ten vision calls and confirms
-nothing, because the fault they share is upstream of all of them.
-
-Read the numbers honestly:
-
-- **`wrink` is the weak one, and it is now a distance rather than a level.**
-  `common.py` records that an isotropic variance measure of exactly this class
-  was tried here as "lower is better" and removed: it ranked the visibly
-  *smoothest* candidate highest because it was reading form shading rather than
-  creases. Scored as distance from the source's own value the shading cancels,
-  but it is still the term to distrust first. If the ranking disagrees with what
-  you can see on `archive/grade_results.jpg`, say so in `## Notes` and pick past
-  it.
-- **The grade is a weighted average, so a good term can buy off a bad one.**
-  Look at the `silh`/`col`/`wrink`/`sym`/`bg` columns and the `pen` column, not
-  just the total.
-- **The two starred columns (`sym*`, `smooth*`) are batch-relative and are not
-  scored.** 100 there means "most of these", not "good". They are context for
-  the case where the whole batch is weak - which the anchored grade will show
-  as everything scoring badly, rather than as a winner.
-- **Nothing here checks length, waistband width or frame clipping.** If a
-  candidate looks stretched, or touches a frame edge, only you will catch it -
-  `compare_images` against `archive/offset_upload.jpg`. Colour and outline ARE
-  measured now (`col` and `silh`), so a desaturated or reshaped candidate should
-  show up in the table before you see it.
-
-**Do not re-generate to fix a failing candidate.** A repair pass rerolls the
-dice rather than converging: one candidate scored 50 for integrity, was re-sent
-with a corrective prompt, and came back at 40, having added texture that was
-never there.
-
-Framing, position, scale and tilt are **not tested and must not be**. The
-retouch team places the garment themselves. Grading framing was
-actively harmful - the candidates rejected for it carried the best colour and
-texture in every batch, because they were the ones that left the product alone.
-
-## Sequence it yourself
-
-There is no prescribed order. Generate, grade, look, pick. Stop when you have
-4, or when the cap is reached.
-
-**Buy the images in stages.** `stage_batch.py --run R --target 4` does it:
-four, grade, then only the shortfall. A batch is usually decided by its first
-four - on the run this was measured against, five of the first six candidates
-cleared and the other four were bought after the answer was already on disk.
-Generating the whole budget in one wave is the single easiest way to spend
-double for the same delivery.
-
-**Look at every candidate, not just the top of the ranking.** One vision pass
-per generated image, all of them, before you pick. The grade cannot see the
-thing that matters most - whether the model redrew the garment instead of
-re-laying it - and a redrawn garment often scores *well*, because clean
-invented stitching reads as good texture. Runs that only inspected the top few
-shipped a candidate with an added strap seam and another with a reshaped
-waistband, both of which sat high in the ranking.
-
-**Your eyes are the last say, over the numbers, in both directions.** Reject a
-high scorer when you can see it is redrawn, and rescue a low scorer when you
-can see the score is wrong - one candidate graded 65.6 on a flag that turned
-out to be a false positive and was correct to ship. When they disagree, say so
-in `## Picking` and say which you followed.
-
-Three things that have gone wrong repeatedly, worth planning around:
-
-- **Nothing cross-checks your picks any more.** `--ship-faithful N` applies its
-  rule and writes the files, and that is the whole of it. There is no second
-  opinion between the grade and the deliverable, so the numbers in `## Results`
-  have to be ones you read off `grade_flats.py`'s own output rather than ones
-  you remember. A run once reasoned its way to one set of picks and then typed
-  the numbers out of an example, shipping two candidates that had been rejected.
-- **Fewer than 4 cleared? `--ship-faithful 4` and let it backfill.** Do not
-  generate more, and do not hand-copy files. It ships the candidates stage 3
-  found intact first, backfills by grade only when there are too few, and
-  prints every exclusion and every backfill with the regions each one altered.
-  Then say in `## Picking` what the backfilled picks carry - it printed the
-  lines, put them in the log. Rejected does not mean unusable, it means the
-  cost is named. If the whole batch failed the same way, that is a prompt
-  fault and more draws would only buy more of it; say that too, rather than
-  letting four ranked images imply four acceptable ones.
-- **Never end a run with `output/` empty.** If the turns run out first, the
-  harness ships the four most faithful candidates itself and says so - but a
-  delivery it wrote carries no `## Picking`, no `## Notes` and no account of
-  what each pick costs, which is most of the value. Three turns from the cap
-  you will get a message saying exactly this; deliver then, do not keep
-  investigating. A real run reached its cap mid-appeal with ten paid-for
-  images in `archive/` and nothing delivered.
-- **A construction MISMATCH now ships anyway, so it has to be reported.** It is
-  the only check in the pipeline that can tell a re-laid garment from a redrawn
-  one, and it runs on 1:1 crops precisely so it is not guessing - but it no
-  longer stops anything. `## Notes` is the only place that record survives, so
-  name every flagged pick and the regions it altered. `crop_pair.py --run R
-  --cand NN --at <region>` puts the two crops in front of you if you want to
-  judge a flag yourself before writing it up - use the region `grade_flats.py`
-  named, and run it without `--at` first if you want the list for this garment.
-
-## Deliver
-
-`--ship-faithful N` writes the picks to `output/`. Then write `<RUN_DIR>/LOG.md`
-with a **bash heredoc**, not `write_file` - a long string argument truncates
-mid-JSON and the call is rejected.
-
-Sections: `## Setup` `## Prompt` `## Generation` `## Testing` `## Picking`
-`## Results` `## Notes`
-
-`## Setup` names the reference step 0 installed - the library filename, its
-score, the `differences` line, and whether `construction_risk` was flagged -
-read off `<RUN_DIR>/reference_selection.json`, not from memory.
-
-`## Results` is a table: Pick | File | Grade | Silhouette | Colour | Wrinkle |
-Background | Construction, with the source's own wrinkle energy and symmetry
-quoted underneath, since every one of those columns is a comparison against it.
-
-`## Notes` carries the honest caveats - a speck in a background, a candidate you
-nearly picked, any `--force` and why, and whether any pick is a no-op.
-
-**Then call `finish()` - the same turn, nothing in between.** LOG.md is the last
-artefact; once the heredoc has written it the run is over. Nothing after it adds
-anything, and the two things that usually fill the gap both cost the run:
-re-reading your own outputs to check work already recorded, and one more look at
-a candidate you have already ranked. Keep going and the iteration cap arrives
-instead, which ends the run with no `finish()` at all - the picks sit in
-`output/` either way, but nothing says they were the picks, and an unfinished
-run reads as an abandoned one. Summarise what shipped, name the flagged picks,
-and stop.
+Write `<RUN_DIR>/LOG.md` first, with a **bash heredoc** rather than `write_file` -
+a long string argument truncates mid-JSON and the call is rejected. Say what you
+changed each round, what each generation started from, and what the winner still
+carries. A named defect is a warning; an unnamed one is a rubber stamp.
 
 ## Rules that cost real runs
 
-1. **Pass every path explicitly and absolutely.** A script falling back to a
-   default input will process a different garment and report precise, plausible,
-   entirely wrong numbers.
-2. **Ground every number in output you actually saw.** Never report a
+1. **Ground every number in output you actually saw.** Never report a
    measurement you did not run or a file you did not create.
-3. **`cat <RUN_DIR>/steps.log`** is the whole run in a few lines, and the spend
-   record to quote. Read it instead of re-deriving.
-4. **Costs are calculated at published rates, never receipts.** fal exposes no
-   billing API.
-5. **Keep tool output small.** You have a limited context window and a run that
-   fills it ends before the work does.
+2. **`cat <RUN_DIR>/steps.log`** is the whole run in a few lines, including the
+   spend. Read it instead of re-deriving it.
+3. **Costs are published rates, never receipts.** fal exposes no billing API.
+4. **Keep tool output small.** The context window is the second scarcest thing
+   here, and a run that fills it ends before the work does.

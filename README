@@ -1,122 +1,155 @@
-# How to run
+PLD laydown harness
+===================
 
-./run.sh --skill-file task/SKILL.md
+One job: take an off-set garment photo and get it to lie like a reference
+laydown - square, flat, wrinkles relaxed, clean white plate, no shadows -
+without redrawing the garment.
 
-# What a run leaves behind
+    ./run.sh --yolo
 
-    runs/<session>/run.log          full trace - see below
-    runs/<session>/transcript.jsonl the agent loop as JSON, one event per line
-    runs/<session>/steps.log        one line per pipeline milestone, with cost
-    runs/<session>/tool_output/     any tool result too big to show the model
+    ./run.sh --source inputs/off_set_image.jpg \
+             --reference inputs/reference_greyscale.jpg \
+             --max-images 6 --yolo
 
-`run.log` is the one to read when a run went wrong. It is plain text, one
-timestamped line per event, and it is a superset of what scrolled past on the
-terminal:
+    ./run.sh --max-images 0 --yolo      # runs the whole loop, bills nothing
 
-    2026-08-18 19:55:58.025 | +    2.0s | INFO  | turn      | 2 tool call(s) names=bash,read_file
-    2026-08-18 19:55:58.044 | +    2.0s | INFO  | bash      | exit=0 secs=0.02 out_chars=396 err_chars=0
 
-Multi-line payloads follow their line indented with `|`, so `grep '^20'` gives
-you the event timeline and `grep -A50 'reasoning | turn 7'` gives you the
-thinking behind turn 7. Columns are timestamp, elapsed, level, component,
-message - and components are worth knowing: `http` (every request, its latency
-and its token usage), `turn`, `reasoning`, `tool`, `bash`, `vision`, `approval`,
-`context` (compactions), `step0`, `console` (anything printed).
+How it works
+------------
 
-Three things it holds that nothing else does. The model's chain of thought,
-which is dropped from the conversation after each turn and otherwise only ever
-seen 600 characters at a time under `-v`. Every message exactly as it was sent
-to the server, logged once when it first appears and again if compaction
-rewrites it. And step 0's own output, which used to go straight to the terminal
-and nowhere else.
+A model with a shell and eight purpose-built tools iterates towards the
+reference. Turn 1 it is handed both images inline - the segmented source and the
+reference - and from then on it chooses freely:
 
-Secrets and base64 image payloads are stripped on the way in, so a trace is safe
-to paste. Flags:
+  * look at an image, or compare two in a single vision call
+  * write and surgically edit the prompt, one named section at a time
+  * generate, from the original source OR from any candidate it already made
+  * segment a CANDIDATE to clean up a plate it does not like
+  * note what it concluded, mark its best, finish
 
-    --trace-level INFO     drop the reasoning and the HTTP payloads
-    --no-trace             do not write it at all
+There is no fixed order and no pipeline. Segmenting a generated image and then
+generating again from it is a legitimate move, and so is throwing the prompt away
+on turn nine.
 
-# Step 0 - the reference is picked for you
+Every candidate is pushed back into the conversation as a picture with three
+free measurements printed underneath, so the model never has to remember to ask.
 
-Every run starts by cleaning the source and then choosing the lay reference,
-deterministically, before the agent gets a turn:
 
-    tools/clean.py              erases the tag, drops the background and plates
-                                it white, writing
-                                runs/<session>/archive/offset_upload.jpg
-    tools/match_reference.py    scores all of library_reference/ against THAT
-                                cleaned image and returns ONE winner or an
-                                honest "no match"
-    tools/select_reference.py   installs that winner as
-                                inputs/reference_greyscale.jpg (desaturated,
-                                full resolution) and records where it came from
+The budget
+----------
 
-Cleaning runs first because every library image is a garment on a white plate.
-Matching the raw phone photo against them scores the room and the hang tag as
-part of the garment, and the number that comes out is what the whole run is
-anchored to. The work is not extra: prepare.py used to do exactly this on the
-agent's first turn and now verifies the result instead of redoing it, so there
-is one cleaning path and the spend is unchanged.
+fal.ai images are capped for the whole run - 10 by default, from
+LAYDOWN_MAX_IMAGES, lowered per run with --max-images. The counter never
+refills. Everything else is free and unlimited: looking, comparing, measuring,
+segmenting, rewriting the prompt.
 
-If cleaning fails the run continues against the raw input, prints
-`WARNING: matched against raw input`, and records `query_cleaned: false` in the
-receipt - degraded, not dead.
+--max-images 0 is supported and useful. The loop runs, generate refuses, nothing
+is billed, and the run exits 0. It is how you check a deployment for free.
 
-harness.py runs the pair itself. `library_reference/` is kept out of the
-workspace inventory so the agent never sees a second candidate to argue with,
-and the run folder gets:
 
-    runs/<session>/reference_selection.json   match_found, source file, score,
-                                              runner-up, what still differs, and
-                                              which image was matched (path, md5,
-                                              query_cleaned)
-    runs/<session>/match_results.json         every attribute record and score
-    runs/<session>/result_top_matches.jpg     query beside the top 5
+The three numbers
+-----------------
 
-reference_selection.json is written on BOTH outcomes. On a miss it carries
-`match_found: false` and the closest the library came, so a caller has one file
-that always exists and always answers the same question - a receipt that
-appeared only on success could not be told apart from a run that died early.
+    tools/metrics.py --run runs/<stamp>
 
-**No match stops the run before the agent starts** - a laydown measured against
-the wrong garment's reference is worse than no laydown. It stops with **exit
-20**, not 1: nothing broke, the library simply holds nothing close enough and
-someone has to upload a hero for this style. 1 stays reserved for the matcher
-actually failing, so the two are never in the same list. Flags:
+Silhouette IoU, colour dE76, and wrinkle energy as a candidate/source ratio -
+all against the ORIGINAL source, never a candidate's parent. No model, no
+network, no money.
 
-    --reference-only             run step 0 and stop, without starting the
-                                 agent: 0 if the library can serve this
-                                 garment, 20 if a hero is needed. No fal spend
-                                 and no text model - step 0 only uses the
-                                 vision endpoint. This is the cheap question to
-                                 ask before paying for the expensive one.
-    --no-reference-select        use whatever reference inputs/ already holds
-    --no-pre-clean               match against the raw input; prepare.py then
-                                 cleans on the agent's first turn as before
-    --reference-category bras    force the library subfolder
-    --reference-threshold 87     lower the pass mark (default 95). 87 accepts a
-                                 construction-identical match that differs only
-                                 in colour, which the reference is desaturated
-                                 to discard anyway
-    --allow-no-reference         start anyway, with no match
+They are advice, never a gate. Nothing is blocked, scored or ranked by them.
+They exist for the one failure eyes reliably miss: the generator drawing a NEW
+garment that is already flat instead of re-laying the real one. task/SKILL.md
+carries the measured bands - read those before reading a number, because the
+useful ranges are not the obvious ones (a normal candidate's wrinkle ratio is
+ABOVE 1, not below).
 
-Or run it by hand:
 
-    cd tools && ../.venv/bin/python select_reference.py --dry-run
-    cd tools && ../.venv/bin/python match_reference.py --list-categories
+What a run leaves behind
+------------------------
 
-# What step 0 needs
+    runs/<stamp>/
+      run.log             the full trace - reasoning, every message, every tool
+      transcript.jsonl    structured turns
+      steps.log           the run in a few lines, including the spend
+      LOG.md              the model's own write-up
+      archive/
+        source_clean.jpg  the segmented source - what fal actually receives
+        reference.jpg     the reference, desaturated on the way in
+        prompt_sections.json    the editable prompt
+        prompt_<hash>.txt       a snapshot per generation
+        cand_01.png ...         every attempt
+        cand_03s.png            a candidate after segmentation
+        lineage.json      parent, depth, prompt hash and seed per candidate
+        notes.json        the model's own note per candidate
+        uploads.json      content hash -> fal URL, so nothing uploads twice
+      output/
+        best.png          the delivery
 
-A vision model on an OpenAI-compatible endpoint - NOT the same server the
-harness uses for its own text model:
 
-    REFMATCH_BASE_URL   default http://10.11.243.169:8080/v1  (include /v1)
-    .qwen_key           the API key, or QWEN_API_KEY in the environment
+The reference
+-------------
 
-Deliberately not QWEN_BASE_URL: harness.py reads that one for its text model and
-appends /v1 itself, so sharing the variable pointed one of the two at the wrong
-path.
+Supplied by the operator, not searched for. --reference defaults to
+inputs/reference_greyscale.jpg.
 
-The attribute cache lives in `.cache/refmatch/`. Cold it costs ~115s for 45
-library images; warm, a run is a few seconds. Deleting it can shift borderline
-scores, because the model re-describes each image - so it is worth keeping.
+It is desaturated on the way into the run folder. That is deliberate and it is
+the one thing done TO it: it is a shape and lay reference, never a colour
+target, and sent in colour it gets read as one - the garment comes back wearing
+the reference's tone.
+
+
+Chained edits
+-------------
+
+generate(source="cand_03") starts from an earlier attempt instead of the
+original. It is how one remaining defect gets fixed without losing what already
+worked, and it compounds drift: image 1 is then a generated image, so anything
+invented on the first pass arrives on the second labelled as the real product.
+
+lineage.json records the depth and it is printed with each candidate. Two edits
+deep is where invented detail starts to harden. Segmenting a candidate does NOT
+add depth - it drops a background and cannot invent anything.
+
+
+Services it talks to
+--------------------
+
+    QWEN_BASE_URL       the model, OpenAI-compatible, no /v1 suffix
+                        default http://10.11.245.41:8091
+    QWEN_API_KEY        or .qwen_key on disk
+    SEGMENT_URL         the segmentation service
+                        default http://10.11.245.41:8780/segment
+    FAL_KEY             from .env; bills real money
+
+Segmentation drops the BACKGROUND only. A hang tag, ticket, pin or clip attached
+to the garment survives into the source - which is why the prompt guardrails
+warn about naming them rather than refusing, and why the skill says to look
+before you decide.
+
+
+Reading a run
+-------------
+
+run.log is the only place three things exist: the model's chain of thought, every
+message exactly as it was sent, and the output of the steps that ran before the
+first turn. Format is
+
+    timestamp | elapsed | LEVEL | component | message
+
+with multi-line payloads indented under a | and components named http, turn,
+reasoning, tool, bash, vision, approval, context, step0, session, console.
+
+
+old/
+----
+
+The retired reference-matching and grading pipeline - 14 tools, the 45-image
+library, the layout profiles and the previous skill. Nothing imports it. See
+old/README.md for what each piece did and why it went.
+
+
+Container
+---------
+
+See DOCKER.md. Two inputs, one output, and the exit-code contract - including
+the finish-status table and why exit 20 can no longer occur.

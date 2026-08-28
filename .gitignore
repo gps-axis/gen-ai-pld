@@ -17,18 +17,17 @@ __pycache__/
 # care about - copy those out rather than committing the folder.
 runs/
 
-# The vision model's attribute cache. Machine-local by design: each entry
-# records the absolute path it was built from, so it does not transfer, and it
-# is rebuilt on demand in about two minutes.
+# Left over from the retired reference matcher's attribute cache. Nothing writes
+# it any more; ignored so an old working copy stays clean.
 .cache/
 
-# Working photos. These are per-job, 6-16MB each, and step 0 overwrites
-# inputs/reference_greyscale.jpg on every run - so the folder's contents are
-# run state, not source. The directory itself is kept.
+# Working photos. Per-job, 6-16MB each - the garment to lay out and the
+# reference to lay it against. Both are run inputs rather than source, and the
+# harness writes derived copies beside them. The directory itself is kept.
 inputs/*
 !inputs/.gitkeep
 
-# Where the container delivers picks. See DOCKER.md.
+# Where the container delivers best.png. See DOCKER.md.
 out/
 
 # Bulk archives - inputs.zip alone is 28MB of photos already covered above.

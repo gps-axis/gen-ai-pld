@@ -1,16 +1,32 @@
 #!/usr/bin/env python3
 """
-harness.py - a very small Claude-Code-style agent loop driven by a local model.
+harness.py - a small agent loop that re-lays a garment towards a reference.
 
-Points a tool-using agent loop at an OpenAI-compatible endpoint (llama.cpp or
-vLLM), loads a SKILL.md as its operating manual, and lets it work in a
-workspace until it calls finish() or hits the iteration cap.
+One job. The model is handed two images - the segmented off-set photo and the
+reference laydown - and iterates towards the second using three real capabilities:
+a segmentation service, a fal.ai image editor, and its own eyes. It writes and
+edits the prompt itself, chooses what each generation starts from, and stops when
+it judges the result good enough or when the image budget runs out.
 
-    ./run.sh --skill laydown-match
-    ./run.sh --skill laydown-match --task "Run stage 1 only and report the numbers"
-    ./run.sh --task "Summarise what is in this folder" --max-iters 5
+    ./run.sh --yolo
+    ./run.sh --source inputs/off_set_image.jpg --reference inputs/ref.jpg --max-images 6
+    ./run.sh --max-images 0 --yolo      # free: exercises the loop, buys nothing
+
+The loop is deliberately not a pipeline. Every tool is available on every turn,
+in any order and any number of times: segmenting a GENERATED candidate and then
+generating again from it is a legitimate move, and so is throwing the prompt away
+and starting it over on turn nine.
 
 Design notes worth knowing before you edit this file:
+
+  * Images are conversation, not tool output. Turn 1 pins the source and the
+    reference into the first user message, and every new candidate is appended as
+    an image with its measurements underneath - so the model sees what it bought
+    without spending a turn asking. See Session.attach_image().
+
+  * That would eat the window, so candidate images are elided every turn, not on
+    a token threshold - see Session.elide_images() and the comment there for why
+    unconditional matters.
 
   * The model is a *reasoning* model. Replies arrive split across a
     chain-of-thought field and `content` (the actual answer). llama.cpp calls
@@ -89,23 +105,32 @@ RECONNECT_POLL = 10
 MAX_TOOL_CHARS = 4000    # per tool result fed back to the model
 BASH_TIMEOUT = 900
 
-# "The library has nothing close enough to this garment" is an expected answer,
-# not a fault, and it has to be distinguishable from one. It used to leave here
-# as 1, the same code a crash leaves as, which made a scheduler show a run that
-# worked perfectly as a failure and put it in the same list as a broken model
-# server. 20 is far enough from the small codes to collide with nothing: 1 is
-# breakage, 2 is the entrypoint's own usage errors, 3 is a short delivery.
+# fal.ai images for a whole run. The ceiling, not a target: the model spends what
+# it needs and stops. Read from the environment so the container and run.sh can
+# set it in one place; --max-images lowers it per run.
+DEFAULT_BUDGET = int(os.environ.get("LAYDOWN_MAX_IMAGES", "10"))
+
+# RESERVED, AND NO LONGER REACHABLE. It used to mean "the library has nothing
+# close enough to this garment" - an expected answer from a reference search that
+# had to be distinguishable from a crash. The reference is now supplied by the
+# operator and there is no search to fail, so nothing in this file returns 20 any
+# more. The constant stays, and DOCKER.md says out loud that it cannot occur,
+# because a downstream workflow branching on it must keep parsing rather than
+# meet an unknown code.
 EXIT_NO_REFERENCE = 20
 
-# "The pre-clean gate rejected the source" is the same kind of answer: the
-# pipeline worked, and what it produced is a refusal to spend money on a garment
-# it can prove was damaged before generation. Distinct from 20 because the fix
-# is different - one needs a hero uploaded, the other needs the input photo or
-# the eraser looked at.
+# "The segmentation gate rejected the source": the run worked, and what it
+# produced is a refusal to spend money on a source it can prove is damaged.
+# Distinct from 1 because the fix is different - this one needs the input photo
+# or the segmenter looked at, not the model server.
 EXIT_UNCLEAN_SOURCE = 21
 
-# Tools that only observe. These never prompt for approval.
-READONLY_TOOLS = {"read_file", "view_image", "compare_images", "finish"}
+# Tools that only observe or cost nothing. These never prompt for approval.
+READONLY_TOOLS = {"read_file", "view_image", "compare_images",
+                  "measure", "prompt_show", "note", "finish"}
+
+# What the model may hand to `source`, and what a run can be told to do with it.
+FINISH_STATUSES = ("done", "budget_exhausted", "gave_up", "no_candidates")
 
 # Refused outright, in any mode. Not a security boundary - a guardrail against
 # an agent that has decided rm -rf is the shortest path to a clean workspace.
@@ -426,151 +451,212 @@ def call_model(messages, tools=None, max_tokens=MAX_TOKENS, temperature=TEMPERAT
 # Tools
 # ---------------------------------------------------------------------------
 
+def _tool(name: str, description: str, properties: dict,
+          required: list[str] | None = None) -> dict:
+    """One OpenAI function spec. Four parallel lists used to drift; this is one."""
+    return {"type": "function", "function": {
+        "name": name, "description": description,
+        "parameters": {"type": "object", "properties": properties,
+                       "required": required or []}}}
+
+
+_PATH = {"type": "string", "description": "Path, absolute or workspace-relative."}
+_CANDIDATE = {
+    "type": "string",
+    "description": ("A candidate name: 'cand_03', or 'cand_03s' for its "
+                    "segmented form. 'source' means the original segmented "
+                    "photo."),
+}
+
 TOOL_SPECS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "bash",
-            "description": (
-                "Run a shell command in the workspace and return stdout+stderr. "
-                "Use this to run python, inspect files, and do the actual work. "
-                "FAL_KEY and the CA-bundle variables are already set."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "The shell command."},
-                },
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read a text file. Use offset/limit for large files.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "offset": {"type": "integer", "description": "First line, 1-based."},
-                    "limit": {"type": "integer", "description": "How many lines."},
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "Create or overwrite a text file with the given content.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"},
-                },
-                "required": ["path", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit_file",
-            "description": (
-                "Replace the first exact occurrence of old_text with new_text. "
-                "old_text must match the file byte for byte."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "old_text": {"type": "string"},
-                    "new_text": {"type": "string"},
-                },
-                "required": ["path", "old_text", "new_text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "view_image",
-            "description": (
-                "LOOK at an image and get a description back. Optionally crop "
-                "first with box='x,y,w,h' in source pixels - use this to inspect "
-                "a seam or a silhouette edge at 1:1 with no resampling. Ask a "
-                "specific question; vague questions get vague answers."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "question": {"type": "string", "description": "What to look for."},
-                    "box": {"type": "string", "description": "Optional crop 'x,y,w,h'."},
-                },
-                "required": ["path", "question"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "compare_images",
-            "description": (
-                "LOOK at two images side by side in ONE vision call and get "
-                "the differences back. Use this - not two view_image calls - "
-                "whenever the question is 'how does this differ from the "
-                "reference'. Optionally crop each with box_a/box_b='x,y,w,h' "
-                "in that image's own source pixels."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path_a": {"type": "string", "description": "First image."},
-                    "path_b": {"type": "string", "description": "Second image."},
-                    "question": {"type": "string", "description": "What to compare."},
-                    "box_a": {"type": "string", "description": "Optional crop of A."},
-                    "box_b": {"type": "string", "description": "Optional crop of B."},
-                },
-                "required": ["path_a", "path_b", "question"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "finish",
-            "description": (
-                "Call when the goal is met or you are blocked. Ends the run."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "summary": {"type": "string", "description": "What you did, with numbers."},
-                    "status": {
-                        "type": "string",
-                        "enum": ["done", "blocked"],
-                        "description": "done if the goal is met, blocked otherwise.",
-                    },
-                },
-                "required": ["summary", "status"],
-            },
-        },
-    },
+    _tool("bash",
+          "Run a shell command in the workspace. Returns exit code, stdout and "
+          "stderr.",
+          {"command": {"type": "string"}}, ["command"]),
+
+    _tool("read_file",
+          "Read a text file with line numbers.",
+          {"path": _PATH,
+           "offset": {"type": "integer", "description": "First line, 1-based."},
+           "limit": {"type": "integer", "description": "How many lines."}},
+          ["path"]),
+
+    _tool("write_file",
+          "Write a text file, overwriting it. Short files only - use bash with a "
+          "quoted heredoc for anything long, because a big string argument gets "
+          "truncated mid-JSON and the call is rejected.",
+          {"path": _PATH, "content": {"type": "string"}}, ["path", "content"]),
+
+    _tool("edit_file",
+          "Replace the first exact occurrence of old_text with new_text. Refuses "
+          "if old_text is missing or ambiguous.",
+          {"path": _PATH,
+           "old_text": {"type": "string"},
+           "new_text": {"type": "string"}},
+          ["path", "old_text", "new_text"]),
+
+    _tool("view_image",
+          "Look at one image and ask a question about it. For a close look at a "
+          "detail, pass a box in source pixels - without one the whole frame is "
+          "downscaled to 1024px and you see nothing of the kind.",
+          {"path": _PATH,
+           "question": {"type": "string"},
+           "box": {"type": "string",
+                   "description": "'x,y,w,h' in source pixels. Optional."}},
+          ["path", "question"]),
+
+    _tool("compare_images",
+          "Put TWO images in one vision call and ask how they differ. Use this "
+          "rather than two view_image calls whenever the question is about a "
+          "difference: two independent descriptions are not a comparison.",
+          {"path_a": _PATH, "path_b": _PATH,
+           "question": {"type": "string"},
+           "box_a": {"type": "string", "description": "'x,y,w,h'. Optional."},
+           "box_b": {"type": "string", "description": "'x,y,w,h'. Optional."}},
+          ["path_a", "path_b", "question"]),
+
+    _tool("segment",
+          "Drop the background and stand the garment on a white plate. Works on "
+          "the source AND on any candidate you have generated, so a candidate "
+          "that came back on a grey or dirty plate can be cleaned and then "
+          "generated from. Free. It chooses where the result goes: cand_03 "
+          "becomes cand_03s, which is a name every other tool accepts. It does "
+          "NOT remove tags, pins or clips - only the background.",
+          {"image": _CANDIDATE}, ["image"]),
+
+    _tool("prompt_show",
+          "Show the prompt: every section, which ones are still empty, the word "
+          "count, and what the guardrails make of it. Free, and the way to check "
+          "a prompt before spending on it.",
+          {}),
+
+    _tool("prompt_set",
+          "Add a prompt section or replace one, leaving every other section "
+          "byte-for-byte alone. The seeded sections are garment, fidelity, "
+          "flatten, pose, background, reference - but any name works, so a "
+          "detail none of them covers gets its own.",
+          {"section": {"type": "string"},
+           "text": {"type": "string"}},
+          ["section", "text"]),
+
+    _tool("prompt_remove",
+          "Delete a prompt section.",
+          {"section": {"type": "string"}}, ["section"]),
+
+    _tool("prompt_replace",
+          "Throw away every section and write the whole prompt as one block. "
+          "Destructive - use prompt_set when you only mean to change one thing.",
+          {"text": {"type": "string"}}, ["text"]),
+
+    _tool("generate",
+          "THE ONLY THING THAT COSTS MONEY. Send the prompt and two images to "
+          "fal.ai and get candidates back. `source` is image 1: 'source' for the "
+          "original segmented photo, or a candidate name to edit an earlier "
+          "attempt instead of starting over. The reference is always image 2. "
+          "Each image counts against the run's budget and the budget never "
+          "refills. Generate one or two at a time and look at what comes back.",
+          {"source": dict(_CANDIDATE, default="source"),
+           "num": {"type": "integer",
+                   "description": "Images to buy in this call. Default 1."},
+           "resolution": {"type": "string", "enum": ["1K", "2K", "4K"],
+                          "description": "Default 2K. 4K costs double."},
+           "seed": {"type": "integer",
+                    "description": "The draw to sample. Same prompt + same seed "
+                                   "= same picture, so CHANGE IT to escape a bad "
+                                   "draw the prompt cannot fix - a second garment "
+                                   "in frame, a stray shadow, sleeves that came "
+                                   "out wrong on this sample but not the last. "
+                                   "Sets the base for the wave: seed 500 with "
+                                   "num 2 gives you 500 and 501. Omit it and "
+                                   "numbering continues automatically."},
+           "use_reference": {"type": "boolean",
+                             "description": "Default true. False sends image 1 "
+                                            "alone."},
+           "match_pose": {"type": "boolean",
+                          "description": "Take the sleeve angle and cuff spacing "
+                                         "off image 2 instead of from your words. "
+                                         "Use it when you have already described "
+                                         "the pose correctly and the generator "
+                                         "ignored you - a sleeve angle is a "
+                                         "geometric fact and words are lossy. It "
+                                         "raises the odds of a SECOND garment in "
+                                         "frame, so buy one or two and change the "
+                                         "seed if a duplicate appears rather than "
+                                         "editing the prompt."},
+           "force": {"type": "boolean",
+                     "description": "Send a prompt the guardrails refused. "
+                                    "Recorded."}},
+          []),
+
+    _tool("polish",
+          "THE LAST STEP, and it costs money. Runs a DIFFERENT model "
+          "(openai/gpt-image-2/edit) over one finished candidate with a narrow "
+          "instruction: take the wrinkles out and change nothing else. Use it "
+          "once, on the candidate you have already decided to ship, when the lay "
+          "and the construction are right and only creases are left. It is not a "
+          "way to fix a bad candidate - a targeted edit cannot re-lay a garment. "
+          "cand_04 becomes cand_04p. The result is measured against the original "
+          "source automatically and warns you if the knit got ironed flat.",
+          {"candidate": dict(_CANDIDATE,
+                             description="The candidate to clean up. Defaults to "
+                                         "whatever pick_best last named."),
+           "instruction": {"type": "string",
+                           "description": "Optional. Overrides the default "
+                                          "de-wrinkle instruction. Whatever you "
+                                          "write, say that the fabric keeps its "
+                                          "real texture, or it comes back "
+                                          "repainted smooth."}},
+          []),
+
+    _tool("measure",
+          "Re-read the three free numbers for a candidate against the ORIGINAL "
+          "source: silhouette IoU, colour dE, and wrinkle energy as a ratio. "
+          "They already arrive automatically with each new candidate, so this is "
+          "for after a segmentation pass, or when a reading has scrolled out of "
+          "context. Free.",
+          {"candidate": _CANDIDATE}, ["candidate"]),
+
+    _tool("note",
+          "Record what you concluded about a candidate. Free. This is also what "
+          "survives when its image is elided from the conversation - a candidate "
+          "with no note collapses to a filename and three numbers, so note "
+          "anything you want to be able to compare against later.",
+          {"candidate": _CANDIDATE, "text": {"type": "string"}},
+          ["candidate", "text"]),
+
+    _tool("pick_best",
+          "Name the candidate you would ship, and why. Call it as often as you "
+          "like - the last call wins, and whatever is named when the run ends is "
+          "what gets delivered.",
+          {"candidate": _CANDIDATE, "why": {"type": "string"}},
+          ["candidate", "why"]),
+
+    _tool("finish",
+          "End the run. status: 'done' when the result is good enough; "
+          "'budget_exhausted' when the images ran out and you are shipping the "
+          "best of them; 'gave_up' when nothing is worth shipping; "
+          "'no_candidates' when nothing was ever generated.",
+          {"summary": {"type": "string",
+                       "description": "What you did, what you shipped, and what "
+                                      "it still carries. Use the numbers you "
+                                      "actually saw."},
+           "status": {"type": "string", "enum": list(FINISH_STATUSES)}},
+          ["summary", "status"]),
 ]
 
 
 class Tools:
-    def __init__(self, workspace: Path, run_dir: Path, allow_outside: bool):
+    def __init__(self, workspace: Path, run_dir: Path, allow_outside: bool,
+                 source_photo: Path | None = None):
         self.ws = workspace
         self.run_dir = run_dir
         self.allow_outside = allow_outside
         self.env = child_env(workspace)
         self.python = find_python()
+        # The RAW photo, kept so segment("source") can be re-run. Everything
+        # else works from archive/source_clean.jpg, which is what it produces.
+        self.source_photo = source_photo or (workspace / "inputs" /
+                                             "off_set_image.jpg")
         self._spool = 0
 
     # -- path handling ----------------------------------------------------
@@ -698,9 +784,11 @@ class Tools:
             return None, (f"ERROR: Pillow not available to the harness "
                           f"interpreter ({sys.executable}). Run the harness "
                           f"via ./run.sh.")
-        p = self.resolve(path)
-        if not p.exists():
-            return None, f"ERROR: no such image: {p}"
+        p = self.resolve_image(path)
+        if p is None or not p.exists():
+            return None, (f"ERROR: no such image: {path}\n"
+                          f"Candidate names work here too - {self._known()} - "
+                          f"and so does a bare filename from the run's archive.")
         try:
             im = Image.open(p)
             im.load()
@@ -807,7 +895,8 @@ class Tools:
         b = self._prep_image(path_b, question, box_b)
         if b[0] is None:
             return b[1]
-        name_a, name_b = self.resolve(path_a).name, self.resolve(path_b).name
+        name_a = (self.resolve_image(path_a) or Path(path_a)).name
+        name_b = (self.resolve_image(path_b) or Path(path_b)).name
         answer = self._ask_vision(
             f"You are given two images. The FIRST is {name_a}. The SECOND is "
             f"{name_b}.\n\n{question}\n\nAnswer concretely in a few sentences, "
@@ -815,6 +904,204 @@ class Tools:
             f"differences you can actually see; if you cannot tell, say so "
             f"rather than guessing.", [a[0], b[0]], max_tokens=4000)
         return f"[1st: {a[1]}]\n[2nd: {b[1]}]\n{answer}"
+
+    # -- the three real capabilities, plus the free bookkeeping -----------
+
+    def _script(self, name: str, argv: list[str], timeout: int = 900) -> str:
+        """Run one of this project's scripts and hand back what it printed.
+
+        Shelled out rather than imported so that a tool call and the same thing
+        typed into bash behave identically - same interpreter, same environment,
+        same steps.log line. A run that debugs one has debugged the other.
+        """
+        cmd = [self.python, str(HERE / "tools" / name), *argv]
+        TR.info("tool", f"exec {name}", body=" ".join(cmd))
+        t0 = time.time()
+        try:
+            r = subprocess.run(cmd, cwd=self.ws, env=self.env,
+                               capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return f"TIMEOUT: {name} was killed after {timeout}s."
+        out = (r.stdout or "") + (r.stderr or "")
+        TR.info("tool", f"{name} exit={r.returncode}",
+                secs=round(time.time() - t0, 2), body=out)
+        return out.strip() or f"exit={r.returncode} (no output)"
+
+    def _archive(self) -> Path:
+        return self.run_dir / "archive"
+
+    def _image_path(self, name: str) -> Path | None:
+        """A candidate name to a file. None when the name is not one."""
+        name = (name or "").strip()
+        arch = self._archive()
+        if name in ("source", "src", "original"):
+            return arch / "source_clean.jpg"
+        if re.fullmatch(r"cand_\d+[sp]*", name):
+            return arch / f"{name}.png"
+        return None
+
+    def resolve_image(self, path: str) -> Path | None:
+        """Anything that names an image: a candidate name, a bare filename, a path.
+
+        The image tools used to take paths only, while every other tool took
+        names, and the seam cost four turns of a real run: the model called
+        view_image("cand_02s.png"), got "no such image" because that resolves
+        against the workspace root, and then spent three turns running find and
+        ls to rediscover a file it had just created. Accepting all three forms
+        removes the class of mistake rather than documenting it.
+        """
+        p = self._image_path(path)                     # cand_03, cand_03s, source
+        if p is not None:
+            return p
+        direct = self.resolve(path)                    # a real path, relative or not
+        if direct.exists():
+            return direct
+        inside = self._archive() / Path(path).name     # a bare archive filename
+        return inside if inside.exists() else direct
+
+    def _known(self) -> str:
+        have = sorted(p.stem for p in self._archive().glob("cand_*.png"))
+        return ", ".join(["source"] + have)
+
+    def segment(self, image: str) -> str:
+        """Drop the background on the source or on any candidate.
+
+        The destination is chosen here rather than passed in, and that is the
+        whole point. A model free to segment to /tmp/x.png and then generate from
+        that path would enter lineage.json with no parent and depth 0 - the drift
+        warning would go quiet at exactly the point in the chain where it matters
+        most. cand_03 becomes cand_03s, which every other tool accepts.
+        """
+        import generate as GEN
+
+        arch = self._archive()
+        arch.mkdir(parents=True, exist_ok=True)
+        name = (image or "").strip()
+
+        if name in ("source", "src", "original", ""):
+            src, out, child = self.source_photo, arch / "source_clean.jpg", None
+        else:
+            src = self._image_path(name)
+            if src is None:
+                return (f"ERROR: '{image}' is not a candidate name. "
+                        f"Known: {self._known()}")
+            if not src.exists():
+                return f"ERROR: {src.name} does not exist. Known: {self._known()}"
+            child = f"{name.rstrip('s')}s" if not name.endswith("s") else name
+            out = arch / f"{child}.png"
+
+        text = self._script("segment.py", ["--run", str(self.run_dir),
+                                           "--off-set", str(src),
+                                           "--out", str(out)])
+        if not out.exists():
+            return (f"{text}\n\nSegmentation produced nothing; "
+                    f"{src.name} is unchanged and still usable.")
+
+        if child:
+            # Depth is the PARENT's, unchanged. Segmentation drops a background;
+            # it does not redraw anything and cannot invent detail, so it is not
+            # a hop away from the real garment and must not read as one.
+            parent_depth = GEN.depth_of(self.run_dir, name)
+            GEN.record(self.run_dir, child, {
+                "parent": name, "parent_kind": "segmentation",
+                "depth": parent_depth, "prompt_hash": None, "seed": None,
+                "created": datetime.now().isoformat(timespec="seconds"),
+            })
+            text += (f"\n\nSaved as {child} (depth {parent_depth}, same as "
+                     f"{name} - segmentation adds no drift). Use it anywhere a "
+                     f"candidate name is taken: generate(source='{child}'), "
+                     f"measure('{child}'), pick_best('{child}').")
+        return text
+
+    def prompt_show(self) -> str:
+        import promptfile as PF
+        try:
+            return PF.show(self.run_dir, self._archive() / "reference.jpg")
+        except RuntimeError as e:
+            return f"ERROR: {e}"
+
+    def prompt_set(self, section: str, text: str) -> str:
+        import promptfile as PF
+        return PF.set_section(self.run_dir, section, text)
+
+    def prompt_remove(self, section: str) -> str:
+        import promptfile as PF
+        return PF.remove_section(self.run_dir, section)
+
+    def prompt_replace(self, text: str) -> str:
+        import promptfile as PF
+        return PF.replace_all(self.run_dir, text)
+
+    def polish(self, candidate: str | None = None,
+               instruction: str | None = None) -> str:
+        argv = ["--run", str(self.run_dir)]
+        if candidate:
+            argv += ["--candidate", str(candidate)]
+        if instruction:
+            argv += ["--instruction", str(instruction)]
+        return self._script("polish.py", argv, timeout=900)
+
+    def measure(self, candidate: str) -> str:
+        import metrics as MET
+        src = self._archive() / "source_clean.jpg"
+        p = self._image_path(candidate)
+        if p is None:
+            return (f"ERROR: '{candidate}' is not a candidate name. "
+                    f"Known: {self._known()}")
+        if not p.exists():
+            return f"ERROR: {p.name} does not exist. Known: {self._known()}"
+        if not src.exists():
+            return f"ERROR: no {src.name} to measure against."
+        try:
+            return MET.line(MET.compare(src, p), candidate)
+        except Exception as e:  # noqa: BLE001
+            return f"ERROR measuring {candidate}: {type(e).__name__}: {e}"
+
+    def note(self, candidate: str, text: str) -> str:
+        """What you concluded about a candidate, kept where elision can find it."""
+        f = self._archive() / "notes.json"
+        book = {}
+        if f.exists():
+            try:
+                book = json.loads(f.read_text())
+            except (json.JSONDecodeError, OSError):
+                book = {}
+        book[candidate] = text.strip()
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(book, indent=2) + "\n")
+        return (f"noted on {candidate}. This is what stays in the conversation "
+                f"once its image is elided.")
+
+    def pick_best(self, candidate: str, why: str) -> str:
+        p = self._image_path(candidate)
+        if p is None:
+            return (f"ERROR: '{candidate}' is not a candidate name. "
+                    f"Known: {self._known()}")
+        if not p.exists():
+            return f"ERROR: {p.name} does not exist. Known: {self._known()}"
+        f = self._archive() / "best.json"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(
+            {"candidate": candidate, "why": why.strip(),
+             "at": datetime.now().isoformat(timespec="seconds")}, indent=2) + "\n")
+        return (f"best is now {candidate}. Call pick_best again to change it; "
+                f"whatever is named when the run ends is what ships.")
+
+    def generate(self, source: str = "source", num: int = 1,
+                 resolution: str = "2K", seed: int | None = None,
+                 use_reference: bool = True, match_pose: bool = False,
+                 force: bool = False) -> str:
+        argv = ["--run", str(self.run_dir), "--source", str(source),
+                "--num", str(int(num or 1)), "--resolution", str(resolution)]
+        if seed is not None:
+            argv += ["--seed", str(int(seed))]
+        if not use_reference:
+            argv.append("--no-reference")
+        if match_pose:
+            argv.append("--match-pose")
+        if force:
+            argv.append("--force")
+        return self._script("generate.py", argv, timeout=1800)
 
     def finish(self, summary: str, status: str = "done") -> str:
         return json.dumps({"status": status, "summary": summary})
@@ -912,48 +1199,57 @@ being asked about - not any similarly-named file elsewhere on this machine.
 
 {task}
 
+# Your budget
+
+{budget} image(s) of fal.ai generation for this whole run, and the counter never
+refills. Everything else - looking, comparing, measuring, segmenting, rewriting
+the prompt - is free and unlimited.
+
 # How to work
 
 - Take ONE step at a time. Call a tool, read the result, then decide the next step.
+- LOOK before you spend and look after. The two images in your first message are
+  the whole brief: image 1 is the garment you must keep, image 2 is the lay you
+  are aiming at. compare_images puts two frames in a single vision call - use it
+  whenever the question is how one differs from another, because two separate
+  view_image calls give you two independent descriptions and the gap between two
+  descriptions is not a measured difference.
+- Build the prompt with prompt_set, one section at a time, and check it with
+  prompt_show before generating. Both are free. When a batch comes back wrong in
+  one respect, change the ONE section that governs it - rewriting the whole
+  prompt re-rolls every decision that was already right.
+- Buy small. One or two images, then look at them. A whole budget spent in one
+  wave cannot learn anything from itself.
+- The three numbers that arrive under each candidate are advice, not a score.
+  Nothing is blocked or ranked by them. They exist to catch the failure your eyes
+  miss: the generator drawing a NEW garment that is already flat instead of
+  re-laying the real one. Your eyes have the last word in both directions -
+  reject a good-looking redraw, and keep a candidate whose numbers you can see
+  are wrong.
 - Ground every claim in output you actually saw. Never report a number you did
   not measure or a file you did not create.
-- NEVER rely on another program's default arguments. Pass every input and output
-  path explicitly, as an absolute path. A script that defaults its inputs will
-  happily process files from its own directory instead of this workspace, and
-  produce real, precise, entirely wrong numbers. Matching file names and even
-  matching image dimensions do NOT prove you processed the right file - check
-  the fingerprints in the inventory above.
-- Before you report a result, confirm it derives from the workspace inputs. If
-  you produced an image, view_image it and check the subject is what the
-  inventory says it should be.
-- Prefer small, checkable steps over one large script. When something fails,
-  read the error before changing anything.
-- Numbers are not proof on their own. When the work is visual, call view_image
-  and LOOK before declaring success. When the question is how one image differs
-  from another, use compare_images - it puts both in a single vision call. Two
-  separate view_image calls give you two independent descriptions, and the gap
-  between two descriptions is not a measured difference.
 - Keep tool output small. Print the few numbers you need, not whole arrays;
   pipe long output through head, grep or wc.
-- write_file is for short files. Anything long - a report, a README - must be
-  written with bash and a quoted heredoc, appending section by section. A big
-  string argument gets truncated mid-JSON and the whole call is rejected.
-- When the goal is met - or you are genuinely blocked - call finish() with a
-  summary containing the concrete numbers you measured.
+- write_file is for short files. Anything long - a report - must be written with
+  bash and a quoted heredoc, appending section by section. A big string argument
+  gets truncated mid-JSON and the whole call is rejected.
+- Call pick_best as soon as you have a candidate worth shipping, and update it as
+  better ones arrive. It is free, and it means an interrupted run still delivers.
+- When the result is good enough, or the images run out, call finish().
 
-You have a limited context window. Be economical: it is the scarcest resource
-you have, and a run that fills it ends before the work does.
+You have a limited context window. Candidate images are dropped from the
+conversation after a couple of turns, and a candidate you left a note on keeps
+its note when that happens. One with no note collapses to a filename and three
+numbers.
 """
 
 
 SKIP_DIRS = {"runs", ".git", "__pycache__", "node_modules", ".venv",
              "output", "notes",
-             # 45 reference photos the agent must not choose between. The
-             # reference is picked before the first turn by
-             # tools/select_reference.py and installed into inputs/; listing the
-             # library as well invites a second, hand-picked opinion and would
-             # eat the whole inventory at 8 files per folder.
-             "library_reference"}
+             # The retired pipeline and its 45-image reference library. Not
+             # inputs, not callable, and at 8 files per folder they would crowd
+             # the two images this run is actually about out of the listing.
+             "old"}
 
 # No single folder may occupy more than this much of the listing. A bulk asset
 # directory otherwise crowds out the files the run is actually about.
@@ -1036,10 +1332,36 @@ def build_inventory(ws: Path, limit: int = 60) -> str:
     return "\n".join(rows) or "  (empty workspace)"
 
 
+# How many candidate images stay inline. Two, so the model can hold a new
+# candidate beside the one it is trying to beat.
+KEEP_IMAGES = 2
+
+
+def encode_image(path: Path, max_dim: int = 1024) -> str | None:
+    """One image as a base64 JPEG, small enough to live in the conversation."""
+    try:
+        from PIL import Image
+        im = Image.open(path)
+        im.load()
+        if max(im.size) > max_dim:
+            im.thumbnail((max_dim, max_dim), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.convert("RGB").save(buf, "JPEG", quality=90)
+        return base64.b64encode(buf.getvalue()).decode()
+    except Exception as e:  # noqa: BLE001 - a missing image is not a crash
+        TR.warn("session", f"could not encode {path}", error=str(e))
+        return None
+
+
+def image_block(b64: str) -> dict:
+    return {"type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+
+
 class Session:
     def __init__(self, task: str, skill_text: str, workspace: Path, run_dir: Path,
                  tools: Tools, approver: Approver, max_iters: int, verbose: bool,
-                 n_ctx: int = N_CTX_FALLBACK):
+                 n_ctx: int = N_CTX_FALLBACK, budget: int = 10):
         self.ws = workspace
         self.run_dir = run_dir
         self.tools = tools
@@ -1047,10 +1369,12 @@ class Session:
         self.max_iters = max_iters
         self.verbose = verbose
         self.n_ctx = n_ctx
+        self.budget = budget
         self.compact_at = int(n_ctx * COMPACT_FRACTION)
         self.prompt_tokens = 0
         self.total_completion = 0
         self.compactions = 0
+        self.nudged = False
 
         skill_block = ""
         if skill_text:
@@ -1066,13 +1390,49 @@ class Session:
             ws=workspace, python=tools.python,
             today=datetime.now().strftime("%Y-%m-%d"),
             inventory=build_inventory(workspace),
-            skill_block=skill_block, task=task,
+            skill_block=skill_block, task=task, budget=budget,
         )
+
+        # Turn 1 carries both images, not just the words. The job is "make image
+        # 1 look like image 2", and a run that has to spend a turn asking to see
+        # its own inputs has started by describing the problem to itself instead
+        # of looking at it.
+        # Read the source's own fastenings once, up front. The standing clause
+        # asks for them to go whether or not anyone looked, but knowing what is
+        # actually there turns "did the pins go" from a guess into a comparison -
+        # and the model cannot tell a pin that was removed from one that was
+        # never in the picture unless it was told at the start.
+        brief = self._brief()
+        found = self._props_check_path(run_dir / "archive" / "source_clean.jpg")
+        if found:
+            brief += ("\n\nWHAT IS ON THE SOURCE RIGHT NOW (read automatically "
+                      "from image 1):\n" + textwrap.indent(found, "  ")
+                      + "\n\nEvery prompt already asks for the temporary "
+                      "fastenings to go and the sewn-in detail to stay, so you "
+                      "do not need to write that. This is here so you can tell "
+                      "whether a candidate actually did it.")
+
+        first = [{"type": "text", "text": task + "\n\n" + brief}]
+        for label, p in (("IMAGE 1 - the garment, background already dropped. "
+                          "This is what fal.ai receives as image 1.",
+                          run_dir / "archive" / "source_clean.jpg"),
+                         ("IMAGE 2 - the reference laydown. Copy how it LIES "
+                          "and nothing else: its construction, trim and tone "
+                          "belong to a different product.",
+                          run_dir / "archive" / "reference.jpg")):
+            b64 = encode_image(p) if p.exists() else None
+            if b64:
+                first.append({"type": "text", "text": label})
+                first.append(image_block(b64))
+
         self.messages = [
             {"role": "system", "content": system},
-            {"role": "user", "content": task},
+            {"role": "user", "content": first},
         ]
-        self.pinned = 2  # never compact the system prompt or the goal
+        # Never elided, never compacted. These two images are the standard every
+        # later judgement is made against, and losing them mid-run means the
+        # model starts comparing candidates to each other instead.
+        self.pinned = 2
         self.log_path = run_dir / "transcript.jsonl"
 
         # The system prompt is assembled here from the skill and a fingerprint
@@ -1083,10 +1443,100 @@ class Session:
         TR.info("session", "skill loaded" if skill_text else "no skill",
                 chars=len(skill_text or ""))
 
+    def _brief(self) -> str:
+        arch = self.run_dir / "archive"
+        return (
+            "Both images are below. Image 1 is the product and its construction, "
+            "colour and texture must survive exactly. Image 2 shows the target "
+            "lay - square, flat, sleeves symmetric, clean white plate, no "
+            "shadows. Getting image 1 to lie like image 2, without redrawing it, "
+            "is the whole job.\n\n"
+            "THE ONLY TWO PATHS YOU NEED:\n"
+            f"  image 1   {arch / 'source_clean.jpg'}\n"
+            f"  image 2   {arch / 'reference.jpg'}\n\n"
+            "Use those exact paths for view_image and compare_images. The raw "
+            "photo in inputs/ is NOT what fal.ai receives - it still has the "
+            "room, the wall and the shadow in it. Writing a prompt from the raw "
+            "file describes things the generator was never sent, and it draws "
+            "them: one run described the raw input's hang tag, and all four "
+            "candidates came back wearing one.\n\n"
+            "Start by looking at both and saying what actually differs. Then "
+            "write the prompt. Then buy one or two images and look at them.")
+
     def log(self, kind: str, payload):
         with self.log_path.open("a") as f:
             f.write(json.dumps({"t": time.time(), "kind": kind, "data": payload},
                                default=str) + "\n")
+
+    # -- candidates in the conversation ------------------------------------
+    def notes(self) -> dict:
+        f = self.run_dir / "archive" / "notes.json"
+        if not f.exists():
+            return {}
+        try:
+            return json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def attach_image(self, name: str, path: Path, caption: str) -> None:
+        """Put a candidate in front of the model as a picture, not a filename."""
+        b64 = encode_image(path)
+        if not b64:
+            return
+        self.messages.append({
+            "role": "user",
+            "_image": name, "_caption": caption,
+            "content": [{"type": "text", "text": caption}, image_block(b64)],
+        })
+        TR.info("session", f"attached {name} to the conversation")
+
+    def elide_images(self) -> int:
+        """Keep the last KEEP_IMAGES candidate pictures; the rest become text.
+
+        RUNS EVERY TURN, ON PURPOSE, and not as part of compact(). Full
+        compaction only fires past COMPACT_FRACTION of the window, which three
+        or four candidates will never reach - so this rule would sit untested
+        until a ten-image run, which is the worst possible place to find out it
+        is wrong. Unconditional means every run exercises it, and how many images
+        are in the conversation stops being a function of how long the prompt is.
+
+        A candidate the model re-viewed comes back inline through the normal
+        vision path and is elided again next turn like any other. Re-viewing buys
+        one turn of attention, not permanence.
+        """
+        book = self.notes()
+
+        def as_text(m: dict) -> str:
+            note = (book.get(m["_image"]) or "").strip()
+            return (m.get("_caption", m["_image"])
+                    + (f"\n  your note: {note}" if note else
+                       "\n  (image dropped from the conversation to save "
+                       "context, and you left no note on it. view_image brings "
+                       "it back for one turn.)"))
+
+        # Already-elided entries are re-rendered too, not just skipped. The
+        # natural order is look-then-note, so a note is usually written a turn or
+        # two AFTER the candidate it describes - by which time that candidate can
+        # already be text. Rendering once at elision would drop every note
+        # written late, which is most of them, and the model would have no way to
+        # tell: the tool said "noted" and the note simply never appeared.
+        for m in self.messages[self.pinned:]:
+            if m.get("_elided") and m.get("_image"):
+                m["content"] = as_text(m)
+
+        live = [m for m in self.messages[self.pinned:]
+                if m.get("_image") and not m.get("_elided")]
+        if len(live) <= KEEP_IMAGES:
+            return 0
+        dropped = 0
+        for m in live[:-KEEP_IMAGES]:
+            m["content"] = as_text(m)
+            m["_elided"] = True
+            dropped += 1
+        if dropped:
+            TR.debug("context", f"elided {dropped} candidate image(s)",
+                     kept=KEEP_IMAGES)
+        return dropped
 
     # -- context management ------------------------------------------------
     def compact(self):
@@ -1121,41 +1571,61 @@ class Session:
                 for m in self.messages]
 
     # -- main loop ---------------------------------------------------------
-    def delivered(self) -> bool:
-        """Is there anything in output/ yet."""
-        return any((self.run_dir / "output").glob("pick*.png"))
+    def candidates(self) -> list[str]:
+        """Billed images on disk. Segmented derivatives do not count as buys."""
+        return sorted(p.stem for p in (self.run_dir / "archive").glob("cand_*.png")
+                      if re.fullmatch(r"cand_\d+", p.stem))
+
+    def best(self) -> dict | None:
+        f = self.run_dir / "archive" / "best.json"
+        if not f.exists():
+            return None
+        try:
+            return json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def images_left(self) -> int:
+        return max(0, self.budget - len(self.candidates()))
 
     def run(self) -> dict:
         result = {"status": "max_iters", "summary": "Hit the iteration cap."}
-        warned_late = False
 
         for i in range(1, self.max_iters + 1):
+            # Unconditional, before anything else. See elide_images().
+            self.elide_images()
             if self.prompt_tokens > self.compact_at:
                 self.compact()
 
-            # Three turns out, with nothing delivered, the run is told plainly
-            # that it is nearly over. A real run spent its last thirty turns
-            # appealing construction flags image by image and reached the cap
-            # with an empty output/ and ten paid-for images in archive/. It did
-            # not run out of information; it ran out of turns while deciding.
-            left = self.max_iters - i + 1
-            if left <= 3 and not warned_late and not self.delivered():
-                warned_late = True
-                TR.warn("session", "delivery warning injected", turns_left=left)
+            # The nudge, once, and only when all three hold. The candidate count
+            # is what makes it safe: without it, a zero-budget run or one whose
+            # first generation failed gets told to "mark your best and finish"
+            # with nothing on disk to mark, which is advice it cannot follow and
+            # a turn it cannot spend well. A real run reached its cap mid-appeal
+            # with ten paid-for images and nothing delivered - that is the case
+            # this exists for, and that run had candidates.
+            turns_left = self.max_iters - i + 1
+            if (not self.nudged and self.candidates()
+                    and (self.images_left() <= 2 or turns_left <= 3)
+                    and self.best() is None):
+                self.nudged = True
+                TR.warn("session", "delivery nudge injected",
+                        turns_left=turns_left, images_left=self.images_left(),
+                        candidates=len(self.candidates()))
                 self.messages.append({
                     "role": "user",
                     "content": (
-                        f"{left} turn(s) left before the run is cut off, and "
-                        f"output/ is still empty. Stop investigating and "
-                        f"deliver now:\n"
-                        f"  cd {self.ws}/tools && {self.tools.python} "
-                        f"grade_flats.py --run {self.run_dir} --ship-faithful 4\n"
-                        f"then write LOG.md and call finish(). It ships the "
-                        f"most faithful candidates first and prints exactly "
-                        f"what each one carries, so an imperfect batch is "
-                        f"still a delivery with its costs named. Shipping four "
-                        f"flagged images with the flags written down beats "
-                        f"shipping nothing."),
+                        f"{turns_left} turn(s) and {self.images_left()} image(s) "
+                        f"left, and nothing is marked as best yet. You have "
+                        f"{len(self.candidates())} candidate(s) on disk, all "
+                        f"already paid for.\n\n"
+                        f"Call pick_best now with whichever one you would defend, "
+                        f"even if none of them is what you wanted - naming the "
+                        f"least bad one and saying what it carries is a delivery; "
+                        f"leaving it unnamed is not. Then finish() with an honest "
+                        f"status: 'done' if it is good enough, "
+                        f"'budget_exhausted' if you simply ran out of images, "
+                        f"'gave_up' if nothing here is shippable."),
                 })
 
             TR.rule(f"turn {i}/{self.max_iters}")
@@ -1257,7 +1727,20 @@ class Session:
 
                 if name == "finish":
                     result = {"status": args.get("status", "done"),
-                              "summary": args.get("summary", "")}
+                              "summary": args.get("summary", ""),
+                              "candidates": len(self.candidates()),
+                              "best": (self.best() or {}).get("candidate")}
+                    # A status can never claim more than the run delivered.
+                    # finish("done") with nothing generated would otherwise exit
+                    # 0 and ship nothing, which reads downstream as a successful
+                    # delivery of a garment nobody ever produced.
+                    if not result["candidates"] and result["status"] != "no_candidates":
+                        TR.warn("session",
+                                f"finish({result['status']}) with no candidates "
+                                f"- recorded as no_candidates",
+                                claimed=result["status"])
+                        result["claimed_status"] = result["status"]
+                        result["status"] = "no_candidates"
                     self.log("finish", result)
                     TR.info("session", f"finish({result['status']}) on turn {i}",
                             body=result["summary"])
@@ -1281,9 +1764,148 @@ class Session:
                 self._show_result(out)
                 self._tool_result(call, out)
 
+                if name == "generate" and allowed:
+                    self._attach_new_candidates()
+
         TR.warn("session", "hit the iteration cap without finish()",
                 max_iters=self.max_iters)
         return result
+
+    # Asked about the LAY and nothing else. The two garments are different
+    # products, so any open question about how they differ comes back describing
+    # collars and colours - which is true, irrelevant, and drowns the one thing
+    # the reference exists to settle.
+    LAY_QUESTION = (
+        "Compare ONLY how the two garments are arranged - their pose on the "
+        "plate. Ignore colour, pattern, trim, collar and construction entirely; "
+        "these are different products and are meant to differ there.\n\n"
+        "Answer these in order:\n"
+        "1. In the SECOND image (the reference), what angle do the sleeves make "
+        "away from the body, and how far are the cuffs from the sides?\n"
+        "2. In the FIRST image, what angle and distance?\n"
+        "3. Do they match? If not, say which way the first one is wrong - "
+        "sleeves too far in, too far out, too high, too low.\n"
+        "4. Are the shoulders and hem level, and is the garment square to the "
+        "frame?\n"
+        "Be specific about angles. Two or three sentences.")
+
+    # Both halves of the standing clause, asked as one question so the answer
+    # cannot report a clean garment while the logo has quietly gone with the
+    # pins. The clause promises two things and this checks two things.
+    PROPS_QUESTION = (
+        "Look at this garment photograph and answer two questions.\n\n"
+        "1. TEMPORARY FASTENINGS. Is there any pin, pearl-headed pin, clip, "
+        "tack, safety pin, hook, hanger, price ticket, swing tag or piece of "
+        "string visible anywhere - on the garment, at the collar, along the hem "
+        "or at the cuffs? These were holding the garment up for the photograph "
+        "and should all be gone. List anything you can still see and say where.\n"
+        "2. SEWN-IN DETAIL. Are the garment's own sewn-in features still there "
+        "and intact - brand or care labels, embroidery, appliqué, printed or "
+        "knitted logos, and the stitching around them? These are part of the "
+        "product and must NOT have been removed.\n\n"
+        "Answer both in two or three sentences. If you cannot see something "
+        "clearly, say so rather than assuming it is fine.")
+
+    def _props_check_path(self, img: Path) -> str:
+        """The props question against any file. Used on the source at turn 1."""
+        if not img.exists():
+            return ""
+        try:
+            out = self.tools.view_image(str(img), self.PROPS_QUESTION)
+        except Exception as e:  # noqa: BLE001 - a check is not the delivery
+            TR.warn("session", f"props check failed for {img.name}", error=str(e))
+            return ""
+        return "\n".join(l for l in out.splitlines()
+                         if not l.startswith("[")).strip()
+
+    def _props_check(self, name: str) -> str:
+        """Did the pins actually go, and did the logo survive?
+
+        The standing clause in generate.py asks for both. Nothing verified
+        either, and an instruction nobody checks is an instruction you find out
+        about from the delivery. Segmentation cannot remove a pin - it drops the
+        background only - so the clause is the ONLY thing standing between a pin
+        in the source and a pin in the shipped image, which makes it exactly the
+        thing worth confirming.
+
+        Asked about the sewn-in half too, because the two failures are opposite
+        halves of one instruction: a model told to remove attached objects can
+        take the brand label with them, and a clean garment missing its logo
+        would otherwise read as a success.
+        """
+        return self._props_check_path(self.run_dir / "archive" / f"{name}.png")
+
+    def _lay_check(self, name: str) -> str:
+        """Hold the new candidate up against the reference and ask about the pose.
+
+        AUTOMATIC, because leaving it to the model does not work. On
+        runs/20260828_110544 the whole run contained two compare_images calls -
+        source against reference to write the prompt, and source against a
+        candidate to check fidelity - and not one comparing a candidate to the
+        reference. The run checked "is this still the same garment" every time
+        and "did I hit the pose I was aiming at" never once, then shipped a
+        candidate whose sleeves were wrong.
+
+        Free: the vision model is the same local server the agent runs on. It is
+        deliberately a QUESTION rather than a rule - nothing here knows what the
+        right sleeve angle is, and it should not. The reference knows, and this
+        puts the two pictures side by side so the model can see for itself.
+        """
+        ref = self.run_dir / "archive" / "reference.jpg"
+        cand = self.run_dir / "archive" / f"{name}.png"
+        if not ref.exists() or not cand.exists():
+            return ""
+        try:
+            out = self.tools.compare_images(str(cand), str(ref),
+                                            self.LAY_QUESTION)
+        except Exception as e:  # noqa: BLE001 - a check is not the delivery
+            TR.warn("session", f"lay check failed for {name}", error=str(e))
+            return ""
+        # The two "[...]" preamble lines are about image preparation and say
+        # nothing about the garment.
+        body = "\n".join(l for l in out.splitlines()
+                         if not l.startswith("[")).strip()
+        return body
+
+    def _attach_new_candidates(self):
+        """Show what was just bought, with its reading printed underneath.
+
+        generate.py leaves last_generation.json rather than being parsed out of
+        its stdout: the numbers matter enough to be structured, and text scraping
+        would break the first time a print statement moved.
+        """
+        f = self.run_dir / "archive" / "last_generation.json"
+        if not f.exists():
+            return
+        try:
+            info = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            return
+        rows = {m.get("candidate", ""): m for m in info.get("metrics", [])}
+        depth = info.get("depth", 1)
+        for name in info.get("candidates", []):
+            p = self.run_dir / "archive" / f"{name}.png"
+            m = next((v for k, v in rows.items() if Path(k).stem == name), None)
+            caption = f"{name} - just generated from {info.get('source')}"
+            if m:
+                import metrics as MET
+                caption += "\n  " + MET.line(m, name)
+            caption += (f"\n  depth {depth}"
+                        + (" - measured against the ORIGINAL source, not its "
+                           "parent" if depth > 1 else ""))
+            lay = self._lay_check(name)
+            if lay:
+                caption += ("\n\n  LAY vs the reference (asked automatically, "
+                            "pose only):\n"
+                            + textwrap.indent(lay, "    "))
+            props = self._props_check(name)
+            if props:
+                caption += ("\n\n  PINS AND LABELS (asked automatically):\n"
+                            + textwrap.indent(props, "    "))
+            self.attach_image(name, p, caption)
+        # Deleted so the next generate cannot re-attach the same wave if it
+        # fails before writing its own.
+        f.unlink(missing_ok=True)
 
     def _tool_result(self, call, content: str):
         self.messages.append({
@@ -1299,6 +1921,14 @@ class Session:
             detail = args.get("status", "")
         elif name == "view_image":
             detail = f"{args.get('path','')} {args.get('box') or ''} - {args.get('question','')}"
+        elif name == "generate":
+            detail = (f"{args.get('num', 1)} at {args.get('resolution', '2K')} "
+                      f"from {args.get('source', 'source')}  "
+                      f"({self.images_left()} left)")
+        elif name in ("segment", "measure", "note", "pick_best"):
+            detail = f"{args.get('image') or args.get('candidate', '')}"
+        elif name.startswith("prompt_"):
+            detail = args.get("section", "")
         else:
             detail = args.get("path", "")
         detail = " ".join(str(detail).split())
@@ -1358,15 +1988,17 @@ def load_skill(p: Path) -> tuple[str, str]:
 
 
 DEFAULT_TASK = (
-    "Accomplish this skill's goal in the workspace, end to end.\n\n"
-    "Start by orienting yourself: list the workspace, identify the input images, "
-    "and check whether a working implementation already exists that the skill "
-    "refers to. Read before you write.\n\n"
-    "Work incrementally and verify each stage with measurements before moving on. "
-    "Anything that costs money must be justified by a measurement first - say what "
-    "you are about to spend and why before you spend it.\n\n"
-    "Write your outputs to a new timestamped folder under runs/ and finish by "
-    "reporting the numbers you measured."
+    "Re-lay the garment in image 1 so it looks like the laydown in image 2: "
+    "square and flat on a clean white plate, wrinkles and handling folds relaxed, "
+    "no odd creases and no shadows - while staying the SAME garment, with its own "
+    "colour, texture, trim and construction untouched.\n\n"
+    "Work iteratively. Look at both images and say what actually differs. Write "
+    "the prompt section by section. Buy one or two images, look at what came "
+    "back, and decide: change a section and try again from the original, or take "
+    "the best candidate so far and edit that one further. Segmenting a candidate "
+    "to clean up its plate is free and available at any point.\n\n"
+    "Mark your best with pick_best as soon as you have one worth shipping, keep "
+    "it updated, and finish when the result is good enough or the images run out."
 )
 
 
@@ -1405,287 +2037,252 @@ def preflight() -> tuple[str, int]:
         )
 
 
-def pre_clean(workspace: Path, run_dir: Path, python: str) -> Path | None:
-    """Step 0a: erase the tag and drop the background BEFORE the reference is
-    picked.
+def prepare_source(run_dir: Path, source: Path, python: str,
+                   skip: bool) -> tuple[Path, list[str]]:
+    """Segment the off-set photo into archive/source_clean.jpg.
 
-    The matcher scores the off-set photo against library flats that are all
-    clean studio plates. Handed the raw phone photo it is scoring a garment plus
-    a room plus a hang tag against a garment on white, and every point that
-    costs comes off the one comparison the whole run is anchored to.
+    Returns (what generate.py will send as image 1, gate failures).
 
-    Cleaning used to live inside prepare.py, which the agent runs on its first
-    turn - after step 0 had already matched. Same work, wrong order. It runs
-    here now and prepare.py verifies the result instead of redoing it, so there
-    is one cleaning path and the total spend is unchanged.
-
-    Returns (cleaned image or None, gate failures). None is survivable: the
-    caller falls back to the raw input and says so. A non-empty failure list is
-    NOT survivable and parks the run - see the caller.
+    A failure here is survivable: segmentation is a background drop, and a run
+    against the raw photo still produces a garment - it just arrives with the
+    room still in it, which the model can see for itself. So a broken service
+    degrades rather than stopping the run. What does NOT degrade is a result that
+    came back with most of the garment missing; segment.py rejects that itself
+    and the caller decides.
     """
-    # segment.py, not clean.py. The fal object-removal endpoint this step used
-    # to call has been restricted since 2026-08-27 and every run crashed here.
-    # The self-hosted segmentation service does the half that is available -
-    # background dropped, garment on a white plate - and does not remove a tag,
-    # ticket or pin. Those are named by describe.py under TO REMOVE and asked
-    # for in the prompt instead.
-    #
-    # No outline gate runs against a segmentation, so this returns no failures.
-    # The gate existed to catch a generative eraser silently redrawing the
-    # garment; a segmenter either finds the garment or does not, and segment.py
-    # checks that itself before writing anything.
-    script = workspace / "tools" / "segment.py"
-    out = run_dir / "archive" / "offset_upload.jpg"
-    if not script.exists():
-        TR.warn("step0", f"no {script}; matching against the raw input")
-        return None, []
-    print(c(BOLD, "\nstep 0a · segment") +
-          c(DIM, "  (background dropped, so the reference is matched against "
-                 "the clean image)"), flush=True)
-    TR.rule("step 0a - segment")
-    with TR.console_component("step0"):
-        rc = stream_subprocess([python, str(script), "--run", str(run_dir)],
-                               cwd=script.parent, comp="step0")
-    if rc == 0 and out.exists():
-        TR.info("step0", "segmentation ok", out=str(out))
+    arch = run_dir / "archive"
+    arch.mkdir(parents=True, exist_ok=True)
+    out = arch / "source_clean.jpg"
+
+    if skip:
+        shutil.copy2(source, out)
+        print(c(YEL, "  --no-pre-clean: sending the raw photo, background and "
+                     "all."))
+        TR.warn("step0", "pre-clean skipped", source=str(source))
         return out, []
 
-    # Which kind of failure this is decides whether the run may continue, so
-    # read the audit rather than the exit code alone. A gate failure means the
-    # cleaned image is not the same garment as the photograph; anything else
-    # (no key, no network, a crash) leaves the raw input usable.
-    fails = []
-    audit = run_dir / "archive" / "clean_audit.json"
-    if audit.exists():
-        try:
-            attempts = json.loads(audit.read_text()).get("attempts") or []
-            fails = list((attempts[-1] if attempts else {}).get("outline_fails") or [])
-        except (json.JSONDecodeError, OSError):
-            fails = []
-    if fails:
-        TR.error("step0", "pre-clean gate failed", exit_code=rc, fails=fails)
-        return (out if out.exists() else None), fails
-    TR.warn("step0", "pre-clean failed; matching against the raw input",
-            exit_code=rc, out_exists=out.exists())
-    print(c(YEL, f"  pre-clean failed (exit {rc}); the reference will be "
-                 f"matched against the raw input."))
-    return None, []
+    print(c(BOLD, "\nstep 0") + c(DIM, "  segmenting the source"))
+    rc = stream_subprocess(
+        [python, str(HERE / "tools" / "segment.py"),
+         "--run", str(run_dir), "--off-set", str(source), "--out", str(out)],
+        cwd=HERE, comp="step0")
+
+    if rc == 0 and out.exists():
+        return out, []
+
+    rejected = out.with_suffix(".seg_rejected.jpg")
+    if rejected.exists():
+        # The service answered and the answer was wrong - most of the garment
+        # gone. Generating from that spends the whole budget on a source the
+        # pipeline already knows is damaged, and every check downstream then
+        # agrees the garment always looked like that.
+        shutil.copy2(source, out)
+        return out, [f"the segmenter returned an image missing most of the "
+                     f"garment; it is at {rejected.name} for inspection"]
+
+    shutil.copy2(source, out)
+    print(c(YEL, "  segmentation unavailable - continuing from the raw photo."))
+    TR.warn("step0", "segmentation failed; using the raw photo", rc=rc)
+    return out, []
 
 
-def force_ship(workspace: Path, run_dir: Path, python: str, n: int) -> bool:
-    """Deliver from what is already generated, when the agent did not.
+def prepare_reference(run_dir: Path, reference: Path) -> Path:
+    """Install the operator's reference at archive/reference.jpg, desaturated.
 
-    The backstop for the failure this harness has actually produced: a run that
-    reached its iteration cap with ten paid-for images in archive/ and nothing
-    in output/. Every one of those images was billed, graded and then
-    abandoned, because the last turn arrived while the agent was still
-    arbitrating between a grade and a flag.
-
-    Nothing here is a judgement call. grade_flats.py --ship-faithful picks the
-    candidates stage 3 found intact, backfills by grade only if there are too
-    few, and prints what each pick carries. If the agent already shipped, this
-    does nothing at all.
-
-    The expected-changes declaration is carried over from the agent's own last
-    grading pass, so the forced delivery reproduces the judgement the run
-    already made rather than taking a fresh and different one.
+    Greyscale on purpose, and this is the one thing done TO the reference rather
+    than with it. It is a shape and lay reference, never a colour target: sent in
+    colour it is read as one, and the garment comes back wearing the reference's
+    tone. A reference that already arrived greyscale is copied unchanged.
     """
-    outd, arch = run_dir / "output", run_dir / "archive"
-    if any(outd.glob("pick*.png")):
-        return False
-    if not list(arch.glob("cand_*.png")):
-        return False
-    script = workspace / "tools" / "grade_flats.py"
-    if not script.exists():
-        return False
-
-    expected = ""
+    out = run_dir / "archive" / "reference.jpg"
+    out.parent.mkdir(parents=True, exist_ok=True)
     try:
-        expected = str(json.loads((arch / "metrics.json").read_text())
-                       .get("expected_changes") or "")
-    except (json.JSONDecodeError, OSError, FileNotFoundError):
-        expected = ""
-
-    cmd = [python, str(script), "--run", str(run_dir), "--ship-faithful", str(n)]
-    if expected:
-        cmd += ["--expected-changes", expected]
-    print(c(YEL, f"\nthe run ended without delivering, and "
-                 f"{len(list(arch.glob('cand_*.png')))} generated image(s) are "
-                 f"sitting in archive/."))
-    print(c(DIM, f"  shipping the {n} most faithful of them, deterministically. "
-                 f"This is the harness, not the agent."))
-    TR.warn("harness", "forcing delivery after an undelivered run",
-            n=n, expected_changes=expected or None)
-    with TR.console_component("ship"):
-        rc = stream_subprocess(cmd, cwd=script.parent, comp="ship")
-    shipped = any(outd.glob("pick*.png"))
-    TR.info("harness", "forced delivery finished", exit_code=rc, shipped=shipped)
-    if not shipped:
-        print(c(RED, "  nothing shipped - read the output above; output/ is "
-                     "still empty."))
-    return shipped
+        from PIL import Image
+        im = Image.open(reference)
+        im.load()
+        if im.mode == "L":
+            shutil.copy2(reference, out)
+            print(c(DIM, f"  reference {reference.name} (already greyscale)"))
+        else:
+            im.convert("L").save(out, quality=95, subsampling=0)
+            print(c(DIM, f"  reference {reference.name} -> desaturated, so it "
+                         f"cannot be read as a colour target"))
+    except Exception as e:  # noqa: BLE001 - a copy still beats no reference
+        TR.warn("step0", f"could not desaturate the reference: {e}")
+        shutil.copy2(reference, out)
+    return out
 
 
-def select_reference(workspace: Path, run_dir: Path, python: str,
-                     category: str | None, threshold: float,
-                     query: Path | None = None,
-                     silhouette: bool = False) -> int:
-    """Step 0: install the lay reference, before the agent gets a turn.
+def auto_polish(run_dir: Path, pick: Path, python: str) -> tuple[Path, str]:
+    """Run the de-wrinkle pass on the chosen candidate. Returns (file, note).
 
-    This is deliberately not the agent's job. Choosing the reference is a
-    judgement with one right answer per garment, it is worth several turns and
-    a lot of context if done conversationally, and it is the input everything
-    downstream is measured against - so it happens once, deterministically,
-    and lands in the workspace inventory as a plain fact by the time the model
-    reads it.
+    AUTOMATIC, not left to the model, and that is the whole point. It was a tool
+    the model could call and it simply did not: on runs/20260828_104807 the run
+    went pick_best -> write the log -> finish, with the polish never invoked.
+    That is the same failure as the pins - this project's own record is that
+    instructions in the skill get skipped, so anything that must happen every
+    time belongs in the harness rather than in the prompt.
 
-    Returns the child's exit code: 0 installed, 2 no match, 1 broke.
+    The polished file is preferred UNLESS polish.py reports one of its
+    unambiguous failures - ironed flat, colour shifted, re-framed. Those are the
+    cases where the cleanup demonstrably broke its own instruction, and shipping
+    the parent instead is the safe read. Shape and scale differences short of
+    that are reported and NOT acted on here, because two polishes of evidence is
+    not enough to automate that judgement. Both files stay on disk either way.
     """
-    script = workspace / "tools" / "select_reference.py"
-    if not script.exists():
-        TR.warn("step0", f"no {script}; skipping reference selection")
-        print(c(YEL, f"  no {script.name}; skipping reference selection"))
+    rc = stream_subprocess(
+        [python, str(HERE / "tools" / "polish.py"),
+         "--run", str(run_dir), "--candidate", pick.stem],
+        cwd=HERE, comp="polish")
+
+    child = run_dir / "archive" / f"{pick.stem}p.png"
+    if rc != 0 or not child.exists():
+        return pick, ("the polish did not run, so this is the unpolished "
+                      "candidate")
+
+    verdict = {}
+    f = run_dir / "archive" / "last_polish.json"
+    if f.exists():
+        try:
+            verdict = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            verdict = {}
+
+    if verdict.get("broke_contract"):
+        why = "; ".join(verdict.get("verdicts") or ["it broke its instruction"])
+        TR.warn("polish", "shipping the unpolished candidate", why=why)
+        return pick, (f"the polish was rejected and {pick.stem} shipped instead - "
+                      f"{why}. The polished file is at {child.name} if you "
+                      f"disagree")
+    return child, f"de-wrinkled from {pick.stem}"
+
+
+def ship_best(run_dir: Path, python: str,
+              polish: bool = True) -> tuple[str | None, bool, str]:
+    """Write output/best.png. Returns (candidate, chosen_by_harness, note).
+
+    Runs only when at least one candidate exists, so a run that generated nothing
+    ends with an empty output/ and says so, rather than shipping a placeholder
+    that a downstream reader would take for a delivery.
+    """
+    arch, outdir = run_dir / "archive", run_dir / "output"
+    cands = sorted(p for p in arch.glob("cand_*.png")
+                   if re.fullmatch(r"cand_\d+[sp]*", p.stem))
+    if not cands:
+        return None, False, ""
+
+    pick, by_harness = None, False
+    bf = arch / "best.json"
+    if bf.exists():
+        try:
+            name = json.loads(bf.read_text()).get("candidate")
+            cand = arch / f"{name}.png"
+            if cand.exists():
+                pick = cand
+        except (json.JSONDecodeError, OSError):
+            pick = None
+    if pick is None:
+        # Newest by number, which is the model's last attempt and therefore its
+        # most informed one. Not a judgement - just better than nothing, and it
+        # is recorded as the harness's choice so nobody reads it as the model's.
+        pick, by_harness = cands[-1], True
+
+    note = ""
+    # Skipped when the pick is already a polish - re-polishing a polish is two
+    # generative hops on a cleanup and there is nothing left for it to smooth.
+    if polish and not pick.stem.endswith("p"):
+        print(c(BOLD, "\nfinal step") + c(DIM, "  de-wrinkling the winner"))
+        pick, note = auto_polish(run_dir, pick, python)
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(pick, outdir / "best.png")
+    sys.path.insert(0, str(HERE / "tools"))
+    try:
+        import common as C
+        C.log(run_dir, f"shipped {pick.stem} as best.png"
+                       + (f" ({note})" if note else "")
+                       + (" (chosen by the harness, not the model)"
+                          if by_harness else ""))
+    except Exception:  # noqa: BLE001 - the file is written either way
+        pass
+    return pick.stem, by_harness, note
+
+
+def exit_code_for(result: dict, budget: int, best_shipped: bool) -> int:
+    """What a finish status means to a caller. See DOCKER.md for the same table.
+
+    The awkward case is `no_candidates`, and it is awkward because the obvious
+    test - "0 if best.png exists" - cannot ever be true when nothing was
+    generated, so it would mark every such run a failure including the ones that
+    did exactly what they were told. It splits on INTENT instead: a run
+    configured with a zero image budget succeeded at buying zero images; a run
+    that had budget and still produced nothing did not.
+    """
+    status = result.get("status")
+    if status == "done":
         return 0
-    cmd = [python, str(script), "--run", str(run_dir),
-           "--threshold", str(threshold)]
-    if query:
-        cmd += ["--query", str(query), "--query-cleaned"]
-    if category:
-        cmd += ["--category", category]
-    if silhouette:
-        # Installs a line drawing of the winner instead of its photograph.
-        # Without this passed through, step 0 rewrites inputs/ on every run and
-        # an outline installed by hand survives exactly until the next one.
-        cmd += ["--silhouette"]
-    # Flushed: the child writes straight to this terminal, so an unflushed
-    # header appears after everything it was supposed to introduce.
-    print(c(BOLD, "\nstep 0 · reference selection") +
-          c(DIM, "  (deterministic, before the agent starts)"), flush=True)
-    TR.rule("step 0 - reference selection")
-    # Read through us rather than letting the child inherit fd 1, or its output
-    # is the one part of a run the trace cannot see.
-    with TR.console_component("step0"):
-        rc = stream_subprocess(cmd, cwd=script.parent, comp="step0")
-    prov = run_dir / "reference_selection.json"
-    if prov.exists():
-        TR.info("step0", "reference_selection.json", body=prov.read_text())
-    return rc
+    if status == "no_candidates":
+        return 0 if budget == 0 else 1
+    if status in ("budget_exhausted", "gave_up"):
+        return 0 if best_shipped else 1
+    return 1          # error, blocked, interrupted, max_iters
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description="A very small Claude-Code-style agent loop on a local model.",
+        description="Iterate an off-set garment photo towards a reference laydown.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             examples:
-              ./run.sh --skill laydown-match
-              ./run.sh --skill laydown-match --task "Run stage 1 only, no API calls"
-              ./run.sh --task "Summarise this folder" --max-iters 5 --yolo
-              ./run.sh --reference-only          # step 0 only: can the library
-                                                 # serve this garment? 0 yes,
-                                                 # 20 upload a hero
+              ./run.sh --yolo
+              ./run.sh --source inputs/off_set_image.jpg \\
+                       --reference inputs/reference_greyscale.jpg --max-images 6
+              ./run.sh --max-images 0 --yolo    # free: runs the loop, buys nothing
         """),
     )
+    ap.add_argument("--source", type=Path,
+                    default=HERE / "inputs" / "off_set_image.jpg",
+                    help="The off-set photo to re-lay.")
+    ap.add_argument("--reference", type=Path,
+                    default=HERE / "inputs" / "reference_greyscale.jpg",
+                    help="The laydown to aim at. Desaturated before use - it is "
+                         "a shape reference, never a colour target.")
+    ap.add_argument("--max-images", type=int, default=None, metavar="N",
+                    help=f"fal.ai images for the whole run. Default "
+                         f"{DEFAULT_BUDGET} (LAYDOWN_MAX_IMAGES). 0 exercises "
+                         f"the loop and bills nothing.")
     ap.add_argument("--skill", help="Skill name under skills/<name>/SKILL.md, or a path.")
     ap.add_argument("--skill-file", help="Explicit path to a SKILL.md.")
     ap.add_argument("--task", help="What to do. Defaults to the skill's own goal.")
     ap.add_argument("--workspace", type=Path, default=HERE)
     ap.add_argument("--max-iters", type=int, default=40)
     ap.add_argument("--yolo", action="store_true",
-                    help="Run tools without asking. You are trusting the model with a shell.")
+                    help="Run tools without asking. You are trusting the model "
+                         "with a shell. Required when stdin is not a terminal.")
     ap.add_argument("--allow-outside", action="store_true",
                     help="Permit writes outside the workspace.")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="Show a slice of the model's reasoning each turn.")
-    ap.add_argument("--no-reference-select", action="store_true",
-                    help="Skip step 0 and run against whatever reference is "
-                         "already sitting in inputs/.")
-    # Back ON by default. It was switched off on 2026-08-27 when the fal
-    # object-removal endpoint started answering 403 and every run crashed here;
-    # step 0a now calls the self-hosted segmentation service instead, which is
-    # reachable and costs nothing.
     ap.add_argument("--no-pre-clean", action="store_true",
-                    help="Skip step 0a. The reference is then matched against "
-                         "the raw input, background and all, and the generator "
-                         "is handed a photo that still has the room in it.")
-    ap.add_argument("--reference-outline", action="store_true",
-                    help="Install a line drawing of the reference instead of "
-                         "its photograph. The lay reference is the second image "
-                         "sent to the generator, and while it is a photograph "
-                         "of a garment the model sometimes draws that garment "
-                         "too - roughly 2 to 3 candidates in 10 come back "
-                         "holding two. An outline carries the pose and contains "
-                         "no garment to copy.")
-    ap.add_argument("--ship-on-cap", type=int, default=4, metavar="N",
-                    help="If the run ends with output/ empty and generated "
-                         "images in archive/, the harness ships the N most "
-                         "faithful of them itself (grade_flats.py "
-                         "--ship-faithful N) rather than abandoning paid-for "
-                         "images. 0 turns it off. The agent is also warned "
-                         "three turns before the cap.")
+                    help="Skip segmentation and send the raw photo, background "
+                         "and all.")
+    ap.add_argument("--no-polish", action="store_true",
+                    help="Skip the final de-wrinkle pass. By default the winner "
+                         "is run through openai/gpt-image-2/edit before it ships, "
+                         "and the unpolished file is kept beside it.")
     ap.add_argument("--allow-dirty-source", action="store_true",
-                    help=f"Start the agent even when the pre-clean OUTLINE GATE "
-                         f"failed - that is, when the cleaned image is missing "
-                         f"part of the garment. Without this the run stops "
-                         f"before the agent and exits {EXIT_UNCLEAN_SOURCE}, "
-                         f"because every image generated from that source "
-                         f"inherits the loss.")
-    ap.add_argument("--reference-category",
-                    help="Force the library subfolder step 0 searches "
-                         "(e.g. bras, leggings) instead of letting the "
-                         "off-set photo's own garment type pick it.")
-    # 95: an operator decision to take the near-miss out of the reference slot
-    # entirely. A wrong reference is not a cheap error - it is the image every
-    # candidate is laid against, and on this project it has bled a V-neckline
-    # and seam piping into four of ten generations at 15c each. Parking the run
-    # and asking for a hero costs nothing by comparison.
-    #
-    # What it gives up, so the trade is on the record rather than rediscovered.
-    # It was 87 for a measured reason: a periwinkle sports bra scored 89.2
-    # against a library piece that agreed on garment type, neckline, strap style
-    # and finish and differed only in COLOUR - the heaviest term in the score
-    # (weight 2.0) - while select_reference.py desaturates the winner before
-    # installing it. At 95 that match is refused on the one attribute the
-    # pipeline throws away.
-    #
-    # And the score is not as stable as a 95 gate assumes. The same library
-    # image scored 99.2 against one cleaned copy of a garment and 81.6 against
-    # another copy of the SAME garment, because the query's attributes are
-    # re-extracted per image. One real batch clears 95 with 4.2 points to
-    # spare; another clears it by 0.2. Expect no-match parks, and read
-    # result_top_matches.jpg before assuming the library has nothing.
-    #
-    # Only reference SELECTION moves. match_reference.py keeps 90 for a direct
-    # call, where the caller is asking "is this the same garment?" rather than
-    # "is this close enough in shape to lay against?".
-    ap.add_argument("--reference-threshold", type=float, default=95.0,
-                    help="Score a library image must reach to be installed as "
-                         "the reference (default 95). Lower it to 87 to accept "
-                         "a construction-identical, wrong-colour match.")
-    ap.add_argument("--allow-no-reference", action="store_true",
-                    help="Start the agent even when step 0 found no matching "
-                         "reference. Off by default: the run would be measured "
-                         "against a reference for a different garment.")
-    ap.add_argument("--reference-only", action="store_true",
-                    help="Run step 0 and stop: pre-clean, match, install the "
-                         "reference, write reference_selection.json, never "
-                         "start the agent. This is the cheap gate a caller runs "
-                         "first to find out whether the library can serve this "
-                         "garment at all - exit 0 if it can, "
-                         f"{EXIT_NO_REFERENCE} if a human has to upload a hero. "
-                         "No fal spend and no text model needed either way.")
+                    help=f"Start the agent even when the segmenter returned an "
+                         f"image missing most of the garment. Without this the "
+                         f"run stops before the agent and exits "
+                         f"{EXIT_UNCLEAN_SOURCE}, because every image generated "
+                         f"from that source inherits the loss.")
     ap.add_argument("--trace-level", default="DEBUG",
                     choices=["DEBUG", "INFO", "WARN", "ERROR"],
-                    help="Detail written to runs/<session>/run.log. DEBUG (the "
-                         "default) keeps the model's reasoning and every HTTP "
-                         "payload; INFO keeps the console, tools and results.")
+                    help="Detail written to runs/<session>/run.log.")
     ap.add_argument("--no-trace", action="store_true",
                     help="Do not write runs/<session>/run.log.")
     args = ap.parse_args()
 
-    # Before anything else that prints or calls out: the trace has nowhere to
-    # live until the run folder is stamped, so early events are buffered and
-    # flushed by attach() below.
     if args.no_trace:
         TR.enabled = False
     else:
@@ -1696,179 +2293,93 @@ def main():
     workspace = args.workspace.resolve()
     if not workspace.is_dir():
         raise SystemExit(f"No such workspace: {workspace}")
+    if not args.source.exists():
+        raise SystemExit(f"No source photo: {args.source}")
+    if not args.reference.exists():
+        raise SystemExit(f"No reference: {args.reference}")
+
+    budget = DEFAULT_BUDGET if args.max_images is None else max(0, args.max_images)
+    # The child scripts read this, and generate.py treats it as a ceiling its own
+    # --max-total can lower but never raise. Set here so a model that reaches for
+    # bash instead of the generate tool meets the same limit.
+    os.environ["LAYDOWN_MAX_IMAGES"] = str(budget)
 
     skill_path = resolve_skill(workspace, args.skill, args.skill_file)
     skill_text, skill_desc = load_skill(skill_path) if skill_path else ("", "")
-
-    if args.reference_only and args.no_reference_select:
-        raise SystemExit("--reference-only and --no-reference-select cancel "
-                         "each other out: the first runs nothing but step 0 "
-                         "and the second is what skips step 0.")
-
-    task = args.task or (DEFAULT_TASK if skill_path else None)
-    # A gate run never reaches the agent, so it does not need to be told what
-    # the agent would have done.
-    if not task and not args.reference_only:
-        raise SystemExit("Nothing to do: pass --task and/or --skill.")
-    if skill_path and not args.task and skill_desc:
-        task = f"{skill_desc}\n\n{task}"
+    task = args.task or (f"{skill_desc}\n\n{DEFAULT_TASK}" if skill_desc
+                         else DEFAULT_TASK)
 
     # One run means one folder, and run.sh stamps it. Deriving a second stamp
-    # here put the transcript and the pipeline's own steps.log in folders that
-    # only agreed because they were a second apart; set it either way so that
-    # calling harness.py directly still gives the tools one folder to share.
+    # here put the transcript and the tools' own steps.log in folders that only
+    # agreed because they were a second apart.
     stamp = os.environ.get("LAYDOWN_SESSION") or datetime.now().strftime("%Y%m%d_%H%M%S")
     os.environ["LAYDOWN_SESSION"] = stamp
     run_dir = workspace / "runs" / stamp
-    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "archive").mkdir(parents=True, exist_ok=True)
 
-    # Attached before preflight, not after: a run that dies because the server
-    # is unreachable is exactly the one someone wants a trace of, and until
-    # there is a file everything is only buffered in memory.
+    # Attached before preflight, not after: a run that dies because the server is
+    # unreachable is exactly the one someone wants a trace of.
     if TR.enabled:
         TR.attach(run_dir / "run.log", level=args.trace_level, header={
             "session": stamp,
             "argv": " ".join(sys.argv[1:]),
             "workspace": workspace,
+            "source": args.source,
+            "reference": args.reference,
+            "budget": budget,
             "skill": skill_path or "(none)",
             "server": BASE_URL,
             "python": sys.executable,
             "pid": os.getpid(),
         })
-        TR.info("harness", "options", **{
-            k: v for k, v in vars(args).items() if k != "task"})
 
-    # Skipped for a gate run, and deliberately: step 0 talks to the vision
-    # server (REFMATCH_BASE_URL), not this one, so a gate that preflighted the
-    # text model would report "no hero" as unreachable-server breakage on a day
-    # the agent was never going to run anyway.
-    model, n_ctx = (None, N_CTX_FALLBACK) if args.reference_only else preflight()
+    model, n_ctx = preflight()
 
-    tools = Tools(workspace, run_dir, args.allow_outside)
-    TR.info("harness", "child interpreter for pipeline scripts", python=tools.python)
+    tools = Tools(workspace, run_dir, args.allow_outside,
+                  source_photo=args.source)
+    TR.info("harness", "child interpreter for the tools", python=tools.python)
 
-    # Step 0, before the Session is built: the inventory in the system prompt is
-    # fingerprinted at construction time, so the reference has to be on disk by
-    # then or the agent is told about the previous garment's one.
-    if not args.no_reference_select:
-        # Clean first, match second. The order is the point: the matcher has to
-        # see the same image the rest of the pipeline works from.
-        clean, clean_fails = ((None, []) if args.no_pre_clean else
-                              pre_clean(workspace, run_dir, tools.python))
-
-        # A failed outline gate parks the run HERE, before the agent gets a
-        # turn and before anything is billed. It used to be a printed warning
-        # that nothing acted on: one run's gate reported the bottom edge of the
-        # garment pulled in 16.7%, the pipeline carried on, and 150 cents of
-        # images were generated from a source the pipeline had already
-        # rejected. Everything downstream then inherited it - the description,
-        # the prompt, and a construction check that flagged all ten candidates
-        # for correctly dropping the pins the clean had failed to remove.
-        if clean_fails and not args.allow_dirty_source:
-            print(c(RED, "\npre-clean gate FAILED - the cleaned image is not "
-                         "the same garment."))
-            for f in clean_fails:
-                print(c(DIM, f"    {f}"))
-            print(c(DIM, f"  audit     {run_dir / 'archive' / 'clean_audit.json'}"))
-            print(c(DIM, f"  cleaned   {run_dir / 'archive' / 'offset_upload.jpg'}"
-                         f"  (written so it can be looked at)"))
-            print(c(DIM, "  The run stops before the agent starts, because "
-                         "every image generated from this source would inherit "
-                         "the loss and every check downstream would agree the "
-                         "garment always looked like this."))
-            print(c(DIM, "  --allow-dirty-source runs anyway; "
-                         "--no-pre-clean skips the clean entirely."))
-            return EXIT_UNCLEAN_SOURCE
-        if clean_fails:
-            print(c(YEL, "\n  --allow-dirty-source: continuing from a source "
-                         "the outline gate rejected."))
-            for f in clean_fails:
-                print(c(DIM, f"    {f}"))
-        rc = select_reference(workspace, run_dir, tools.python,
-                              args.reference_category, args.reference_threshold,
-                              query=clean, silhouette=args.reference_outline)
-        # 2 and 1 are different answers and must not leave here as the same
-        # code. 2 is "the library has nothing close enough, a human has to
-        # upload a hero" - the pipeline worked and gave its verdict. 1 is the
-        # matcher itself breaking. Collapsing them meant a scheduler could only
-        # see "the run stopped", so a correct verdict sat in the failure list
-        # next to an unreachable model server, and the list stopped being read.
-        if rc != 0 and not args.allow_no_reference:
-            business = rc == 2
-            (TR.warn if business else TR.error)(
-                "step0", "no reference installed; stopping before the agent",
-                exit_code=rc, outcome="no_reference" if business else "error")
-            if business:
-                print(c(YEL, "\nno reference: the library has nothing close "
-                             "enough to this garment."))
-                print(c(DIM, "  This is an answer, not a failure. Someone has "
-                             "to upload a hero for this style; the run stops "
-                             f"here and exits {EXIT_NO_REFERENCE}."))
-                print(c(DIM, "  reference_selection.json records the closest "
-                             "the library came, and result_top_matches.jpg "
-                             "shows it."))
-            else:
-                print(c(RED, "\nstopping before the agent starts."))
-                print(c(DIM, "  Reference selection broke; nothing was "
-                             "installed, so every measurement downstream would "
-                             "be against the wrong garment."))
-            print(c(DIM, "  --allow-no-reference runs anyway; "
-                         "--no-reference-select uses what is already in inputs/;"))
-            print(c(DIM, "  --reference-category / --reference-threshold widen "
-                         "the search."))
-            return EXIT_NO_REFERENCE if business else 1
-        if rc != 0:
-            print(c(YEL, "\n  --allow-no-reference: starting with whatever "
-                         "reference inputs/ already holds."))
-
-    # The gate stops here. Everything above is deterministic and cheap; the
-    # agent below is neither, and a caller that only wants to know whether the
-    # library can serve this garment should not have to pay for it to find out.
-    if args.reference_only:
-        prov = run_dir / "reference_selection.json"
-        TR.info("step0", "--reference-only: stopping after step 0",
-                receipt=str(prov), exists=prov.exists())
-        print(c(BOLD, "\n--reference-only") +
-              c(DIM, "  the agent was not started."))
-        if prov.exists():
-            r = json.loads(prov.read_text())
-            if r.get("match_found"):
-                print(c(GRN, f"  reference {Path(r['installed']).name}  <- "
-                             f"{Path(r['source']).name}  ({r['score']}/100)"))
-            else:
-                closest = r.get("closest") or {}
-                print(c(YEL, f"  no reference: closest was "
-                             f"{closest.get('file', '?')} at "
-                             f"{(closest.get('score') or 0):.1f}, needed "
-                             f"{(r.get('threshold') or 0):.0f}"))
-        print(c(DIM, f"  receipt   {prov}"))
-        return 0
+    # Step 0, before the Session is built: turn 1 puts both images into the
+    # conversation, so they have to exist on disk by then.
+    clean, gate_fails = prepare_source(run_dir, args.source, tools.python,
+                                       args.no_pre_clean)
+    if gate_fails and not args.allow_dirty_source:
+        print(c(RED, "\nsegmentation gate FAILED - the result is not the same "
+                     "garment."))
+        for f in gate_fails:
+            print(c(DIM, f"    {f}"))
+        print(c(DIM, "  The run stops before the agent starts, because every "
+                     "image generated from this source would inherit the loss."))
+        print(c(DIM, "  --allow-dirty-source runs anyway; --no-pre-clean skips "
+                     "segmentation entirely."))
+        TR.error("step0", "segmentation gate failed", fails=len(gate_fails))
+        return EXIT_UNCLEAN_SOURCE
+    if gate_fails:
+        print(c(YEL, "\n  --allow-dirty-source: continuing from a source the "
+                     "gate rejected."))
+        for f in gate_fails:
+            print(c(DIM, f"    {f}"))
+    prepare_reference(run_dir, args.reference)
 
     approver = Approver(args.yolo)
     sess = Session(task, skill_text, workspace, run_dir, tools, approver,
-                   args.max_iters, args.verbose, n_ctx)
+                   args.max_iters, args.verbose, n_ctx, budget=budget)
 
-    print(c(BOLD, "qwen harness"))
+    print(c(BOLD, "\nlaydown harness"))
     print(c(DIM, f"  model     {model}"))
     print(c(DIM, f"  context   {n_ctx} tokens (compacting past {sess.compact_at})"))
     print(c(DIM, f"  server    {BASE_URL}"))
-    print(c(DIM, f"  workspace {workspace}"))
+    print(c(DIM, f"  source    {args.source.name}"))
+    print(c(DIM, f"  reference {args.reference.name}"))
+    print(c(DIM, f"  budget    {budget} image(s)"
+                 + ("  - nothing will be billed" if budget == 0 else
+                    f"  (~{budget * 15}c at 2K)")))
     print(c(DIM, f"  skill     {skill_path or '(none)'}"))
     print(c(DIM, f"  run       {run_dir}"))
-    prov = run_dir / "reference_selection.json"
-    if prov.exists():
-        r = json.loads(prov.read_text())
-        # The receipt exists on a miss too, with nulls where the reference would
-        # be. Only --allow-no-reference gets this far with one, and that run is
-        # exactly the one that has to say out loud what it is laying against.
-        if r.get("installed"):
-            print(c(DIM, f"  reference {Path(r['installed']).name}  <- "
-                         f"{Path(r['source']).name}  ({r['score']}/100)"))
-        else:
-            print(c(YEL, "  reference NONE - step 0 found no match and the run "
-                         "was allowed to start anyway"))
     print(c(DIM, f"  approval  {'OFF (--yolo)' if args.yolo else 'on'}"))
-    sess.log("start", {"task": task, "skill": args.skill, "model": model})
+    sess.log("start", {"task": task, "model": model, "budget": budget,
+                       "source": str(args.source),
+                       "reference": str(args.reference)})
 
     t0 = time.time()
     try:
@@ -1880,35 +2391,48 @@ def main():
     except BaseException as e:
         TR.exception("harness", f"run aborted: {type(e).__name__}: {e}")
         raise
-
     dt = time.time() - t0
 
-    # Whatever the agent decided, paid-for images do not get abandoned.
-    forced = False
-    if args.ship_on_cap:
-        forced = force_ship(workspace, run_dir, tools.python, args.ship_on_cap)
+    # Paid-for images are never abandoned - but only if there are any. A run that
+    # generated nothing ends with an empty output/ and says so.
+    shipped, by_harness, polish_note = ship_best(run_dir, tools.python,
+                                                polish=not args.no_polish)
+    rc = exit_code_for(result, budget, shipped is not None)
 
-    colour = {"done": GRN, "blocked": YEL}.get(result["status"], RED)
+    colour = {"done": GRN, "budget_exhausted": GRN,
+              "gave_up": YEL, "no_candidates": YEL}.get(result["status"], RED)
     print("\n" + c(BOLD, "─" * 60))
-    print(c(colour, f"{result['status'].upper()}") +
-          c(DIM, f"  ·  {dt/60:.1f} min  ·  {sess.total_completion} tokens generated"
-                 f"  ·  {sess.compactions} compactions"))
+    print(c(colour, result["status"].upper()) +
+          c(DIM, f"  ·  {dt/60:.1f} min  ·  {len(sess.candidates())}/{budget} "
+                 f"image(s) used  ·  {sess.total_completion} tokens  ·  "
+                 f"{sess.compactions} compactions"))
+    if result.get("claimed_status"):
+        print(c(YEL, f"  the model called finish('{result['claimed_status']}') "
+                     f"having generated nothing - recorded as no_candidates."))
     if result.get("summary"):
         print("\n" + textwrap.indent(textwrap.fill(result["summary"], 76), "  "))
-    if forced:
-        print(c(YEL, "\n  output/ was written by the harness, not by the agent. "
-                     "Nothing in the run's own LOG.md describes these picks - "
-                     "read grade_flats.py's output above for what each carries."))
+    if shipped:
+        print(c(GRN, f"\n  best      {shipped} -> {run_dir / 'output' / 'best.png'}"))
+        if polish_note:
+            print(c(DIM, f"            {polish_note}"))
+        if by_harness:
+            print(c(YEL, "  chosen by the harness, not the model - nothing was "
+                         "marked with pick_best, so this is the newest "
+                         "candidate rather than a judgement."))
+    else:
+        print(c(DIM, "\n  nothing shipped - no candidates were generated."))
     print(c(DIM, f"\n  transcript: {sess.log_path}"))
     if TR.path:
         print(c(DIM, f"  trace:      {TR.path}"))
 
-    sess.log("end", {"result": result, "seconds": dt})
+    sess.log("end", {"result": result, "seconds": dt, "shipped": shipped,
+                     "shipped_by_harness": by_harness, "polish": polish_note,
+                     "exit_code": rc})
     TR.info("harness", f"run finished: {result['status']}",
             body=result.get("summary"), seconds=round(dt, 1),
-            completion_tokens=sess.total_completion,
-            compactions=sess.compactions)
-    return 0 if result["status"] == "done" else 1
+            images=len(sess.candidates()), budget=budget, shipped=shipped,
+            exit_code=rc)
+    return rc
 
 
 if __name__ == "__main__":

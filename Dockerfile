@@ -1,18 +1,20 @@
 # PLD laydown harness.
 #
 # The container is a CLIENT, not a self-contained system. Three things stay
-# outside it and are supplied at run time: the text model (QWEN_BASE_URL), the
-# vision model step 0 scores references with (REFMATCH_BASE_URL), and fal.ai
-# (FAL_KEY). Nothing here downloads a model or holds a credential.
+# outside it and are supplied at run time: the model (QWEN_BASE_URL), the
+# segmentation service (SEGMENT_URL), and fal.ai (FAL_KEY). Nothing here
+# downloads a model or holds a credential.
 #
 # Build:  docker build -t pld-harness .
-# Run:    see docker-entrypoint.sh, or the "Usage" section of DOCKER.md
+# Run:    see docker-entrypoint.sh, or DOCKER.md
 FROM python:3.10-slim
 
-# ImageMagick is not optional: match_reference.py builds its result sheet with
-# `magick`/`montage` and grade_flats.py measures trim boxes with
-# `magick identify`, all under check=True. fonts-liberation supplies the Arial
-# stand-in below.
+# ImageMagick is no longer called by anything that ships in this image - the
+# tools that shelled out to `magick`/`montage` are retired to old/. It stays
+# because the two shims below (docker/sips, docker/magick) exist to keep the
+# macOS and Linux copies of the source byte-identical, and dropping the package
+# would mean the shims lie about what is available. fonts-liberation supplies
+# the Arial stand-in below.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         imagemagick \
         fonts-liberation \
@@ -60,27 +62,28 @@ RUN set -eux; \
     fi; \
     magick -version >/dev/null
 
-# grade_flats.py and match_reference.py pass this exact path to ImageMagick's
-# -font under check=True, so on Linux the annotated sheets would fail to build.
-# Liberation Sans is metric-compatible with Arial, so putting it where the
-# tools already look is a smaller change than editing three call sites.
+# Kept from the annotated-contact-sheet era: the tools that passed this exact
+# path to ImageMagick's -font have been retired to old/, but the symlink is one
+# line and costs nothing, and removing it is the kind of change that is only
+# discovered to have mattered on a Linux box at 2am.
 RUN mkdir -p /System/Library/Fonts/Supplemental \
     && ln -s /usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf \
              /System/Library/Fonts/Supplemental/Arial.ttf
 
+# profiles/ and library_reference/ are deliberately NOT copied any more. They
+# belonged to the reference search, which is gone - the reference now arrives
+# from the caller. Together they were ~150 MB of an image that otherwise holds
+# five scripts.
 COPY harness.py ./
 COPY tools/ tools/
 COPY task/ task/
-COPY profiles/ profiles/
-COPY library_reference/ library_reference/
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# task/SKILL.md hardcodes the developer's absolute workspace path in two
-# instructions it gives the agent. Rewriting it in the image beats patching the
-# file in git, which would break the native macOS run this project still uses.
-RUN sed -i 's#/Users/ulmarti/Desktop/PLD_Harness#/app#g' task/SKILL.md \
-    && ! grep -q '/Users/' task/SKILL.md
+# The skill used to hardcode the developer's absolute workspace path. It no
+# longer does, and this asserts that rather than assuming it: a path that creeps
+# back in would send the agent looking outside the container.
+RUN ! grep -q '/Users/' task/SKILL.md
 
 # Created empty so a run with no volumes mounted still works; each is a mount
 # point in the documented invocation.
