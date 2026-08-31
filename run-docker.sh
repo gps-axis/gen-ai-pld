@@ -67,8 +67,15 @@ fi
 # The model that drives the agent loop. No /v1 - harness.py appends it.
 : "${QWEN_BASE_URL:=http://10.11.245.41:8091}"
 
-# The segmentation service. Drops the background; does NOT remove tags or pins.
-: "${SEGMENT_URL:=http://10.11.245.41:8780/segment}"
+# Empty is fine against a server that holds one model: preflight() then takes
+# whatever /v1/models lists. A proxy fronting several needs the name, and the
+# container never sees the .env the native path reads it from, so it is passed.
+: "${QWEN_MODEL:=}"
+
+# The SAM3 segmentation service. Drops the background; does NOT remove tags or
+# pins. Behind the proxy it needs a key, and that key is not the model's.
+: "${SEGMENT_URL:=http://10.11.245.145:4000/sam3-segment}"
+: "${SEGMENT_API_KEY:=}"
 
 : "${MAX_ITERS:=40}"
 
@@ -79,7 +86,8 @@ fi
 # revamp removed. Set TASK only to say something the skill does not.
 : "${TASK:=}"
 
-export FAL_KEY QWEN_API_KEY QWEN_BASE_URL SEGMENT_URL LAYDOWN_MAX_IMAGES
+export FAL_KEY QWEN_API_KEY QWEN_BASE_URL QWEN_MODEL SEGMENT_URL SEGMENT_API_KEY \
+       LAYDOWN_MAX_IMAGES
 
 mkdir -p "$HERE/out"
 
@@ -102,7 +110,9 @@ exec docker run --rm \
     -e FAL_KEY \
     -e QWEN_API_KEY \
     -e QWEN_BASE_URL \
+    -e QWEN_MODEL \
     -e SEGMENT_URL \
+    -e SEGMENT_API_KEY \
     -e LAYDOWN_MAX_IMAGES \
     -e REFERENCE \
     pld-harness "${ARGS[@]}"

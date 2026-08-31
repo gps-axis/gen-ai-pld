@@ -35,7 +35,15 @@ from PIL import Image
 
 import common as C
 
-URL = os.environ.get("SEGMENT_URL", "http://10.11.245.41:8780/segment")
+URL = C.conf("SEGMENT_URL", "http://10.11.245.145:4000/sam3-segment")
+
+# The endpoint above is the SAM3 service reached through the LiteLLM proxy,
+# which is the same segmenter the direct address served - the proxy reports
+# http://10.11.245.41:8780/segment as its upstream, and answers with the same
+# JPEG. What changed is that the proxy authenticates: without a key it is a 401,
+# so a run against it silently continued from the raw photo, background and all.
+# Empty is still valid, for talking to a service that wants no auth.
+API_KEY = C.conf("SEGMENT_API_KEY")
 
 # A segmentation that ate the garment is worse than no segmentation: it is a
 # white rectangle that every downstream measurement will happily describe. The
@@ -60,9 +68,10 @@ def post(src: Path, dst: Path, url: str = URL, timeout: int = 180) -> None:
         src.read_bytes(),
         f"\r\n--{boundary}--\r\n".encode(),
     ])
-    req = urllib.request.Request(
-        url, data=body, method="POST",
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
+    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         data = r.read()
     if not data:
@@ -122,9 +131,15 @@ def main() -> int:
         post(a.off_set, raw, a.url, a.timeout)
     except Exception as e:  # noqa: BLE001 - every reachability failure reads alike
         raw.unlink(missing_ok=True)
+        # An auth refusal is worth naming. It looks identical to "the box is
+        # down" in the line above, and the fix is the opposite one.
+        hint = ("Set SEGMENT_URL or --url if the service moved."
+                if getattr(e, "code", None) not in (401, 403) else
+                "The service refused the key: set SEGMENT_API_KEY to a key that "
+                "is valid for this endpoint.")
         print(f"  segmentation FAILED: {type(e).__name__}: {e}\n"
               f"  the run continues from the raw photo, which still has its "
-              f"background. Set SEGMENT_URL or --url if the service moved.")
+              f"background. {hint}")
         return 1
 
     ok, why = check(a.off_set, raw)

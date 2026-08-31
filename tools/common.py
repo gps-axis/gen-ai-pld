@@ -171,16 +171,31 @@ def fix_ca_bundle() -> None:
         os.environ.setdefault("REQUESTS_CA_BUNDLE", bundle)
 
 
-def load_fal_key() -> str:
-    key = os.environ.get("FAL_KEY")
-    if key:
-        return key
+def conf(key: str, default: str = "") -> str:
+    """A setting from the environment, else the project .env, else the default.
+
+    The harness passes its own .env down to every tool it spawns, so under a
+    normal run the environment already has these. The .env fallback is for a
+    tool run by hand from a shell that exported nothing - which is how they get
+    debugged, and which used to mean silently falling back to a stale default.
+    """
+    v = os.environ.get(key)
+    if v:
+        return v
     env = ROOT / ".env"
     if env.exists():
-        m = re.search(r'^\s*FAL_KEY\s*=\s*["\']?([^"\'\s]+)', env.read_text(), re.M)
+        m = re.search(rf'^\s*{re.escape(key)}\s*=\s*["\']?([^"\'\s]+)',
+                      env.read_text(), re.M)
         if m:
-            os.environ["FAL_KEY"] = m.group(1)
+            os.environ[key] = m.group(1)
             return m.group(1)
+    return default
+
+
+def load_fal_key() -> str:
+    key = conf("FAL_KEY")
+    if key:
+        return key
     sys.exit("FAL_KEY not set and none found in .env")
 
 

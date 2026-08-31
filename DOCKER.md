@@ -41,7 +41,9 @@ be reachable from inside the container:
 | what | env var | default |
 |---|---|---|
 | text/vision model (the agent) | `QWEN_BASE_URL` | `http://10.11.245.41:8091` |
-| segmentation service | `SEGMENT_URL` | `http://10.11.245.41:8780/segment` |
+| which model, when the endpoint serves several | `QWEN_MODEL` | none - the first model `/v1/models` lists |
+| SAM3 segmentation service | `SEGMENT_URL` | `http://10.11.245.145:4000/sam3-segment` |
+| its key, separate from the model's | `SEGMENT_API_KEY` | none - unset means no auth header |
 | fal.ai (the billed generation) | `FAL_KEY` | none - required unless the budget is 0 |
 
 `QWEN_API_KEY` is required. On the host it comes from `.qwen_key`; that file and

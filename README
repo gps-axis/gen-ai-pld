@@ -114,11 +114,18 @@ add depth - it drops a background and cannot invent anything.
 Services it talks to
 --------------------
 
-    QWEN_BASE_URL       the model, OpenAI-compatible, no /v1 suffix
+    QWEN_BASE_URL       the model, OpenAI-compatible; a /v1 suffix is stripped
                         default http://10.11.245.41:8091
     QWEN_API_KEY        or .qwen_key on disk
-    SEGMENT_URL         the segmentation service
-                        default http://10.11.245.41:8780/segment
+    QWEN_MODEL          which model to route on. Optional against a server
+                        holding one - the harness reads /v1/models and takes
+                        what is there. Required against a proxy (LiteLLM),
+                        which fronts several and rejects an unnamed request.
+    SEGMENT_URL         the SAM3 segmentation service
+                        default http://10.11.245.145:4000/sam3-segment
+    SEGMENT_API_KEY     its key, which is NOT the model's. Leave unset for a
+                        service that wants no auth, such as the box itself at
+                        http://10.11.245.41:8780/segment
     FAL_KEY             from .env; bills real money
 
 Segmentation drops the BACKGROUND only. A hang tag, ticket, pin or clip attached

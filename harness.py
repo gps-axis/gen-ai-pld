@@ -74,6 +74,36 @@ from runlog import trace as TR, stream_subprocess  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 
+
+def load_dotenv(path: Path) -> dict:
+    """Tolerant .env reader - handles `KEY = value`, quotes, comments."""
+    env = {}
+    if not path.exists():
+        return env
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        env[k.strip()] = v.strip().strip('"').strip("'")
+    return env
+
+
+_DOTENV = load_dotenv(HERE / ".env")
+
+
+def _conf(key: str, default: str = "") -> str:
+    """A setting from the environment, else .env, else the default.
+
+    The endpoint settings used to be environment-only, so pointing the harness
+    at a different server meant exporting three variables in every shell that
+    ran it - while FAL_KEY, sitting in the same .env, was picked up for free.
+    An explicit export still wins, so a one-off override is unchanged.
+    """
+    v = os.environ.get(key)
+    return v if v not in (None, "") else _DOTENV.get(key, default)
+
+
 def _base_url() -> str:
     """The server root, without the /v1 suffix this file appends itself.
 
@@ -82,12 +112,19 @@ def _base_url() -> str:
     normalise, rather than producing /v1/v1/chat/completions from a perfectly
     reasonable QWEN_BASE_URL.
     """
-    url = os.environ.get("QWEN_BASE_URL", "http://10.11.245.41:8091").rstrip("/")
+    url = _conf("QWEN_BASE_URL", "http://10.11.245.41:8091").rstrip("/")
     return url[:-3].rstrip("/") if url.endswith("/v1") else url
 
 
 BASE_URL = _base_url()
-API_KEY = os.environ.get("QWEN_API_KEY", "pick-a-long-secret-string")
+API_KEY = _conf("QWEN_API_KEY", "pick-a-long-secret-string")
+
+# The name to route on. A single-model llama.cpp/vLLM server ignores the field
+# and serves whatever it loaded, so this file used to omit it. A proxy cannot:
+# LiteLLM fronts many models and 400s "Invalid model name passed in model=None"
+# on every request without it. preflight() overwrites this with the id the
+# server actually reports, so the default only has to survive until then.
+MODEL = _conf("QWEN_MODEL")
 
 # Fallback only. The real window is read off the server at startup - see
 # preflight(). Hardcoding it was wrong the moment the endpoint moved: the old
@@ -163,20 +200,6 @@ DIM, BOLD, RED, GRN, YEL, BLU, CYA = "2", "1", "31", "32", "33", "34", "36"
 # ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
-
-def load_dotenv(path: Path) -> dict:
-    """Tolerant .env reader - handles `KEY = value`, quotes, comments."""
-    env = {}
-    if not path.exists():
-        return env
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        env[k.strip()] = v.strip().strip('"').strip("'")
-    return env
-
 
 def child_env(workspace: Path) -> dict:
     """Environment handed to bash: inherited, plus .env, plus the CA fix.
@@ -334,11 +357,29 @@ def post(payload: dict, timeout: int = REQUEST_TIMEOUT) -> dict:
 
 
 def server_up(timeout: int = 5) -> bool:
-    try:
-        with urllib.request.urlopen(f"{BASE_URL}/health", timeout=timeout) as r:
-            return r.status == 200
-    except Exception:
-        return False
+    """Is the endpoint answering? Used only by the reconnect loop.
+
+    /health is llama.cpp's and vLLM's; LiteLLM keeps that path for an
+    admin-only upstream check that 401s/403s a normal key, and puts the
+    liveness probe on /health/liveliness. Try both, and treat an auth refusal
+    as up - something answered, which is the whole question here. Without this
+    the reconnect loop against a proxy waits out its full budget and gives up
+    on a server that is running fine.
+    """
+    for path in ("/health/liveliness", "/health"):
+        try:
+            req = urllib.request.Request(
+                f"{BASE_URL}{path}",
+                headers={"Authorization": f"Bearer {API_KEY}"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                if r.status == 200:
+                    return True
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def wait_for_server() -> bool:
@@ -378,6 +419,7 @@ def call_model(messages, tools=None, max_tokens=MAX_TOKENS, temperature=TEMPERAT
     Retry once with a bigger budget rather than surfacing an empty answer.
     """
     payload = {
+        "model": MODEL,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
@@ -2009,10 +2051,15 @@ DEFAULT_TASK = (
 def preflight() -> tuple[str, int]:
     """Confirm the server is reachable; return (model id, context window).
 
-    vLLM reports `max_model_len` per model on /v1/models; llama.cpp does not,
-    hence the fallback. Reading it beats a constant: this project has already
-    run a 262144-token server while every budget in the file said 32768.
+    vLLM reports `max_model_len` per model on /v1/models and LiteLLM reports
+    `max_input_tokens`; llama.cpp reports neither, hence the fallback. Reading it
+    beats a constant: this project has already run a 262144-token server while
+    every budget in the file said 32768.
+
+    Also sets the module-level MODEL, because a proxy routes on the name and a
+    list of one is only the common case - QWEN_MODEL picks out of a longer list.
     """
+    global MODEL
     TR.info("preflight", "GET /v1/models", url=f"{BASE_URL}/v1/models")
     try:
         req = urllib.request.Request(f"{BASE_URL}/v1/models",
@@ -2021,11 +2068,22 @@ def preflight() -> tuple[str, int]:
             data = json.loads(r.read())
         TR.debug("preflight", "models response",
                  body=json.dumps(data, indent=2, default=str))
-        m = data["data"][0]
-        n_ctx = int(m.get("max_model_len") or N_CTX_FALLBACK)
-        TR.info("preflight", "server ready", model=m["id"], n_ctx=n_ctx,
-                from_server=bool(m.get("max_model_len")))
-        return m["id"], n_ctx
+        served = data["data"]
+        if MODEL:
+            m = next((x for x in served if x["id"] == MODEL), None)
+            if m is None:
+                raise SystemExit(
+                    f"QWEN_MODEL={MODEL!r} is not served by {BASE_URL}. "
+                    f"Available: {', '.join(x['id'] for x in served) or '(none)'}"
+                )
+        else:
+            m = served[0]
+        MODEL = m["id"]
+        reported = m.get("max_model_len") or m.get("max_input_tokens")
+        n_ctx = int(reported or N_CTX_FALLBACK)
+        TR.info("preflight", "server ready", model=MODEL, n_ctx=n_ctx,
+                from_server=bool(reported))
+        return MODEL, n_ctx
     except SystemExit:
         raise
     except Exception as e:

@@ -119,7 +119,7 @@ echo "  input     $INPUT"
 echo "  reference $REFERENCE"
 echo "  session   $LAYDOWN_SESSION  (max $LAYDOWN_MAX_IMAGES images)"
 echo "  text      ${QWEN_BASE_URL:-http://10.11.245.41:8091 (default)}"
-echo "  segmenter ${SEGMENT_URL:-http://10.11.245.41:8780/segment (default)}"
+echo "  segmenter ${SEGMENT_URL:-http://10.11.245.145:4000/sam3-segment (default)}"
 echo
 
 # --yolo is required, not a preference: Approver.ok() refuses every mutating tool
