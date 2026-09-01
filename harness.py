@@ -930,6 +930,15 @@ class Tools:
 
         Both images get their own 1024px budget, so this is also sharper than
         viewing a side-by-side contact sheet, where each half arrives at ~512px.
+
+        Every answer carries NOT_PROMPT_TEXT. A comparison is phrased as a
+        contrast - "X, whereas Y", "closed, not splayed open" - and that reads
+        exactly like an instruction, so it gets pasted into a prompt section
+        unedited. On runs/20260901_140946 the first call of the run described
+        the reference hood as "folded flat and closed into a neat rounded
+        shape"; four seconds later that clause was the pose section, and the
+        generator spent the whole run building a closed rounded hood onto a
+        garment whose reference has it splayed flat open.
         """
         a = self._prep_image(path_a, question, box_a)
         if a[0] is None:
@@ -945,7 +954,20 @@ class Tools:
             f"naming which image each observation is about. Describe only "
             f"differences you can actually see; if you cannot tell, say so "
             f"rather than guessing.", [a[0], b[0]], max_tokens=4000)
-        return f"[1st: {a[1]}]\n[2nd: {b[1]}]\n{answer}"
+        return (f"[1st: {a[1]}]\n[2nd: {b[1]}]\n{answer}\n"
+                f"{self.NOT_PROMPT_TEXT}")
+
+    # One bracketed line, so _lay_check's existing "[" filter drops it from the
+    # automatic check and it only lands where it is needed - in front of the
+    # agent, next to prose it is about to reuse.
+    NOT_PROMPT_TEXT = (
+        "[The answer above is a COMPARISON, not prompt text. It is written as "
+        "a contrast between two pictures, and a contrast reads as an "
+        "instruction once it reaches the generator: a phrase like \"closed, "
+        "not splayed open\" tells it to build a closed shape. Do not paste any "
+        "of it into a prompt section. Write pose from a fresh look at the "
+        "reference on its own, describing how that garment lies in plain "
+        "positive terms.]")
 
     # -- the three real capabilities, plus the free bookkeeping -----------
 
@@ -1817,6 +1839,15 @@ class Session:
     # products, so any open question about how they differ comes back describing
     # collars and colours - which is true, irrelevant, and drowns the one thing
     # the reference exists to settle.
+    #
+    # FALLBACK ONLY. This fixed list of parts is what the check used to ask on
+    # every run, and it is blind to any part not named in it. On
+    # runs/20260901_140946 the pose defect was a hood - splayed flat open in the
+    # reference, rebuilt as a raised peak in the candidate - and the check waved
+    # it through four times because sleeves, cuffs, shoulders and hem were the
+    # only things it knew how to ask about. _lay_question() below builds the
+    # real question from the run's own pose section instead; this text is what
+    # is left when that section is still empty.
     LAY_QUESTION = (
         "Compare ONLY how the two garments are arranged - their pose on the "
         "plate. Ignore colour, pattern, trim, collar and construction entirely; "
@@ -1830,6 +1861,101 @@ class Session:
         "4. Are the shoulders and hem level, and is the garment square to the "
         "frame?\n"
         "Be specific about angles. Two or three sentences.")
+
+    # The same scoping as LAY_QUESTION, but the list of parts to inspect comes
+    # from the pose section the agent wrote for THIS run, so a hood, a strap, a
+    # trouser leg or a bag handle gets checked without anything here knowing
+    # those words.
+    #
+    # THE POSE TEXT IS THE CHECKLIST, NEVER THE ANSWER KEY. It is the agent's
+    # description of the arrangement it was aiming for, and it can be wrong: on
+    # runs/20260901_140946 it said the reference hood was "folded flat and
+    # closed into a neat rounded shape at the top, not splayed open" when the
+    # reference hood is flat and spread wide. A check that graded the candidate
+    # against those words would have passed the peaked hood a second time. Only
+    # the reference image decides what is correct; the pose text decides what
+    # gets looked at.
+    LAY_QUESTION_HEAD = (
+        "Compare ONLY how the two garments are arranged - their pose on the "
+        "plate. Ignore colour, pattern, trim, collar and construction entirely; "
+        "these are different products and are meant to differ there.\n\n"
+        "Look at each of these parts in turn: {parts}.\n\n"
+        "For EACH part, answer in this order:\n"
+        "1. How does that part sit in the SECOND image (the reference)? "
+        "Describe what you can see there, in your own words.\n"
+        "2. How does it sit in the FIRST image?\n"
+        "3. Do they match? If not, say which way the first one is wrong.\n\n"
+        "Then: are the shoulders and hem level, and is the garment square to "
+        "the frame? Be specific about angles and distances. One or two "
+        "sentences per part, no more.")
+
+    # Pull the part NAMES out of the pose section and throw its adjectives away.
+    #
+    # Handing the vision model the pose prose whole does name the right parts,
+    # but it also hands over the wording, and the answer comes back wearing it:
+    # asked with runs/20260901_140946's pose text in the question, the model
+    # described the reference hood as "folded flat and closed into a neat
+    # rounded shape, not splayed" - which is the pose section's error, not what
+    # is in the reference. It still caught the peaked hood, because peak versus
+    # flat is too big to miss whatever vocabulary you arrive with, but a subtler
+    # defect described in confident wrong words is exactly what would slip
+    # through. Nouns carry the checklist; adjectives carry the answer key, and
+    # only the nouns are wanted here.
+    PARTS_QUESTION = (
+        "Below is a description of how a garment should be laid out.\n\n"
+        "--- description ---\n{pose}\n--- end ---\n\n"
+        "List the PARTS of the garment it mentions - the physical pieces, such "
+        "as sleeves, cuffs, hem, hood, collar, straps, legs, waistband, "
+        "fastenings. Reply with the part names only, lower case, separated by "
+        "commas, nothing else. Do not include how they are arranged, do not "
+        "include adjectives, and do not include the garment itself.")
+
+    # Long enough to name parts, short enough that runaway output is capped.
+    PARTS_MAX_WORDS = 24
+
+    def _lay_parts(self, pose: str) -> str:
+        """The parts named in `pose`, as a comma list, or "" if unavailable."""
+        try:
+            data = call_model(
+                [{"role": "user",
+                  "content": self.PARTS_QUESTION.format(pose=pose)}],
+                tools=None, max_tokens=2000, temperature=0.1, retries=1)
+            parts = (data["choices"][0]["message"].get("content") or "").strip()
+        except (ModelError, KeyError, IndexError) as e:
+            TR.warn("session", "part extraction failed for the lay check",
+                    error=str(e))
+            return ""
+        # A reasoning model that spends its budget thinking returns nothing, and
+        # a chatty one returns a sentence. Neither is a checklist.
+        parts = parts.replace("\n", " ").strip()
+        if not parts or len(parts.split()) > self.PARTS_MAX_WORDS:
+            TR.warn("session", "part extraction gave no usable list",
+                    got=parts[:200])
+            return ""
+        return parts
+
+    def _lay_question(self) -> str:
+        """The lay check's question, built from this run's pose section.
+
+        Falls back to LAY_QUESTION whenever the pose section cannot produce a
+        checklist: unreadable, empty, still a stub, or the extraction call came
+        back with something that is not a list of parts. The fallback asks about
+        sleeves and cuffs only, which is thin, but a check that asks the wrong
+        question beats a check that crashes on the way to asking it.
+        """
+        try:
+            import promptfile as PF
+            pose = (PF.load(self.run_dir)["sections"].get("pose") or "").strip()
+        except Exception as e:  # noqa: BLE001 - a check is not the delivery
+            TR.warn("session", "could not read pose for the lay check",
+                    error=str(e))
+            return self.LAY_QUESTION
+        if len(pose.split()) < 12:
+            return self.LAY_QUESTION
+        parts = self._lay_parts(pose)
+        if not parts:
+            return self.LAY_QUESTION
+        return self.LAY_QUESTION_HEAD.format(parts=parts)
 
     # Both halves of the standing clause, asked as one question so the answer
     # cannot report a clean garment while the logo has quietly gone with the
@@ -1892,6 +2018,10 @@ class Session:
         deliberately a QUESTION rather than a rule - nothing here knows what the
         right sleeve angle is, and it should not. The reference knows, and this
         puts the two pictures side by side so the model can see for itself.
+
+        Which parts it asks about come from the run's own pose section - see
+        _lay_question(). A fixed list of parts only ever catches the defects
+        someone anticipated when they wrote the list.
         """
         ref = self.run_dir / "archive" / "reference.jpg"
         cand = self.run_dir / "archive" / f"{name}.png"
@@ -1899,7 +2029,7 @@ class Session:
             return ""
         try:
             out = self.tools.compare_images(str(cand), str(ref),
-                                            self.LAY_QUESTION)
+                                            self._lay_question())
         except Exception as e:  # noqa: BLE001 - a check is not the delivery
             TR.warn("session", f"lay check failed for {name}", error=str(e))
             return ""

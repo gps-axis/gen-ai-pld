@@ -116,6 +116,13 @@ def compare(source: Path, candidate: Path, long_side: int = 1024) -> dict:
     w_cand = C.wrinkle_energy(Path(candidate), cand_mask, long_side=long_side)
     ratio = (w_cand / w_src) if w_src > 0 else float("nan")
 
+    # The same surface energy read at two scales, so a caller can tell a relaxed
+    # crease from a repainted knit. wrinkle_ratio above cannot: both lower it.
+    b_src = C.wrinkle_bands(Path(source), src_mask, long_side=long_side)
+    b_cand = C.wrinkle_bands(Path(candidate), cand_mask, long_side=long_side)
+    fine = (b_cand["fine"] / b_src["fine"]) if b_src["fine"] > 0 else None
+    broad = (b_cand["broad"] / b_src["broad"]) if b_src["broad"] > 0 else None
+
     return {
         "source": str(source),
         "candidate": str(candidate),
@@ -125,6 +132,8 @@ def compare(source: Path, candidate: Path, long_side: int = 1024) -> dict:
         "wrinkle_source": round(float(w_src), 4),
         "wrinkle_candidate": round(float(w_cand), 4),
         "wrinkle_ratio": (None if w_src <= 0 else round(float(ratio), 3)),
+        "wrinkle_fine_ratio": (None if fine is None else round(fine, 3)),
+        "wrinkle_broad_ratio": (None if broad is None else round(broad, 3)),
         "specks": int(C.speck_count(Path(candidate))),
         "clipped": C.clipped(cand_mask),
         "plate_level": round(float(C.plate_level(Path(candidate))), 4),
@@ -140,6 +149,12 @@ def line(m: dict, name: str | None = None) -> str:
     out = (f"{who}  IoU {m['silhouette_iou']:.3f}  "
            f"dE {m['colour_de']:.1f}  "
            f"wrinkle x{ratio}")
+    # Printed only when the two scales disagree enough to mean something. On a
+    # normal candidate they track each other and a second pair of numbers on
+    # every line is noise; when they part company that IS the finding.
+    fine, broad = m.get("wrinkle_fine_ratio"), m.get("wrinkle_broad_ratio")
+    if fine is not None and broad is not None and abs(fine - broad) >= 0.08:
+        out += f" (knit x{fine:.2f}, creases x{broad:.2f})"
     if m["specks"]:
         out += f"  specks {m['specks']}"
     if m["clipped"]:

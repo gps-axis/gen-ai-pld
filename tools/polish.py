@@ -237,11 +237,61 @@ def main() -> int:
         # guessed threshold that fires on a good result teaches everyone to
         # ignore the warning. The shape and scale numbers are printed every time
         # and left to the eye, which is the standing rule in this project anyway.
+        # Surface energy at two scales, against the parent. This is what tells a
+        # relaxed crease from a repainted knit: the job is meant to move `broad`
+        # and leave `fine` roughly where it is. A single window cannot separate
+        # them, which is why the ratio above passed a polish that had visibly
+        # softened the fleece.
+        fine = drift.get("wrinkle_fine_ratio")
+        broad = drift.get("wrinkle_broad_ratio")
+
+        # And the same fine reading against the ORIGINAL source. Everything else
+        # in this block is deliberately parent-relative - the polish's contract
+        # is with its parent - but texture is the one quantity that STACKS. On
+        # runs/20260901_140946 generation spent 31% of the source's knit and the
+        # polish took 12% of what was left; each step was unremarkable against
+        # its own parent and the shipped file kept 61% of the fabric. Only a
+        # reading against the photograph sees that, so it is measured here and
+        # reported separately rather than folded into the parent numbers.
+        fine_vs_source = None
+        origin = arch / "source_clean.jpg"
+        if origin.exists():
+            try:
+                fine_vs_source = M.compare(origin, out).get("wrinkle_fine_ratio")
+            except Exception as e:  # noqa: BLE001 - a check is not the delivery
+                print(f"  (could not measure texture against the source: {e})")
+
         verdicts = []
         if ratio is not None and ratio < 0.5:
             verdicts.append(
                 f"IRONED FLAT: wrinkle ratio {ratio:.2f}. Far below 1 is not a "
                 f"de-wrinkled garment, it is a repainted one")
+
+        # SHAPE OF THE DATA, not a magnitude. Broad falling while fine holds is
+        # the pass working; fine falling meaningfully faster than broad is the
+        # knit being painted out from under the fold shadows. 0.85 is one sixth
+        # of a scale's worth of divergence - loose, because the two bands track
+        # each other within a few percent on every candidate measured so far
+        # (cand_04p: fine 0.885, broad 0.863, quotient 1.03) and anything that
+        # parts them by more than a token amount is not sampling noise.
+        if fine and broad and broad > 0 and (fine / broad) < 0.85:
+            verdicts.append(
+                f"KNIT PAINTED OUT: fine texture fell to x{fine:.2f} while the "
+                f"creases only fell to x{broad:.2f}. The pass smoothed the "
+                f"fabric itself, not the folds in it")
+
+        # ANCHORED ON ONE RUN, and worth saying so. The only measured points are
+        # runs/20260901_140946, where 0.61 against the source was called too
+        # heavy by eye and its unpolished parent at 0.69 was acceptable. 0.65
+        # sits between them. Treat it as the line that flags "go and look",
+        # not as a calibration - it will move once there are more runs behind it.
+        if fine_vs_source is not None and fine_vs_source < 0.65:
+            verdicts.append(
+                f"TEXTURE SPENT: the polished file keeps x{fine_vs_source:.2f} "
+                f"of the ORIGINAL photograph's fabric texture. The polish is "
+                f"within its contract against its parent, but generation and "
+                f"polish together have gone too far - ship the unpolished "
+                f"parent, or soften the flatten section and regenerate")
         if de > 3.0:
             verdicts.append(
                 f"COLOUR SHIFTED: dE {de:.1f} against its parent, which the "
@@ -256,6 +306,8 @@ def main() -> int:
         (arch / "last_polish.json").write_text(json.dumps({
             "child": out_name, "parent": candidate,
             "silhouette_iou": iou, "colour_de": de, "wrinkle_ratio": ratio,
+            "wrinkle_fine_ratio": fine, "wrinkle_broad_ratio": broad,
+            "wrinkle_fine_vs_source": fine_vs_source,
             "scale": scale, "verdicts": verdicts, "broke_contract": bool(verdicts),
         }, indent=2) + "\n")
 
@@ -269,6 +321,13 @@ def main() -> int:
         if ratio:
             line += f"   texture x{ratio:.2f}"
         print(line)
+        # Printed every time, warning or not. The standing rule on this project
+        # is that the numbers go on screen and the eye decides; a threshold that
+        # only speaks when it fires hides the run that sat just under it.
+        if fine and broad:
+            print(f"  fabric knit x{fine:.2f}, creases x{broad:.2f} vs parent"
+                  + (f"   |   knit x{fine_vs_source:.2f} vs the original photo"
+                     if fine_vs_source is not None else ""))
         # Three polishes of evidence so far, and they separate cleanly: two at
         # IoU ~0.834 where the sleeves and the framing had visibly moved, and one
         # at 0.994 / scale 1.00 that changed nothing but the creases. So a clean

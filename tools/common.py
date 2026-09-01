@@ -1046,18 +1046,24 @@ def colour_drift(rgb_a: np.ndarray, rgb_b: np.ndarray) -> dict:
 # (creases the re-lay failed to relax) or smoother than it (a redraw that
 # ironed the knit out of existence). Ranked that way round, the metric answers
 # a question it can actually answer.
-def wrinkle_energy(path: Path, mask: np.ndarray, norm_h: int = 900,
-                   win: int = 9, long_side: int = 1024) -> float:
-    """Mean local luminance SD inside the garment, at a fixed garment height.
+# The two window sizes the fine/broad split measures at, in pixels at norm_h.
+# FINE is a few stitches across - it is the knit, weave or pile itself. BROAD is
+# a fold's worth - it is the soft shadow a crease casts. They are deliberately
+# far apart; adjacent windows measure nearly the same thing.
+WRINKLE_WIN_FINE = 3
+WRINKLE_WIN_BROAD = 25
 
-    Rescaled so the garment's bbox is `norm_h` tall before anything is
-    measured, or the number mostly reports source resolution: a 3072px original
-    resampled to a common width is smoother than a 1792px one at the same
-    width, purely from the heavier resample.
+
+def _wrinkle_field(path: Path, mask: np.ndarray, norm_h: int, long_side: int):
+    """The normalised luminance array and the region to measure it over.
+
+    Split out so a two-band reading loads and rescales the image once. The
+    normalisation is the whole reason this is not just np.std on the pixels -
+    see wrinkle_energy.
     """
     ys, xs = np.nonzero(mask)
     if not len(xs):
-        return 0.0
+        return None, None
     k = norm_h / max(ys.max() - ys.min() + 1, 1)
     L = Image.open(path).convert("L")
     L.thumbnail((long_side, long_side), Image.LANCZOS)
@@ -1069,10 +1075,52 @@ def wrinkle_energy(path: Path, mask: np.ndarray, norm_h: int = 900,
     if inner.sum() < 500:
         inner = m
     if not inner.any():
-        return 0.0
+        return None, None
+    return a, inner
+
+
+def _local_sd(a: np.ndarray, inner: np.ndarray, win: int) -> float:
     mean = ndimage.uniform_filter(a, win)
     sq = ndimage.uniform_filter(a * a, win)
     return float(np.sqrt(np.clip(sq - mean * mean, 0.0, None))[inner].mean())
+
+
+def wrinkle_energy(path: Path, mask: np.ndarray, norm_h: int = 900,
+                   win: int = 9, long_side: int = 1024) -> float:
+    """Mean local luminance SD inside the garment, at a fixed garment height.
+
+    Rescaled so the garment's bbox is `norm_h` tall before anything is
+    measured, or the number mostly reports source resolution: a 3072px original
+    resampled to a common width is smoother than a 1792px one at the same
+    width, purely from the heavier resample.
+
+    ONE WINDOW SEES ONE THING. At win=9 a relaxed crease and an airbrushed knit
+    move this number the same way and by similar amounts, so a single ratio
+    cannot say which happened - see wrinkle_bands() for the reading that can.
+    """
+    a, inner = _wrinkle_field(path, mask, norm_h, long_side)
+    if a is None:
+        return 0.0
+    return _local_sd(a, inner, win)
+
+
+def wrinkle_bands(path: Path, mask: np.ndarray, norm_h: int = 900,
+                  long_side: int = 1024) -> dict:
+    """Surface energy at two scales: {"fine": ..., "broad": ...}.
+
+    WHY TWO. De-wrinkling is meant to take the creases out and leave the fabric.
+    Those live at different scales - a crease is a soft gradient tens of pixels
+    wide, the knit is a few pixels - so the job succeeding and the job going too
+    far look identical to a single number and quite different to a pair. Broad
+    down, fine held is the wanted outcome. Fine falling faster than broad is the
+    knit being painted out while the fold shadows stay, which is the failure the
+    single-window ratio could never name.
+    """
+    a, inner = _wrinkle_field(path, mask, norm_h, long_side)
+    if a is None:
+        return {"fine": 0.0, "broad": 0.0}
+    return {"fine": _local_sd(a, inner, WRINKLE_WIN_FINE),
+            "broad": _local_sd(a, inner, WRINKLE_WIN_BROAD)}
 
 
 def seam_energy(path: Path, mask: np.ndarray) -> float:
