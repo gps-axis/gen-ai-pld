@@ -1,0 +1,11 @@
+[project]
+name = "gap-dam-scraper"
+version = "0.1.0"
+description = "Authenticated Gap DAM bulk JPG downloader"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+    "playwright==1.61.0",
+]
+
+[tool.uv]
+package = false

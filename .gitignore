@@ -30,6 +30,12 @@ inputs/*
 # Where the container delivers best.png. See DOCKER.md.
 out/
 
+# Generated Gap DAM downloads and manifests.
+/dam_scraper/downloads/
+
+# Per-user Gap DAM authentication state.
+/dam_scraper/secrets/
+
 # Bulk archives - inputs.zip alone is 28MB of photos already covered above.
 *.zip
 
