@@ -28,10 +28,21 @@ DEFAULT_SEARCH_URL = (
     "#/DamView&TP=default&VBID=270HZOLSY3NGJ&PN=1&WS=270H397TAWK"
 )
 IMAGE_SUFFIXES = {".jpg", ".jpeg"}
+ASSET_PRODUCTION_TYPE = "Asset Production Type"
+FINAL_ASSET_VALUE = "FINAL"
+SHOT_REQUEST_ID = "Shot Request ID"
+REQUIRED_FILTERS = {
+    "Shot Type": "L",
+    ASSET_PRODUCTION_TYPE: FINAL_ASSET_VALUE,
+}
 
 
 class ScrapeError(RuntimeError):
     """The requested DAM job could not be completed safely."""
+
+
+class FacetUnavailableError(ScrapeError):
+    """A named DAM facet is not present in the current result set."""
 
 
 @dataclass(frozen=True)
@@ -44,6 +55,13 @@ class SearchResults:
 class ShotBatch:
     code: str
     limit: int
+
+
+@dataclass(frozen=True)
+class FacetOption:
+    value: str
+    count: int
+    checked: bool
 
 
 def choose_shot_batches(counts: dict[str, int]) -> tuple[ShotBatch, ...]:
@@ -133,6 +151,24 @@ def write_json_atomic(path: Path, value: dict[str, object]) -> None:
     temporary_path.replace(path)
 
 
+def is_complete_manifest_reusable(
+    manifest: dict[str, object], output_directory: Path
+) -> bool:
+    filters = manifest.get("filters")
+    if not isinstance(filters, dict) or any(
+        filters.get(title) != value for title, value in REQUIRED_FILTERS.items()
+    ):
+        return False
+    archives = manifest.get("archives")
+    archives_exist = isinstance(archives, list) and bool(archives) and all(
+        isinstance(archive, dict)
+        and isinstance(archive.get("filename"), str)
+        and (output_directory / archive["filename"]).is_file()
+        for archive in archives
+    )
+    return manifest.get("status") == "complete" and archives_exist
+
+
 def find_visible(page: Any, selectors: Iterable[str], timeout_ms: int) -> Any:
     deadline = time.monotonic() + timeout_ms / 1000
     while True:
@@ -145,19 +181,6 @@ def find_visible(page: Any, selectors: Iterable[str], timeout_ms: int) -> Any:
                         return candidate
         if time.monotonic() >= deadline:
             raise ScrapeError(f"Required DAM control was not visible: {tuple(selectors)}")
-        time.sleep(0.25)
-
-
-def find_existing(page: Any, selectors: Iterable[str], timeout_ms: int) -> Any:
-    deadline = time.monotonic() + timeout_ms / 1000
-    while True:
-        for frame in page.frames:
-            for selector in selectors:
-                candidate = frame.locator(selector)
-                if candidate.count() > 0:
-                    return candidate.first
-        if time.monotonic() >= deadline:
-            raise ScrapeError(f"Required DAM control was not found: {tuple(selectors)}")
         time.sleep(0.25)
 
 
@@ -219,12 +242,17 @@ def open_search_page(context: Any, url: str, query: str, timeout_ms: int) -> Any
     authenticated_page.wait_for_timeout(500)
     wait_for_post(authenticated_page, lambda: search.press("Enter"), timeout_ms)
     authenticated_page.wait_for_timeout(2_000)
+    clear_facet_filters(authenticated_page, SHOT_REQUEST_ID, timeout_ms)
+    apply_exclusive_facet(
+        authenticated_page,
+        ASSET_PRODUCTION_TYPE,
+        FINAL_ASSET_VALUE,
+        timeout_ms,
+    )
     return authenticated_page
 
 
-def read_shot_request_facet(
-    page: Any, timeout_ms: int
-) -> tuple[dict[str, int], dict[str, bool]]:
+def find_filter_sidebar(page: Any, timeout_ms: int) -> Any:
     sidebar_candidates = [
         frame.locator("aside[aria-label='Photo Studio Filters']")
         for frame in page.frames
@@ -242,35 +270,94 @@ def read_shot_request_facet(
         sidebar = find_visible(
             page, ("aside[aria-label='Photo Studio Filters']",), timeout_ms
         )
-    sidebar.evaluate("element => { element.scrollTop = element.scrollHeight; }")
-    page.wait_for_timeout(500)
+    return sidebar
 
-    heading = sidebar.locator("[original-title='Shot Request ID']").first
-    if heading.count() == 0:
-        raise ScrapeError("The Shot Request ID filter was not available.")
+
+def find_facet_containers(page: Any, title: str, timeout_ms: int) -> Any:
+    sidebar = find_filter_sidebar(page, timeout_ms)
+    metrics = sidebar.evaluate(
+        """element => ({
+            clientHeight: element.clientHeight,
+            scrollHeight: element.scrollHeight
+        })"""
+    )
+    client_height = max(int(metrics.get("clientHeight", 0)), 1)
+    max_scroll = max(int(metrics.get("scrollHeight", 0)) - client_height, 0)
+    step = max(client_height * 3 // 4, 1)
+    scroll_positions = list(range(0, max_scroll + 1, step))
+    if scroll_positions[-1] != max_scroll:
+        scroll_positions.append(max_scroll)
+
+    heading = None
+    for scroll_top in scroll_positions:
+        sidebar.evaluate(
+            "(element, value) => { element.scrollTop = value; }", scroll_top
+        )
+        page.wait_for_timeout(150)
+        rendered_headings = sidebar.locator("[id$=':FacetNameLbl_Lbl']")
+        for index in range(rendered_headings.count()):
+            candidate = rendered_headings.nth(index)
+            candidate_title = candidate.inner_text().replace(
+                "\N{NO-BREAK SPACE}", " "
+            ).strip()
+            if candidate_title == title:
+                heading = candidate
+                break
+        if heading is None:
+            titled_headings = sidebar.locator(
+                f"[original-title={json.dumps(title)}]"
+            )
+            if titled_headings.count() > 0:
+                heading = titled_headings.first
+        if heading is not None:
+            break
+
+    if heading is None:
+        raise FacetUnavailableError(f"The {title} filter was not available.")
     header = heading.locator("xpath=ancestor::*[contains(@id, ':HeaderPnl')][1]")
     header_id = header.get_attribute("id") or ""
     prefix = header_id.removesuffix(":HeaderPnl")
     if not prefix:
-        raise ScrapeError("The Shot Request ID filter could not be read.")
+        raise ScrapeError(f"The {title} filter could not be read.")
     containers = sidebar.locator(
         f"[id^='{prefix}:FacetContainer'][data-opn='FacetContainer']"
     )
+    if containers.count() == 0:
+        raise ScrapeError(f"The {title} filter could not be read.")
+    return containers
+
+
+def read_facet_options(
+    page: Any, title: str, timeout_ms: int
+) -> tuple[FacetOption, ...]:
+    containers = find_facet_containers(page, title, timeout_ms)
     values = containers.evaluate_all(
         """items => items.map(item => ({
-            code: item.querySelector('input[type=checkbox]')?.getAttribute('aria-label') || '',
+            value: item.querySelector('input[type=checkbox]')?.getAttribute('aria-label') || '',
             count: Number((item.querySelector('[data-opn=OccurrencesLbl]')?.innerText || '0').trim()),
             checked: Boolean(item.querySelector('input[type=checkbox]')?.checked)
-        })).filter(item => item.code)"""
+        })).filter(item => item.value)"""
     )
-    return (
-        {item["code"]: item["count"] for item in values},
-        {item["code"]: item["checked"] for item in values},
+    return tuple(
+        FacetOption(
+            value=item["value"],
+            count=item["count"],
+            checked=item["checked"],
+        )
+        for item in values
     )
 
 
-def toggle_shot_request_checkbox(page: Any, code: str, timeout_ms: int) -> None:
-    checkbox = find_existing(page, (f"input[aria-label='{code}']",), timeout_ms)
+def toggle_facet_checkbox(
+    page: Any, title: str, value: str, timeout_ms: int
+) -> None:
+    containers = find_facet_containers(page, title, timeout_ms)
+    checkbox_candidates = containers.locator(
+        f"input[type='checkbox'][aria-label={json.dumps(value)}]"
+    )
+    if checkbox_candidates.count() == 0:
+        raise ScrapeError(f"The {title} value {value} could not be read.")
+    checkbox = checkbox_candidates.first
     expected_checked = not checkbox.is_checked()
     wait_for_post(
         page,
@@ -280,28 +367,66 @@ def toggle_shot_request_checkbox(page: Any, code: str, timeout_ms: int) -> None:
     page.wait_for_timeout(1_500)
     deadline = time.monotonic() + timeout_ms / 1000
     while True:
-        _, checked = read_shot_request_facet(page, timeout_ms)
-        if checked.get(code, False) == expected_checked:
+        options = read_facet_options(page, title, timeout_ms)
+        checked = next(
+            (option.checked for option in options if option.value == value), False
+        )
+        if checked == expected_checked:
             return
         if time.monotonic() >= deadline:
-            raise ScrapeError(f"Shot Request ID {code} did not update.")
+            raise ScrapeError(f"{title} {value} did not update.")
         page.wait_for_timeout(500)
 
 
-def clear_shot_request_filters(page: Any, timeout_ms: int) -> dict[str, int]:
-    _, checked = read_shot_request_facet(page, timeout_ms)
-    for code, is_checked in checked.items():
-        if is_checked:
-            toggle_shot_request_checkbox(page, code, timeout_ms)
-    counts, _ = read_shot_request_facet(page, timeout_ms)
-    return counts
+def clear_facet_filters(page: Any, title: str, timeout_ms: int) -> tuple[FacetOption, ...]:
+    options = read_facet_options(page, title, timeout_ms)
+    for option in options:
+        if option.checked:
+            toggle_facet_checkbox(page, title, option.value, timeout_ms)
+    return read_facet_options(page, title, timeout_ms)
+
+
+def apply_exclusive_facet(
+    page: Any, title: str, value: str, timeout_ms: int
+) -> tuple[FacetOption, ...]:
+    try:
+        options = read_facet_options(page, title, timeout_ms)
+    except FacetUnavailableError:
+        if title == ASSET_PRODUCTION_TYPE and value == FINAL_ASSET_VALUE:
+            raise ScrapeError("No FINAL image is available for this style.") from None
+        raise
+    target = next((option for option in options if option.value == value), None)
+    checked = tuple(option for option in options if option.checked)
+    if target is not None and target.count > 0 and checked == (target,):
+        return options
+
+    for option in checked:
+        if option.value != value:
+            toggle_facet_checkbox(page, title, option.value, timeout_ms)
+
+    options = read_facet_options(page, title, timeout_ms)
+    target = next((option for option in options if option.value == value), None)
+    if target is None or target.count <= 0:
+        if title == ASSET_PRODUCTION_TYPE and value == FINAL_ASSET_VALUE:
+            raise ScrapeError("No FINAL image is available for this style.")
+        raise ScrapeError(f"{title} {value} is not available for this style.")
+    if not target.checked:
+        toggle_facet_checkbox(page, title, value, timeout_ms)
+
+    settled = read_facet_options(page, title, timeout_ms)
+    if not any(option.value == value and option.checked for option in settled) or any(
+        option.value != value and option.checked for option in settled
+    ):
+        raise ScrapeError(f"{title} {value} did not update.")
+    return settled
+
+
+def shot_request_counts(options: Iterable[FacetOption]) -> dict[str, int]:
+    return {option.value: option.count for option in options}
 
 
 def set_shot_request_filter(page: Any, code: str, timeout_ms: int) -> None:
-    counts = clear_shot_request_filters(page, timeout_ms)
-    if counts.get(code, 0) <= 0:
-        raise ScrapeError(f"Shot Request ID {code} is not available for this style.")
-    toggle_shot_request_checkbox(page, code, timeout_ms)
+    apply_exclusive_facet(page, SHOT_REQUEST_ID, code, timeout_ms)
 
     sidebar = find_visible(
         page, ("aside[aria-label='Photo Studio Filters']",), timeout_ms
@@ -364,7 +489,9 @@ def discover_shot_counts(
         browser = playwright.chromium.launch(headless=not headed)
         context = browser.new_context(storage_state=auth_state)
         page = open_search_page(context, url, query, timeout_ms)
-        counts = clear_shot_request_filters(page, timeout_ms)
+        counts = shot_request_counts(
+            clear_facet_filters(page, SHOT_REQUEST_ID, timeout_ms)
+        )
         browser.close()
         return counts
 
@@ -453,8 +580,9 @@ def download_batch_from_dam(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Search the current Gap DAM view, apply the Shot Request ID fallback "
-            "policy, and download up to three assets per selected code as JPGs."
+            "Search FINAL assets in the current Gap DAM view, apply the Shot Request "
+            "ID fallback policy, and download up to three assets per selected code "
+            "as JPGs."
         )
     )
     parser.add_argument(
@@ -485,14 +613,7 @@ def main(argv: list[str] | None = None) -> int:
         manifest_path = output_directory / "manifest.json"
         if manifest_path.exists() and not args.force:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            archives = manifest.get("archives", [])
-            archives_exist = isinstance(archives, list) and archives and all(
-                isinstance(archive, dict)
-                and isinstance(archive.get("filename"), str)
-                and (output_directory / archive["filename"]).is_file()
-                for archive in archives
-            )
-            if manifest.get("status") == "complete" and archives_exist:
+            if is_complete_manifest_reusable(manifest, output_directory):
                 print(f"Already complete: {output_directory}")
                 return 0
 
@@ -552,7 +673,7 @@ def main(argv: list[str] | None = None) -> int:
             "input_style_number": args.style_number,
             "query": query,
             "brand_scope": "Gap",
-            "filters": {"Shot Type": "L"},
+            "filters": REQUIRED_FILTERS,
             "shot_request_policy": {
                 "preferred_order": ["P01", "AV5"],
                 "maximum_per_code": 3,
