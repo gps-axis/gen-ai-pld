@@ -1,0 +1,766 @@
+# Generation flow for the Product Laydown command queue - harness edition.
+#
+# Same shape as the intake flow (gen-ai-product-laydown): run the harness,
+# branch on status.json, either deliver or park. The difference is WHERE the
+# outcome is reported. Intake has no command yet, so it parks through the
+# intake endpoint. Here a command already exists, so both outcomes go to the
+# webhook keyed on command_id - that is the idempotency key Django routes on.
+#
+#   complete   images delivered -> uploaded to a command-versioned Spaces key
+#   parked     no_reference: the library held nothing close enough. A person
+#              has to supply one. Execution ends GREEN.
+#   failed     anything else -> the errors block reports it
+#
+# Task order: prepare -> fal-edit (harness) -> If reference found:
+#   upload-to-spaces -> notify-endpoint
+#   else: upload-near-misses -> notify-parked
+#
+# 2026-09-02: the container is the rebuilt harness under PLD_Harness/, not the
+# retired pipeline in old/. Its entrypoint keeps this flow's contract, so Axis
+# and the webhook payloads are untouched. Changes here: LAYDOWN_TASK gone (it
+# named a script that no longer exists; the harness ranks and delivers its best
+# four itself), the forced reference is handed over as -e REFERENCE, and the
+# segmentation service gets its two env vars.
+#
+# TODO: move every key and token below into Kestra secrets - this file travels.
+
+id: gen-ai-product-laydown-commands
+namespace: company.team
+
+# Was 20, sized for a flow whose heavy task was one HTTP call to fal. A harness
+# run is an agent loop against a LAN model server for tens of minutes; twenty at
+# once would just queue on the GPU and time out. Size to what 10.11.245.41 serves.
+concurrency:
+  limit: 3
+  behavior: QUEUE
+
+variables:
+  notify_url: "https://gapplatformstudio.com/studio_management/api/product_laydown_test/webhook/"
+  # Debug trail for the candidates that were graded but not delivered. Posted
+  # after the command is already reported complete, never as part of it.
+  artifacts_url: "https://gapplatformstudio.com/studio_management/api/product_laydown_test/generation-artifacts/"
+  axis_token: "7d616826-0079-4088-8ab3-ce184c44bfa1"
+
+triggers:
+  - id: kafka_commands
+    type: io.kestra.plugin.kafka.RealtimeTrigger
+    topic: pld-ai-workflow.commands
+    groupId: pld-ai-commands
+    properties:
+      bootstrap.servers: "kafka-kafka-1:9092"
+      auto.offset.reset: latest
+    keyDeserializer: STRING
+    valueDeserializer: JSON
+
+tasks:
+  # 1. Stage the inputs the harness needs, and only those.
+  #
+  # hero_url is deliberately NOT downloaded. Under the harness the reference
+  # comes from library_reference/ (or from an operator's approved drop), and
+  # feeding a hero in as well would give the run two competing references.
+  #
+  # Every declared output is created on every path: Kestra fails a task on an
+  # outputFile it cannot find, and the forced reference is present on maybe one
+  # run in twenty.
+  - id: prepare
+    type: io.kestra.plugin.scripts.shell.Commands
+    containerImage: debian:bookworm-slim
+    beforeCommands:
+      - apt-get update -qq && apt-get install -y -qq --no-install-recommends imagemagick curl jq ca-certificates > /dev/null
+    inputFiles:
+      command.json: "{{ trigger.value | json }}"
+    outputFiles:
+      - source_fit.jpg
+      - forced_reference.jpg
+      - forced_reference_color.jpg
+      - base_name.txt
+      - category.txt
+      - expected_picks.txt
+      - has_forced_reference.txt
+    commands:
+      - |
+        set -eu
+        CAP=25000000
+
+        SOURCE_URL=$(jq -r '.payload.source_url // ""' command.json)
+        [ -n "$SOURCE_URL" ] && [ "$SOURCE_URL" != "null" ] \
+          || { echo "Command has no source_url"; exit 1; }
+
+        # The reference an operator dropped and approved against a parked job.
+        # Present only on the release path; empty on a normal run.
+        REF_URL=$(jq -r '.payload.library_reference_url // ""' command.json)
+
+        curl -fsSL "$SOURCE_URL" -o source.jpg
+
+        # Stable base name for the output keys, from the source filename.
+        basename "$SOURCE_URL" | sed -E 's/\?.*$//; s/\.[A-Za-z0-9]+$//' > base_name.txt
+        echo "Base name: $(cat base_name.txt)"
+
+        # Django's category_key (BRAS) -> the library subfolder (bras). Passed
+        # as --reference-category so the folder searched does not depend on
+        # the vision model naming the garment the same way Axis does. The
+        # entrypoint searches only that folder, and falls back to the whole
+        # library when the folder is missing or empty.
+        #
+        # Separators become "_", they are NOT deleted: "Sports Bras" ->
+        # "sports_bras", the name the folder is filed under below.
+        jq -r '.payload.item_category // .category_key // ""' command.json \
+          | tr '[:upper:]' '[:lower:]' \
+          | sed -E 's/[^a-z0-9]+/_/g; s/^_+//; s/_+$//' > category.txt
+        echo "Category: $(cat category.txt)"
+
+        # Kept for the flow's own record. The harness no longer reads it: it
+        # delivers up to four ranked picks on every run and fills any slot the
+        # agent leaves empty from its own ranking.
+        jq -r '.payload.num_images // 1' command.json > expected_picks.txt
+
+        IM=convert
+        command -v magick >/dev/null 2>&1 && IM=magick
+        filesize() { stat -c%s "$1"; }
+
+        fit_under_cap() {
+          src="$1"; out="$2"
+          if [ "$(filesize "$src")" -le "$CAP" ]; then
+            cp "$src" "$out"
+            echo "$src already under cap ($(filesize "$src") bytes), copied"
+            return
+          fi
+          tmp="${out}.tmp"
+          best_q=0; lo=1; hi=95
+          while [ "$lo" -le "$hi" ]; do
+            mid=$(( (lo + hi) / 2 ))
+            $IM "$src" -strip -quality "$mid" "$tmp"
+            if [ "$(filesize "$tmp")" -le "$CAP" ]; then
+              best_q=$mid; cp "$tmp" "$out"; lo=$((mid + 1))
+            else
+              hi=$((mid - 1))
+            fi
+          done
+          rm -f "$tmp"
+          scale=100
+          while [ "$best_q" -eq 0 ] && [ "$scale" -gt 10 ]; do
+            scale=$((scale * 90 / 100))
+            $IM "$src" -strip -resize "${scale}%" -quality 85 "$out"
+            [ "$(filesize "$out")" -le "$CAP" ] && best_q=85
+          done
+          [ "$best_q" -gt 0 ] || { echo "FAILED to fit $src under cap"; exit 1; }
+          echo "$src -> $out (quality $best_q, $(filesize "$out") bytes)"
+        }
+
+        fit_under_cap source.jpg source_fit.jpg
+
+        # An approved drop bypasses the library search. TWO copies come out of
+        # this, and the difference matters:
+        #
+        #   forced_reference.jpg        greyscale - what THIS run lays against.
+        #                               The harness desaturates and re-tones
+        #                               whatever reference it is given, so a
+        #                               greyscale input is fine and a colour
+        #                               one would be too.
+        #   forced_reference_color.jpg  colour    - what joins the library
+        #
+        # The library holds colour originals because the harness desaturates
+        # whatever it picks at install time and keeps the colour original
+        # beside it. Filing the greyscale copy would throw the colour away for
+        # every future garment.
+        if [ -n "$REF_URL" ] && [ "$REF_URL" != "null" ]; then
+          curl -fsSL "$REF_URL" -o forced_raw
+          # .jpg, always: a PNG filed into the library under another name is
+          # invisible to a reader that globs by extension.
+          $IM forced_raw -strip -quality 95 forced_reference_color.jpg
+          $IM forced_reference_color.jpg -colorspace Gray -strip forced_reference.jpg
+          echo yes > has_forced_reference.txt
+          echo "Forced reference installed from the operator's approved drop."
+        else
+          # Sentinels: declared, so they must exist; 1x1 so they are obviously unused.
+          $IM -size 1x1 xc:black forced_reference.jpg
+          $IM -size 1x1 xc:black forced_reference_color.jpg
+          echo no > has_forced_reference.txt
+        fi
+
+  # 2. Run the harness. no_reference = library has nothing close -> park, not fail.
+  #
+  # pullPolicy NEVER because pld-harness is built on this box and lives in no
+  # registry - the default would try to pull it and fail before the first line.
+  #
+  # No networkMode on purpose: needs public internet (fal) AND LAN model servers.
+  #
+  # Images come back as a tar, not as generated_1..4.png: the count is up to
+  # four, and a declared-but-absent outputFile fails the task - which on the
+  # parked path would report a park as a failure.
+  # NOT io.kestra.plugin.docker.Run. That task type accepts a `volumes:` block
+  # and then ignores it - the container starts, the mount is absent, and
+  # nothing in the logs says so. Only the scripts docker taskRunner honours it,
+  # and only with kestra.tasks.scripts.docker.volume-enabled: true in
+  # kestra.yml. If that setting is ever lost, this flow keeps running and
+  # quietly stops learning: every run searches the empty folder baked into the
+  # image and parks. The `ls` after the mount check is the tripwire.
+  - id: fal-edit
+    type: io.kestra.plugin.scripts.shell.Commands
+    containerImage: pld-harness
+    timeout: PT45M
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      pullPolicy: NEVER
+      # The library is mounted over the empty folder in the image, which makes
+      # it DATA rather than a build artefact: the run reads whatever has
+      # accumulated since the last build, and a reference filed here outlives
+      # the container.
+      volumes:
+        - "/mnt/nvme1/ContainerFiles/agentic-gen-ai-workflow/gen-ai-pld/library_reference:/app/library_reference"
+    inputFiles:
+      source_fit.jpg: "{{ outputs.prepare.outputFiles['source_fit.jpg'] }}"
+      forced_reference.jpg: "{{ outputs.prepare.outputFiles['forced_reference.jpg'] }}"
+      forced_reference_color.jpg: "{{ outputs.prepare.outputFiles['forced_reference_color.jpg'] }}"
+      category.txt: "{{ outputs.prepare.outputFiles['category.txt'] }}"
+      base_name.txt: "{{ outputs.prepare.outputFiles['base_name.txt'] }}"
+      expected_picks.txt: "{{ outputs.prepare.outputFiles['expected_picks.txt'] }}"
+      has_forced_reference.txt: "{{ outputs.prepare.outputFiles['has_forced_reference.txt'] }}"
+    outputFiles:
+      - generated.tar         # the ranked picks; empty archive when parked
+      - status.json           # always written; the branch reads this
+      - used_prompt.txt       # always touched (empty when parked)
+      - result.json           # the harness's own receipt
+      - near_misses.jpg       # always touched (real content only when parked)
+      - match_results.json
+      - debug.tar             # always written; empty archive when parked
+      - debug_report.txt      # why the bundle looks the way it does
+    env:
+      FAL_KEY: "bb3ee3cd-ffa7-4736-9400-84eebc616095:cc27b7ade3a3201c562374a015463ffb"
+      QWEN_API_KEY: "pick-a-long-secret-string"
+      QWEN_BASE_URL: "http://10.11.245.41:8091"
+      # The segmentation service the harness drops the background with, behind
+      # the same proxy. Without the key the run continues from the raw photo
+      # and says so in run.log - degraded, not dead.
+      SEGMENT_URL: "http://10.11.245.145:4000/sam3-segment"
+      SEGMENT_API_KEY: "<SEGMENT_API_KEY>"   # TODO: real value, or a Kestra secret
+      # Where the volume above lands. The entrypoint would find it there
+      # anyway; naming it keeps the two lines in sight of each other.
+      REFERENCE_LIBRARY: "/app/library_reference"
+      LAYDOWN_MAX_IMAGES: "10"
+      # The ranked picks come out under these names, generated_1.png being
+      # rank 1.
+      OUTPUT_PATTERN: "generated_{n}.png"
+      MAX_ITERS: "80"
+      # Names the harness's run folder instead of letting it stamp a timestamp
+      # nothing downstream can predict: the entrypoint reads this and writes to
+      # /app/runs/$LAYDOWN_SESSION, which is where the debug bundle collects the
+      # candidates from. Per EXECUTION, not per command - a retry must get a
+      # fresh folder, because the harness enforces its image budget by counting
+      # what is already in there.
+      LAYDOWN_SESSION: "{{ execution.id }}"
+      # No LAYDOWN_TASK. The one this flow used to send told the agent to
+      # finish with grade_flats.py --ship 4, a script that no longer exists;
+      # the harness now ranks and delivers its best four itself, and the
+      # entrypoint drops any task that names a retired tool.
+    commands:
+      - |
+        # NOTE: no `set -e` - we must survive the harness's exit code and run
+        # the lines after it. Written for POSIX sh (no arrays): the scripts
+        # runner wraps this in the image's default shell, which is not
+        # guaranteed to be bash.
+        export OUT_DIR="$PWD"
+
+        # Everything the debug bundle learns goes to stdout AND to a file that
+        # travels as an outputFile, because this task's log is 15 minutes of
+        # agent transcript that the UI truncates to its first dozen lines.
+        # upload-debug cats this at the top of its own three-line log.
+        : > debug_report.txt
+        dbg() { echo "$*"; echo "$*" >> debug_report.txt; }
+
+        # Tripwire. If the mount is ever silently dropped, this is the line
+        # that says so - the run still works, it just searches an empty
+        # library and parks everything.
+        echo "--- library ---"
+        ls /app/library_reference/ || echo "LIBRARY MISSING"
+
+        set -- --max-iters "$MAX_ITERS"
+
+        if [ "$(cat has_forced_reference.txt)" = "yes" ]; then
+          # No search: the operator's approved image, greyscaled by prepare, is
+          # the reference. The entrypoint stages it under the name the pipeline
+          # reads and passes it to the harness as --reference.
+          export REFERENCE="$PWD/forced_reference.jpg"
+        else
+          CATEGORY="$(cat category.txt)"
+          # Search only the category's folder. Axis already knows the category;
+          # deriving it again is a second chance to get it wrong.
+          [ -n "$CATEGORY" ] && set -- "$@" --reference-category "$CATEGORY"
+        fi
+
+        /usr/local/bin/docker-entrypoint.sh "$PWD/source_fit.jpg" "$@"
+        rc=$?
+        echo "harness exit code: $rc"
+
+        # Placeholders so every declared outputFile exists on every path.
+        # used_prompt.txt, result.json, result_top_matches.jpg and
+        # match_results.json are written by the entrypoint's delivery step
+        # whenever they exist; touch only fills the gaps.
+        touch used_prompt.txt result.json near_misses.jpg match_results.json
+        tar -cf generated.tar --files-from /dev/null
+        tar -cf debug.tar --files-from /dev/null
+
+        if [ "$rc" -eq 20 ]; then
+          # No reference in the library: an answer, not a failure. The
+          # entrypoint wrote the near-miss strip flat into OUT_DIR under its
+          # old name; this only gives it the name the downstream task declared.
+          cp result_top_matches.jpg near_misses.jpg 2>/dev/null || true
+          echo '{"no_reference": true}' > status.json
+          exit 0
+        fi
+
+        # Bundle whatever the run delivered. The names are generated_1..N.png
+        # via OUTPUT_PATTERN, but N varies, so the archive is what travels.
+        if ls generated_*.png >/dev/null 2>&1; then
+          tar -cf generated.tar generated_*.png
+        fi
+
+        # --- file the operator's reference into the library ------------------
+        #
+        # The point of the whole loop: an approved drop stops being a one-off
+        # for this command and becomes something every future garment can
+        # match against. It lands in the mounted host folder.
+        #
+        # Three conditions, each of them load-bearing:
+        #
+        #   images exist      a reference that produced nothing usable is not
+        #                     evidence of anything. Growing the library with it
+        #                     makes every later match worse, and nobody would
+        #                     ever know which file did it. Deliberately NOT
+        #                     `rc = 0`: a run can deliver on a non-zero code.
+        #   colour copy       the library holds colour; the harness desaturates
+        #                     what it picks and keeps the original beside it.
+        #   never overwrite   the base name comes from the source item, so a
+        #                     collision means a DIFFERENT job already filed
+        #                     under it. Silently replacing it would delete a
+        #                     reference somebody approved.
+        #
+        # Never fatal: the images are already made and delivered. Failing the
+        # task over a bookkeeping step would report a good run as a failure.
+        if [ "$(cat has_forced_reference.txt)" = "yes" ] && ls generated_*.png >/dev/null 2>&1; then
+          CATEGORY="$(cat category.txt)"
+          BASE="$(cat base_name.txt)"
+          if [ -n "$CATEGORY" ] && [ -n "$BASE" ]; then
+            DEST="/app/library_reference/$CATEGORY"
+            if mkdir -p "$DEST" 2>/dev/null; then
+              if [ -e "$DEST/$BASE.jpg" ]; then
+                echo "library: $CATEGORY/$BASE.jpg already exists, leaving it alone"
+              else
+                cp forced_reference_color.jpg "$DEST/$BASE.jpg" \
+                  && echo "library: filed $CATEGORY/$BASE.jpg" \
+                  || echo "library: could not write $DEST/$BASE.jpg"
+              fi
+            else
+              echo "library: $DEST not writable - is the volume mounted?"
+            fi
+          fi
+        fi
+
+        # --- debug bundle ---------------------------------------------------
+        #
+        # The picks are what the reviewer sees; the candidates and the numbers
+        # behind them are what explain a set that came out wrong. Only this
+        # container can see the harness's run directory, so the bundling
+        # happens here and the uploading happens downstream.
+        #
+        # picks.txt carries the mapping - the entrypoint writes pickN_cand_XX.png
+        # copies into the run's output/ - so which candidate won which slot
+        # survives. archive/metrics.json is one row per candidate with .cand
+        # and .score (lay match to the reference, 0-100).
+        #
+        # Never fatal: failing here would throw away delivered images over
+        # bookkeeping. Located by the files themselves rather than by a path
+        # this flow believes in: every wrong guess so far produced a silent
+        # empty archive.
+        RUN_DIR="/app/runs/${LAYDOWN_SESSION:-}"
+        dbg "session=${LAYDOWN_SESSION:-UNSET} run_dir=$RUN_DIR pwd=$PWD"
+        dbg "run dir exists: $([ -d "$RUN_DIR" ] && echo yes || echo NO)"
+        dbg "archive exists: $([ -d "$RUN_DIR/archive" ] && echo yes || echo NO)"
+        dbg "/app/runs holds: $(ls /app/runs 2>&1 | tr '\n' ' ' | cut -c1-200)"
+        if [ ! -d "$RUN_DIR/archive" ]; then
+          CAND="$(find /app "$PWD" -maxdepth 6 -type f -name 'cand_*.png' \
+                  2>/dev/null | head -1)"
+          if [ -n "$CAND" ]; then
+            PROBE="$(dirname "$CAND")"
+            RUN_DIR=""
+            for _ in 1 2 3 4 5 6; do
+              if [ -d "$PROBE/archive" ]; then RUN_DIR="$PROBE"; break; fi
+              [ "$PROBE" = "/" ] && break
+              PROBE="$(dirname "$PROBE")"
+            done
+            if [ -n "$RUN_DIR" ]; then
+              dbg "located run under $RUN_DIR (from $CAND)"
+            else
+              RUN_DIR="$(dirname "$CAND")"
+              dbg "no archive/ above $CAND; falling back to $RUN_DIR"
+            fi
+          else
+            dbg "no cand_*.png anywhere under /app or $PWD"
+          fi
+        fi
+        dbg "run dir contents: $(ls "$RUN_DIR" 2>&1 | tr '\n' ' ' | cut -c1-300)"
+        dbg "candidates in archive: $(ls "$RUN_DIR"/archive/cand_*.png 2>/dev/null | wc -l)"
+        dbg "metrics.json: $([ -f "$RUN_DIR/archive/metrics.json" ] && echo yes || echo NO)"
+        ls "$RUN_DIR/output" > "$RUN_DIR/picks.txt" 2>/dev/null || : > "$RUN_DIR/picks.txt"
+        # Test each entry instead of reading `ls -d`'s exit status: ls prints
+        # the entries that DO exist and still exits non-zero for the ones that
+        # do not, and half of this list is optional.
+        : > /tmp/debug_list.txt
+        for entry in picks.txt archive reference_selection.json \
+                     match_results.json result_top_matches.jpg \
+                     reference_match.jpg run.log steps.log LOG.md \
+                     transcript.jsonl; do
+          if [ -e "$RUN_DIR/$entry" ]; then
+            printf '%s\n' "$entry" >> /tmp/debug_list.txt
+          fi
+        done
+        if [ -s /tmp/debug_list.txt ]; then
+          dbg "collecting $(tr '\n' ' ' < /tmp/debug_list.txt)"
+          if tar -cf debug.tar -C "$RUN_DIR" -T /tmp/debug_list.txt 2>/tmp/tar_err.txt; then
+            dbg "$(tar -tf debug.tar | wc -l) entries archived"
+          else
+            dbg "TAR FAILED - $(head -3 /tmp/tar_err.txt | tr '\n' ' ')"
+            dbg "disk: $(df -h "$PWD" | tail -1)"
+            tar -cf debug.tar --files-from /dev/null
+          fi
+        else
+          dbg "nothing to collect in $RUN_DIR"
+        fi
+        dbg "$(wc -c < debug.tar) bytes packed from $RUN_DIR"
+
+        echo '{"no_reference": false}' > status.json
+
+        # Deliver whatever the run stood behind: images exist -> deliver them,
+        # whatever the code (the harness can end on a non-zero code and still
+        # have shipped, and the entrypoint's 3 means "nothing reached OUT_DIR",
+        # which the ls below catches). No images and not a park -> the run
+        # genuinely failed, and the errors block should say so.
+        if ls generated_*.png >/dev/null 2>&1; then
+          [ "$rc" -eq 0 ] || echo "delivering $rc as success: images were produced"
+          exit 0
+        fi
+        exit $rc
+
+  # 3. Branch: generated set vs parked-for-reference.
+  - id: check-harness-result
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ json(read(outputs['fal-edit'].outputFiles['status.json'])).no_reference == false }}"
+
+    then:
+      # ---- normal path: upload the picks, then notify complete ----
+      - id: upload-to-spaces
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: debian:bookworm-slim
+        beforeCommands:
+          - apt-get update -qq && apt-get install -y -qq --no-install-recommends s3cmd jq ca-certificates > /dev/null
+        inputFiles:
+          command.json: "{{ trigger.value | json }}"
+          base_name.txt: "{{ outputs.prepare.outputFiles['base_name.txt'] }}"
+          generated.tar: "{{ outputs['fal-edit'].outputFiles['generated.tar'] }}"
+        outputFiles:
+          - generated_urls.txt
+        env:
+          DO_SPACES_KEY: "DO00L8V2TTRUGRJZGJPJ"
+          DO_SPACES_SECRET: "Jy7LwX1AbL3b5MIh39wlGAmte5j3vCZnXvZgP350tBs"
+          DO_SPACES_REGION: "sfo3"
+          DO_SPACES_BUCKET: "gps"
+        commands:
+          - |
+            set -eu
+            COMMAND_ID=$(jq -r '.command_id' command.json)
+            BASE_CLEAN=$(cat base_name.txt)
+            UPLOAD_PATH="product-laydown/generated/cmd-${COMMAND_ID}/"
+
+            S3_HOST="${DO_SPACES_REGION}.digitaloceanspaces.com"
+            cat > /tmp/.s3cfg <<EOF
+            [default]
+            access_key = ${DO_SPACES_KEY}
+            secret_key = ${DO_SPACES_SECRET}
+            host_base = ${S3_HOST}
+            host_bucket = %(bucket)s.${S3_HOST}
+            use_https = True
+            EOF
+
+            tar -xf generated.tar
+
+            # A run that reached here without images is a failure in disguise:
+            # letting it through would mark the command done while its options
+            # sit pending forever with nothing left to finish them.
+            ls generated_*.png >/dev/null 2>&1 || {
+              echo "Harness delivered no images and did not report no_reference"
+              exit 1
+            }
+
+            GENERATED_URLS=""
+            for f in generated_*.png; do
+              i=$(basename "$f" .png | sed 's/generated_//')
+              key="${UPLOAD_PATH}${BASE_CLEAN}_${i}.png"
+              echo "Uploading ${key}"
+              s3cmd -c /tmp/.s3cfg \
+                    --acl-public --no-mime-magic \
+                    --mime-type="image/png" \
+                    --add-header="Content-Type: image/png" \
+                    --add-header="Content-Disposition: inline" \
+                    --no-preserve --no-check-md5 \
+                    put "$f" "s3://${DO_SPACES_BUCKET}/${key}"
+              GENERATED_URLS="${GENERATED_URLS}https://${DO_SPACES_BUCKET}.${S3_HOST}/${key},"
+            done
+
+            printf '%s' "${GENERATED_URLS%,}" > generated_urls.txt
+            echo ""
+            echo "Uploaded: $(cat generated_urls.txt)"
+
+      - id: notify-endpoint
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ vars.notify_url }}"
+        method: POST
+        contentType: application/json
+        headers:
+          Authorization: "Token {{ vars.axis_token }}"
+        retry:
+          type: constant
+          maxAttempt: 5
+          interval: PT30S
+        body: |
+          {
+            "execution_id": "{{ execution.id }}",
+            "command_id": "{{ trigger.value.command_id }}",
+            "status": "complete",
+            "prompt": {{ read(outputs['fal-edit'].outputFiles['used_prompt.txt']) | json }},
+            "generated_image_urls": "{{ read(outputs['upload-to-spaces'].outputFiles['generated_urls.txt']) }}"
+          }
+
+      # ---- debug trail: the candidates that were graded but not delivered ---
+      #
+      # Keyed on command_id like the completion above, so the manifest lands on
+      # the exact generation rather than on whatever ran last for this item.
+      # Both tasks allow failure: the images are already delivered, and losing
+      # the debug trail must never take a green execution red.
+      - id: upload-debug
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: debian:bookworm-slim
+        allowFailure: true
+        beforeCommands:
+          - apt-get update -qq && apt-get install -y -qq --no-install-recommends s3cmd jq ca-certificates > /dev/null
+        inputFiles:
+          command.json: "{{ trigger.value | json }}"
+          debug.tar: "{{ outputs['fal-edit'].outputFiles['debug.tar'] }}"
+          debug_report.txt: "{{ outputs['fal-edit'].outputFiles['debug_report.txt'] }}"
+        outputFiles:
+          - debug_manifest.json
+        env:
+          DO_SPACES_KEY: "DO00L8V2TTRUGRJZGJPJ"
+          DO_SPACES_SECRET: "Jy7LwX1AbL3b5MIh39wlGAmte5j3vCZnXvZgP350tBs"
+          DO_SPACES_REGION: "sfo3"
+          DO_SPACES_BUCKET: "gps"
+        commands:
+          - |
+            set -eu
+            # An empty manifest is a valid answer, and it keeps the notify
+            # task's read() from failing on a run with no candidates.
+            echo '[]' > debug_manifest.json
+
+            COMMAND_ID=$(jq -r '.command_id' command.json)
+            UPLOAD_PATH="product-laydown/debug/cmd-${COMMAND_ID}/"
+
+            # The diagnostic lives HERE, not in fal-edit, because this task's
+            # log is three lines and always visible while fal-edit's is 13
+            # minutes of agent transcript the UI truncates. "empty" used to
+            # mean either "nothing was packed" or "unpacking failed" - the
+            # byte count separates them without opening another log.
+            echo "--- what fal-edit saw when it packed ---"
+            cat debug_report.txt 2>/dev/null || echo "(no report)"
+            echo "----------------------------------------"
+
+            mkdir -p bundle
+            echo "debug bundle: received $(wc -c < debug.tar) bytes"
+            if ! tar -xf debug.tar -C bundle 2>/tmp/untar_err.txt; then
+              echo "debug bundle: EXTRACT FAILED -"
+              head -10 /tmp/untar_err.txt
+            fi
+            if [ -z "$(find bundle -type f 2>/dev/null | head -1)" ]; then
+              echo "debug bundle is empty; nothing to upload"
+              exit 0
+            fi
+            echo "debug bundle: $(find bundle -type f | wc -l) files extracted"
+
+            S3_HOST="${DO_SPACES_REGION}.digitaloceanspaces.com"
+            cat > /tmp/.s3cfg <<EOF
+            [default]
+            access_key = ${DO_SPACES_KEY}
+            secret_key = ${DO_SPACES_SECRET}
+            host_base = ${S3_HOST}
+            host_bucket = %(bucket)s.${S3_HOST}
+            use_https = True
+            EOF
+            BASE="https://${DO_SPACES_BUCKET}.${S3_HOST}/${UPLOAD_PATH}"
+
+            find bundle -type f | while read -r f; do
+              name=$(basename "$f")
+              case "$name" in
+                *.png) mime="image/png" ;;
+                *.jpg|*.jpeg) mime="image/jpeg" ;;
+                *.json) mime="application/json" ;;
+                *) mime="text/plain" ;;
+              esac
+              s3cmd -c /tmp/.s3cfg \
+                    --acl-public --no-mime-magic \
+                    --mime-type="$mime" \
+                    --add-header="Content-Type: $mime" \
+                    --add-header="Content-Disposition: inline" \
+                    --no-preserve --no-check-md5 \
+                    put "$f" "s3://${DO_SPACES_BUCKET}/${UPLOAD_PATH}${name}" >/dev/null
+            done
+
+            # pick2_cand_05.png -> "2 cand_05": which candidate won which slot.
+            : > /tmp/picks.txt
+            [ -f bundle/picks.txt ] && \
+              sed -n 's/^pick\([0-9][0-9]*\).*_\(cand_[0-9][0-9]*\)\.png$/\1 \2/p' \
+                bundle/picks.txt > /tmp/picks.txt
+
+            METRICS=bundle/archive/metrics.json
+            [ -f "$METRICS" ] || METRICS=/dev/null
+
+            : > /tmp/entries.jsonl
+            for f in bundle/archive/cand_*.png; do
+              [ -e "$f" ] || continue
+              name=$(basename "$f" .png)
+              pick=$(awk -v n="$name" '$2 == n {print $1}' /tmp/picks.txt | head -1)
+              score=$(jq -r --arg n "$name" \
+                '[.candidates[]? | select(.cand == $n) | .score] | first // empty' \
+                "$METRICS" 2>/dev/null || echo "")
+              grade=$(jq -r --arg n "$name" \
+                '[.candidates[]? | select(.cand == $n) | .grade] | first // empty' \
+                "$METRICS" 2>/dev/null || echo "")
+              jq -nc --arg name "$name" --arg url "${BASE}${name}.png" \
+                     --arg score "$score" --arg grade "$grade" --arg pick "$pick" \
+                '{name: $name, url: $url, kind: "candidate"}
+                 + (if $score == "" then {} else {score: ($score | tonumber)} end)
+                 + (if $grade == "" then {} else {grade: ($grade | tonumber)} end)
+                 + (if $pick  == "" then {} else {picked_as: ($pick | tonumber)} end)' \
+                >> /tmp/entries.jsonl
+            done
+
+            find bundle -type f ! -name 'cand_*.png' | while read -r f; do
+              name=$(basename "$f")
+              jq -nc --arg name "$name" --arg url "${BASE}${name}" \
+                '{name: $name, url: $url, kind: "metadata"}' >> /tmp/entries.jsonl
+            done
+
+            jq -s . /tmp/entries.jsonl > debug_manifest.json
+            echo "manifest entries: $(jq 'length' debug_manifest.json)"
+
+      - id: notify-debug
+        type: io.kestra.plugin.core.http.Request
+        allowFailure: true
+        uri: "{{ vars.artifacts_url }}"
+        method: POST
+        contentType: application/json
+        headers:
+          Authorization: "Token {{ vars.axis_token }}"
+        body: |
+          {
+            "execution_id": "{{ execution.id }}",
+            "command_id": "{{ trigger.value.command_id }}",
+            "artifacts": {{ read(outputs['upload-debug'].outputFiles['debug_manifest.json']) }}
+          }
+
+    else:
+      # ---- parked path: upload the near-misses strip, park the command ----
+      - id: upload-near-misses
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: debian:bookworm-slim
+        beforeCommands:
+          - apt-get update -qq && apt-get install -y -qq --no-install-recommends s3cmd jq ca-certificates > /dev/null
+        inputFiles:
+          command.json: "{{ trigger.value | json }}"
+          base_name.txt: "{{ outputs.prepare.outputFiles['base_name.txt'] }}"
+          near_misses.jpg: "{{ outputs['fal-edit'].outputFiles['near_misses.jpg'] }}"
+        outputFiles:
+          - near_misses_url.txt
+        env:
+          DO_SPACES_KEY: "DO00L8V2TTRUGRJZGJPJ"
+          DO_SPACES_SECRET: "Jy7LwX1AbL3b5MIh39wlGAmte5j3vCZnXvZgP350tBs"
+          DO_SPACES_REGION: "sfo3"
+          DO_SPACES_BUCKET: "gps"
+          UPLOAD_PATH: "product-laydown/no-hero/"
+        commands:
+          - |
+            set -eu
+            COMMAND_ID=$(jq -r '.command_id' command.json)
+            BASE_CLEAN=$(cat base_name.txt)
+
+            # A park with no contact sheet is still a valid park - the reviewer
+            # just loses the clue. Never fail the flow over the evidence.
+            if [ ! -s near_misses.jpg ]; then
+              echo "near_misses.jpg is empty; skipping upload"
+              printf '%s' "" > near_misses_url.txt
+              exit 0
+            fi
+
+            S3_HOST="${DO_SPACES_REGION}.digitaloceanspaces.com"
+            cat > /tmp/.s3cfg <<EOF
+            [default]
+            access_key = ${DO_SPACES_KEY}
+            secret_key = ${DO_SPACES_SECRET}
+            host_base = ${S3_HOST}
+            host_bucket = %(bucket)s.${S3_HOST}
+            use_https = True
+            EOF
+
+            key="${UPLOAD_PATH}cmd-${COMMAND_ID}/${BASE_CLEAN}_near_misses.jpg"
+            s3cmd -c /tmp/.s3cfg \
+                  --acl-public --no-mime-magic \
+                  --mime-type="image/jpeg" \
+                  --add-header="Content-Type: image/jpeg" \
+                  --add-header="Content-Disposition: inline" \
+                  --no-preserve --no-check-md5 \
+                  put near_misses.jpg "s3://${DO_SPACES_BUCKET}/${key}"
+
+            printf '%s' "https://${DO_SPACES_BUCKET}.${S3_HOST}/${key}" > near_misses_url.txt
+            cat near_misses_url.txt
+
+      # The command already exists, so this parks through the WEBHOOK, not the
+      # intake endpoint the intake flow uses. command_id routes it to the exact
+      # row; Django sends it back to blocked and it surfaces in the
+      # "waiting for a reference image" table.
+      - id: notify-parked
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ vars.notify_url }}"
+        method: POST
+        contentType: application/json
+        headers:
+          Authorization: "Token {{ vars.axis_token }}"
+        retry:
+          type: constant
+          maxAttempt: 5
+          interval: PT30S
+        body: |
+          {
+            "execution_id": "{{ execution.id }}",
+            "command_id": "{{ trigger.value.command_id }}",
+            "status": "parked",
+            "park_reason": "library_no_reference",
+            "error_message": "The reference library has nothing close enough to this garment.",
+            "near_misses_url": "{{ read(outputs['upload-near-misses'].outputFiles['near_misses_url.txt']) }}"
+          }
+
+errors:
+  # Any task failure reports the command as failed so the option shows the
+  # error (and the retry path) instead of spinning forever. A park never lands
+  # here - it exits 0 and routes through the `else` branch above.
+  - id: notify-failure
+    type: io.kestra.plugin.core.http.Request
+    allowFailure: true
+    uri: "{{ vars.notify_url }}"
+    method: POST
+    contentType: application/json
+    headers:
+      Authorization: "Token {{ vars.axis_token }}"
+    body: |
+      {
+        "execution_id": "{{ execution.id }}",
+        "command_id": "{{ trigger.value.command_id }}",
+        "status": "failed",
+        "error_message": "Generation failed in Kestra execution {{ execution.id }} ({{ flow.id }}). Check Kestra logs."
+      }

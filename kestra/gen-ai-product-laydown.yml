@@ -1,0 +1,810 @@
+# Intake flow: off-the-floor drops (MinIO -> generate 4 options).
+#
+# Behavior:
+#   - Drop whose CATEGORY has no active Hero in Axis  -> parked by resolve-hero (as before).
+#   - Drop whose category exists but the harness LIBRARY has no match (exit 20)
+#     -> parked via the same intake endpoint, execution ends GREEN.
+#   - Any other harness failure -> execution goes RED.
+#
+# Task order: parse -> download -> stage-source -> resolve-hero (parks on 404)
+#   -> If hero found: compress -> fal-edit (harness)
+#      -> If harness found a reference: upload -> notify
+#         else: upload near-misses strip -> park via intake
+#
+# HARNESS EDITION (2026-09-02). The container is the rebuilt harness under
+# PLD_Harness/, not the retired pipeline in old/. Its entrypoint still speaks
+# this flow's contract - --reference-category, OUTPUT_PATTERN, used_prompt.txt,
+# result_top_matches.jpg, the pickN_cand_XX names and archive/metrics.json -
+# so nothing Axis reads has changed. What changed here:
+#   * fal-edit runs under the scripts docker taskRunner so the shared library
+#     can be MOUNTED (io.kestra.plugin.docker.Run ignores volumes silently)
+#   * the harness delivers its best four on its own, ranked; LAYDOWN_TASK is
+#     gone because it named a script that no longer exists
+#   * the picks travel as generated.tar, since fewer than four can come back
+#   * SEGMENT_URL / SEGMENT_API_KEY, for the segmentation service the harness
+#     now uses to drop the background before anything is generated
+
+id: gen-ai-product-laydown
+namespace: company.team
+
+concurrency:
+  # Sized to the GPU the harness talks to, not to fal: a run is an agent loop
+  # against a LAN model server for tens of minutes.
+  limit: 3
+  behavior: QUEUE
+
+variables:
+  notify_url: "https://gapplatformstudio.com/studio_management/api/product_laydown_test/webhook/"
+  intake_url: "https://gapplatformstudio.com/studio_management/api/product_laydown_test/intake/"
+  # Debug trail for the candidates that were graded but not delivered. Posted
+  # after the run is already complete, never as part of delivering it.
+  artifacts_url: "https://gapplatformstudio.com/studio_management/api/product_laydown_test/generation-artifacts/"
+  # TODO: move all keys/tokens below into Kestra secrets — this file travels.
+  intake_token: "GMjy6012n3kNYIXkOxsRrpZYMmWga9VF8TyoN1b0exA"
+
+triggers:
+  - id: kafka_realtime
+    type: io.kestra.plugin.kafka.RealtimeTrigger
+    topic: pld-ai-workflow.upload.events
+    groupId: pld-ai-workflow
+    properties:
+      bootstrap.servers: "kafka-kafka-1:9092"
+      auto.offset.reset: latest
+    keyDeserializer: STRING
+    valueDeserializer: JSON
+
+tasks:
+  # 1. Parse Kafka / MinIO event
+  - id: parse-message
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install --quiet kestra
+    outputFiles:
+      - file_info.json
+    inputFiles:
+      event.json: "{{ trigger.value | json }}"
+    script: |
+      import json, os
+      from kestra import Kestra
+
+      with open("event.json", "r") as f:
+          event = json.load(f)
+
+      record = event["Records"][0]
+      bucket = record["s3"]["bucket"]["name"]
+      key = record["s3"]["object"]["key"]
+      filename = key.split("/")[-1]
+      prefix = os.path.dirname(key)
+      hero_key = f"{prefix}/Hero.jpg" if prefix else "Hero.jpg"
+
+      info = {
+          "bucket": bucket,
+          "object_key": key,
+          "filename": filename,
+          "hero_key": hero_key,
+      }
+      with open("file_info.json", "w") as f:
+          json.dump(info, f)
+
+      print(f"Saved file_info.json for {bucket}/{key} (hero: {hero_key})")
+      Kestra.outputs(info)
+
+  # 2. Download the SOURCE image from MinIO
+  - id: download
+    type: io.kestra.plugin.docker.Run
+    containerImage: lightweight-tools:debian
+    networkMode: kafka_kafka-shared
+    inputFiles:
+      file_info.json: "{{ outputs['parse-message'].outputFiles['file_info.json'] }}"
+    outputFiles:
+      - "downloaded.jpg"
+    env:
+      AWS_ACCESS_KEY_ID: gpsppof
+      AWS_SECRET_ACCESS_KEY: "2#x5mb22&!qqJqH"
+    entryPoint: ["/bin/sh", "-c"]
+    commands:
+      - |
+        set -e
+        bucket=$(jq -r '.bucket' file_info.json)
+        key=$(jq -r '.object_key' file_info.json)
+        echo "Downloading s3://${bucket}/${key} -> downloaded.jpg"
+        s3cmd --host=minio:9000 --host-bucket=minio:9000 --no-ssl --signature-v2 \
+              --access_key=${AWS_ACCESS_KEY_ID} --secret_key=${AWS_SECRET_ACCESS_KEY} \
+              get "s3://${bucket}/${key}" "downloaded.jpg"
+        ls -lh downloaded.jpg
+
+  # 3. Stage the source to Spaces BEFORE the hero lookup (durable copy for parked drops)
+  - id: stage-source
+    type: io.kestra.plugin.docker.Run
+    containerImage: lightweight-tools:debian
+    networkMode: kafka_kafka-shared
+    inputFiles:
+      file_info.json: "{{ outputs['parse-message'].outputFiles['file_info.json'] }}"
+      downloaded.jpg: "{{ outputs.download.outputFiles['downloaded.jpg'] }}"
+    outputFiles:
+      - source_url.txt
+    env:
+      DO_SPACES_KEY: "DO00L8V2TTRUGRJZGJPJ"
+      DO_SPACES_SECRET: "Jy7LwX1AbL3b5MIh39wlGAmte5j3vCZnXvZgP350tBs"
+      DO_SPACES_REGION: "sfo3"
+      DO_SPACES_BUCKET: "gps"
+      # Per-execution folder, the way the commands flow uses cmd-<command_id>/.
+      # The key used to be built from the filename alone, so a second drop of
+      # the same item overwrote the first drop's staged source - and Axis, which
+      # compares source URLs to tell a re-shoot from an echo of work it already
+      # did, could never see a genuine re-drop as new. Every run now owns its
+      # own object, so the runs are independent and their history stays true.
+      UPLOAD_PATH: "product-laydown/generated/exec-{{ execution.id }}/"
+    entryPoint: ["/bin/sh", "-c"]
+    commands:
+      - |
+        set -e
+        original_filename=$(jq -r '.filename' file_info.json)
+        base_clean=$(echo "$original_filename" | sed -E 's/\.(jpg|jpeg|JPG|JPEG)$//')
+
+        S3_HOST="${DO_SPACES_REGION}.digitaloceanspaces.com"
+        cat > /tmp/.s3cfg <<EOF
+        [default]
+        access_key = ${DO_SPACES_KEY}
+        secret_key = ${DO_SPACES_SECRET}
+        host_base = ${S3_HOST}
+        host_bucket = %(bucket)s.${S3_HOST}
+        use_https = True
+        EOF
+
+        cp downloaded.jpg "${base_clean}.jpg"
+        echo "Staging source ${base_clean}.jpg to Spaces..."
+        s3cmd -c /tmp/.s3cfg \
+              --acl-public --no-mime-magic \
+              --mime-type="image/jpeg" \
+              --add-header="Content-Type: image/jpeg" \
+              --add-header="Content-Disposition: inline" \
+              --no-preserve --no-check-md5 \
+              put "${base_clean}.jpg" "s3://${DO_SPACES_BUCKET}/${UPLOAD_PATH}${base_clean}.jpg"
+
+        printf '%s' "https://${DO_SPACES_BUCKET}.${S3_HOST}/${UPLOAD_PATH}${base_clean}.jpg" > source_url.txt
+        cat source_url.txt
+
+  # 4. Resolve the Hero via Axis. 404 with known category -> park, end green.
+  - id: resolve-hero
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install --quiet kestra
+    outputFiles:
+      - hero_url.txt
+      - hero_prompt.txt
+    env:
+      RESOLVE_URL: "https://gapplatformstudio.com/studio_management/api/product_laydown_test/resolve-hero/"
+      INTAKE_URL: "{{ vars.intake_url }}"
+      AXIS_TOKEN: "7d616826-0079-4088-8ab3-ce184c44bfa1"
+      INTAKE_TOKEN: "{{ vars.intake_token }}"
+      FILENAME: "{{ outputs['parse-message'].vars.filename }}"
+      MINIO_KEY: "{{ outputs['parse-message'].vars.object_key }}"
+      SOURCE_URL: "{{ read(outputs['stage-source'].outputFiles['source_url.txt']) }}"
+      EXECUTION_ID: "{{ execution.id }}"
+      EXECUTION_START: "{{ execution.startDate }}"
+      FLOW_ID: "{{ flow.id }}"
+      NAMESPACE: "{{ flow.namespace }}"
+    script: |
+      import json, os, urllib.request, urllib.error
+      from kestra import Kestra
+
+      filename = os.environ["FILENAME"]
+
+      def post_json(url, body, token):
+          req = urllib.request.Request(
+              url,
+              data=json.dumps(body).encode("utf-8"),
+              method="POST",
+              headers={
+                  "Content-Type": "application/json",
+                  "Authorization": f"Token {token}",
+                  "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+              },
+          )
+          with urllib.request.urlopen(req) as resp:
+              return json.loads(resp.read().decode("utf-8"))
+
+      # Placeholders so outputFiles always exist.
+      open("hero_url.txt", "w").write("")
+      open("hero_prompt.txt", "w").write("")
+
+      try:
+          data = post_json(os.environ["RESOLVE_URL"], {"filename": filename}, os.environ["AXIS_TOKEN"])
+      except urllib.error.HTTPError as e:
+          detail = json.loads(e.read().decode("utf-8", "replace") or "{}")
+          print(f"resolve-hero returned {e.code}: {json.dumps(detail, indent=2)}")
+          category = (detail.get("category") or "").strip()
+          brand = (detail.get("brand") or "").strip()
+          if e.code == 404 and category and brand:
+              registration = post_json(
+                  os.environ["INTAKE_URL"],
+                  {
+                      "execution_id": os.environ["EXECUTION_ID"],
+                      "brand": brand,
+                      "flow_id": os.environ["FLOW_ID"],
+                      "namespace": os.environ["NAMESPACE"],
+                      "source_image_url": os.environ["SOURCE_URL"],
+                      "item_category": category,
+                      "minio_key": os.environ["MINIO_KEY"],
+                      # Dates the run to this drop; see park-no-library-reference.
+                      "timestamp": os.environ["EXECUTION_START"],
+                      "reason": "axis_no_hero_for_category",
+                  },
+                  os.environ["INTAKE_TOKEN"],
+              )
+              print(f"Parked awaiting Hero: {json.dumps(registration, indent=2)}")
+              Kestra.outputs({"hero_found": False, "brand": brand, "category": category})
+              raise SystemExit(0)
+          raise
+
+      print(json.dumps(data, indent=2))
+      open("hero_url.txt", "w").write(data["hero_image_url"])
+      open("hero_prompt.txt", "w").write(data.get("prompt") or "")
+
+      Kestra.outputs({
+          "hero_found": True,
+          "hero_image_url": data["hero_image_url"],
+          "hero_image_key": data.get("hero_image_key", ""),
+          "brand": data.get("brand", ""),
+          "category": data.get("category", ""),
+          "category_key": data.get("category_key", ""),
+      })
+
+  # 5. Generate only when Axis had a Hero for the category.
+  - id: generate-when-hero-found
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs['resolve-hero'].vars.hero_found }}"
+    then:
+      # 5a. Ensure both images are under fal's 25MB cap
+      - id: compress
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: debian:bookworm-slim
+        beforeCommands:
+          - apt-get update -qq && apt-get install -y -qq --no-install-recommends imagemagick curl ca-certificates > /dev/null
+        inputFiles:
+          downloaded.jpg: "{{ outputs.download.outputFiles['downloaded.jpg'] }}"
+        outputFiles:
+          - source_fit.jpg
+          - hero_fit.jpg
+        env:
+          HERO_URL: "{{ read(outputs['resolve-hero'].outputFiles['hero_url.txt']) }}"
+        commands:
+          - |
+            set -eu
+            CAP=25000000
+
+            IM=convert
+            command -v magick >/dev/null 2>&1 && IM=magick
+
+            filesize() { stat -c%s "$1"; }
+
+            fit_under_cap() {
+              src="$1"; out="$2"
+              if [ "$(filesize "$src")" -le "$CAP" ]; then
+                cp "$src" "$out"
+                echo "$src already under cap ($(filesize "$src") bytes), copied"
+                return
+              fi
+
+              tmp="${out}.tmp"
+              best_q=0; lo=1; hi=95
+              while [ "$lo" -le "$hi" ]; do
+                mid=$(( (lo + hi) / 2 ))
+                $IM "$src" -strip -quality "$mid" "$tmp"
+                if [ "$(filesize "$tmp")" -le "$CAP" ]; then
+                  best_q=$mid; cp "$tmp" "$out"; lo=$((mid + 1))
+                else
+                  hi=$((mid - 1))
+                fi
+              done
+              rm -f "$tmp"
+
+              scale=100
+              while [ "$best_q" -eq 0 ] && [ "$scale" -gt 10 ]; do
+                scale=$((scale * 90 / 100))
+                $IM "$src" -strip -resize "${scale}%" -quality 85 "$out"
+                [ "$(filesize "$out")" -le "$CAP" ] && best_q=85
+              done
+
+              [ "$best_q" -gt 0 ] || { echo "FAILED to fit $src under cap"; exit 1; }
+              echo "$src -> $out (quality $best_q, $(filesize "$out") bytes)"
+            }
+
+            fit_under_cap downloaded.jpg source_fit.jpg
+            curl -fsSL "$HERO_URL" -o hero.jpg
+            fit_under_cap hero.jpg hero_fit.jpg
+
+      # 5b. Run the harness. Exit 20 = library has no reference -> park, not fail.
+      #
+      # The scripts docker taskRunner, NOT io.kestra.plugin.docker.Run: that task
+      # type accepts a `volumes:` block and then ignores it, and the library is
+      # data that has to be mounted - the image deliberately does not bake it
+      # in. Needs kestra.tasks.scripts.docker.volume-enabled: true in kestra.yml.
+      # pullPolicy NEVER because pld-harness is built on this box and lives in
+      # no registry. No networkMode on purpose: needs public internet (fal) AND
+      # the LAN model and segmentation servers.
+      #
+      # The hero image is staged but not passed: the harness chooses its lay
+      # reference from the library, and a second reference would compete with
+      # it. It stays in compress's outputs for the record.
+      - id: fal-edit
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: pld-harness
+        timeout: PT45M
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          pullPolicy: NEVER
+          volumes:
+            - "/mnt/nvme1/ContainerFiles/agentic-gen-ai-workflow/gen-ai-pld/library_reference:/app/library_reference"
+        inputFiles:
+          source_fit.jpg: "{{ outputs.compress.outputFiles['source_fit.jpg'] }}"
+        outputFiles:
+          - generated.tar         # the ranked picks; empty archive when parked
+          - status.json           # always written; the branch reads this
+          - used_prompt.txt       # always touched (empty when parked)
+          - result.json           # the harness's own receipt
+          - near_misses.jpg       # always touched (real content only when parked)
+          - match_results.json
+          - debug.tar             # always written; empty archive when parked
+          - debug_report.txt      # why the bundle looks the way it does
+        env:
+          FAL_KEY: "bb3ee3cd-ffa7-4736-9400-84eebc616095:cc27b7ade3a3201c562374a015463ffb"
+          QWEN_API_KEY: "pick-a-long-secret-string"
+          QWEN_BASE_URL: "http://10.11.245.41:8091"
+          # The segmentation service the harness drops the background with,
+          # behind the same proxy. Without the key the run continues from the
+          # raw photo and says so in run.log - degraded, not dead.
+          SEGMENT_URL: "http://10.11.245.145:4000/sam3-segment"
+          SEGMENT_API_KEY: "<SEGMENT_API_KEY>"   # TODO: real value, or a Kestra secret
+          # Where the volume above lands. The entrypoint would find it there
+          # anyway; naming it keeps the two lines in sight of each other.
+          REFERENCE_LIBRARY: "/app/library_reference"
+          LAYDOWN_MAX_IMAGES: "10"
+          # The ranked picks come out under these names, generated_1.png being
+          # rank 1.
+          OUTPUT_PATTERN: "generated_{n}.png"
+          MAX_ITERS: "80"
+          # Names the harness's run folder instead of letting it stamp a
+          # timestamp nothing downstream can predict: the entrypoint reads this
+          # and writes to /app/runs/$LAYDOWN_SESSION, which is where the debug
+          # bundle collects the candidates from.
+          LAYDOWN_SESSION: "{{ execution.id }}"
+          # No LAYDOWN_TASK. The one this flow used to send told the agent to
+          # finish with grade_flats.py --ship 4, a script that no longer
+          # exists; the harness now ranks and delivers its best four itself,
+          # and the entrypoint drops any task that names a retired tool.
+          AXIS_CATEGORY: "{{ outputs['resolve-hero'].vars.category_key }}"
+        commands:
+          - |
+            # NOTE: no `set -e` - we must survive the harness's exit code and run
+            # the lines after it. Written for POSIX sh (no arrays).
+            export OUT_DIR="$PWD"
+
+            : > debug_report.txt
+            dbg() { echo "$*"; echo "$*" >> debug_report.txt; }
+
+            # Tripwire. If the mount is ever silently dropped, this is the line
+            # that says so - the run still works, it just searches an empty
+            # library and parks everything.
+            echo "--- library ---"
+            ls /app/library_reference/ || echo "LIBRARY MISSING"
+
+            /usr/local/bin/docker-entrypoint.sh "$PWD/source_fit.jpg" \
+                  --max-iters "$MAX_ITERS" \
+                  --reference-category "$AXIS_CATEGORY"
+            rc=$?
+            echo "harness exit code: $rc"
+
+            # Placeholders so every declared outputFile exists on every path.
+            # used_prompt.txt, result.json, result_top_matches.jpg and
+            # match_results.json are written by the entrypoint's delivery step
+            # whenever they exist; touch only fills the gaps.
+            touch used_prompt.txt result.json near_misses.jpg match_results.json
+            tar -cf generated.tar --files-from /dev/null
+            tar -cf debug.tar --files-from /dev/null
+
+            if [ "$rc" -eq 20 ]; then
+              # No reference in the library: an answer, not a failure. The
+              # entrypoint wrote the near-miss strip flat into OUT_DIR under its
+              # old name; this only gives it the name the next task declared.
+              cp result_top_matches.jpg near_misses.jpg 2>/dev/null || true
+              echo '{"no_reference": true}'  > status.json
+              exit 0
+            fi
+
+            # The ranked picks travel as an archive: their count is up to four,
+            # not always four, and a declared-but-absent outputFile fails the
+            # task.
+            if ls generated_*.png >/dev/null 2>&1; then
+              tar -cf generated.tar generated_*.png
+            fi
+
+            # --- debug bundle -------------------------------------------------
+            #
+            # The picks are what the reviewer sees; the candidates and the
+            # numbers behind them are what explain a set that came out wrong.
+            # Only this container can see the harness's run directory, so the
+            # bundling happens here and the uploading happens downstream.
+            #
+            # picks.txt carries the mapping - the entrypoint writes
+            # pickN_cand_XX.png copies into the run's output/ - so which
+            # candidate won which slot survives. archive/metrics.json is one
+            # row per candidate with .cand and .score (lay match to the
+            # reference, 0-100).
+            #
+            # Never fatal. A missing bundle costs the debug view; failing the
+            # task here would throw away four good images over bookkeeping.
+            RUN_DIR="/app/runs/${LAYDOWN_SESSION:-}"
+            dbg "session=${LAYDOWN_SESSION:-UNSET} run_dir=$RUN_DIR pwd=$PWD"
+            dbg "run dir exists: $([ -d "$RUN_DIR" ] && echo yes || echo NO)"
+            dbg "archive exists: $([ -d "$RUN_DIR/archive" ] && echo yes || echo NO)"
+            if [ ! -d "$RUN_DIR/archive" ]; then
+              CAND="$(find /app "$PWD" -maxdepth 6 -type f -name 'cand_*.png' \
+                      2>/dev/null | head -1)"
+              if [ -n "$CAND" ]; then
+                PROBE="$(dirname "$CAND")"
+                RUN_DIR=""
+                for _ in 1 2 3 4 5 6; do
+                  if [ -d "$PROBE/archive" ]; then RUN_DIR="$PROBE"; break; fi
+                  [ "$PROBE" = "/" ] && break
+                  PROBE="$(dirname "$PROBE")"
+                done
+                if [ -n "$RUN_DIR" ]; then
+                  dbg "located run under $RUN_DIR (from $CAND)"
+                else
+                  RUN_DIR="$(dirname "$CAND")"
+                  dbg "no archive/ above $CAND; falling back to $RUN_DIR"
+                fi
+              else
+                dbg "no cand_*.png anywhere under /app or $PWD"
+              fi
+            fi
+            dbg "candidates in archive: $(ls "$RUN_DIR"/archive/cand_*.png 2>/dev/null | wc -l)"
+            dbg "metrics.json: $([ -f "$RUN_DIR/archive/metrics.json" ] && echo yes || echo NO)"
+            ls "$RUN_DIR/output" > "$RUN_DIR/picks.txt" 2>/dev/null || : > "$RUN_DIR/picks.txt"
+            # Test each entry instead of reading `ls -d`'s exit status: ls
+            # prints the entries that DO exist and still exits non-zero for the
+            # ones that do not, and half of this list is optional.
+            : > /tmp/debug_list.txt
+            for entry in picks.txt archive reference_selection.json \
+                         match_results.json result_top_matches.jpg \
+                         reference_match.jpg run.log steps.log LOG.md \
+                         transcript.jsonl; do
+              if [ -e "$RUN_DIR/$entry" ]; then
+                printf '%s\n' "$entry" >> /tmp/debug_list.txt
+              fi
+            done
+            if [ -s /tmp/debug_list.txt ]; then
+              dbg "collecting $(tr '\n' ' ' < /tmp/debug_list.txt)"
+              if tar -cf debug.tar -C "$RUN_DIR" -T /tmp/debug_list.txt 2>/tmp/tar_err.txt; then
+                dbg "$(tar -tf debug.tar | wc -l) entries archived"
+              else
+                dbg "TAR FAILED - $(head -3 /tmp/tar_err.txt | tr '\n' ' ')"
+                dbg "disk: $(df -h "$PWD" | tail -1)"
+                tar -cf debug.tar --files-from /dev/null
+              fi
+            else
+              dbg "nothing to collect in $RUN_DIR"
+            fi
+            dbg "$(wc -c < debug.tar) bytes packed from $RUN_DIR"
+
+            echo '{"no_reference": false}' > status.json
+
+            # Deliver whatever the run stood behind: images exist -> deliver
+            # them, whatever the code. No images and not a park -> the run
+            # genuinely failed, and the execution should go red.
+            if ls generated_*.png >/dev/null 2>&1; then
+              [ "$rc" -eq 0 ] || echo "delivering $rc as success: images were produced"
+              exit 0
+            fi
+            exit $rc
+
+      # 5c. Branch: generated set vs parked-for-hero
+      - id: check-harness-result
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ json(read(outputs['fal-edit'].outputFiles['status.json'])).no_reference == false }}"
+        then:
+          # ---- normal path: upload the picks, then notify ----
+          - id: upload-to-spaces
+            type: io.kestra.plugin.docker.Run
+            containerImage: lightweight-tools:debian
+            networkMode: kafka_kafka-shared
+            inputFiles:
+              file_info.json: "{{ outputs['parse-message'].outputFiles['file_info.json'] }}"
+              generated.tar: "{{ outputs['fal-edit'].outputFiles['generated.tar'] }}"
+            outputFiles:
+              - generated_urls.txt
+            env:
+              DO_SPACES_KEY: "DO00L8V2TTRUGRJZGJPJ"
+              DO_SPACES_SECRET: "Jy7LwX1AbL3b5MIh39wlGAmte5j3vCZnXvZgP350tBs"
+              DO_SPACES_REGION: "sfo3"
+              DO_SPACES_BUCKET: "gps"
+              # Same execution folder the source was staged into: a later run of
+              # this item must not overwrite the pictures an earlier run
+              # delivered and somebody already graded.
+              UPLOAD_PATH: "product-laydown/generated/exec-{{ execution.id }}/"
+            entryPoint: ["/bin/sh", "-c"]
+            commands:
+              - |
+                set -e
+                original_filename=$(jq -r '.filename' file_info.json)
+                base_clean=$(echo "$original_filename" | sed -E 's/\.(jpg|jpeg|JPG|JPEG)$//')
+                echo "Base cleaned: $base_clean"
+
+                S3_HOST="${DO_SPACES_REGION}.digitaloceanspaces.com"
+                cat > /tmp/.s3cfg <<EOF
+                [default]
+                access_key = ${DO_SPACES_KEY}
+                secret_key = ${DO_SPACES_SECRET}
+                host_base = ${S3_HOST}
+                host_bucket = %(bucket)s.${S3_HOST}
+                use_https = True
+                EOF
+
+                tar -xf generated.tar
+
+                # A run that reached here without images is a failure in
+                # disguise: letting it through would notify Axis of a delivery
+                # with nothing in it.
+                ls generated_*.png >/dev/null 2>&1 || {
+                  echo "Harness delivered no images and did not report no_reference"
+                  exit 1
+                }
+
+                GENERATED_URLS=""
+                for f in generated_*.png; do
+                  i=$(basename "$f" .png | sed 's/generated_//')
+                  cp "$f" "${base_clean}_${i}.png"
+                  echo "Uploading ${base_clean}_${i}.png..."
+                  s3cmd -c /tmp/.s3cfg \
+                        --acl-public --no-mime-magic \
+                        --mime-type="image/png" \
+                        --add-header="Content-Type: image/png" \
+                        --add-header="Content-Disposition: inline" \
+                        --no-preserve --no-check-md5 \
+                        put "${base_clean}_${i}.png" "s3://${DO_SPACES_BUCKET}/${UPLOAD_PATH}${base_clean}_${i}.png"
+                  URL="https://${DO_SPACES_BUCKET}.${S3_HOST}/${UPLOAD_PATH}${base_clean}_${i}.png"
+                  GENERATED_URLS="${GENERATED_URLS}${URL},"
+                done
+
+                GENERATED_URLS=$(echo "$GENERATED_URLS" | sed 's/,$//')
+                printf '%s' "${GENERATED_URLS}" > generated_urls.txt
+                echo "Uploaded: ${GENERATED_URLS}"
+
+          - id: notify-endpoint
+            type: io.kestra.plugin.core.http.Request
+            allowFailure: true
+            uri: "{{ vars.notify_url }}"
+            method: POST
+            contentType: application/json
+            headers:
+              Authorization: "Token 7d616826-0079-4088-8ab3-ce184c44bfa1"
+            body: |
+              {
+                "execution_id": "{{ execution.id }}",
+                "flow_id": "{{ flow.id }}",
+                "namespace": "{{ flow.namespace }}",
+                "timestamp": "{{ execution.startDate }}",
+                "prompt": {{ read(outputs['fal-edit'].outputFiles['used_prompt.txt']) | json }},
+                "source_image_url": "{{ read(outputs['stage-source'].outputFiles['source_url.txt']) }}",
+                "hero_image_key": "{{ read(outputs['resolve-hero'].outputFiles['hero_url.txt']) }}",
+                "generated_image_urls": "{{ read(outputs['upload-to-spaces'].outputFiles['generated_urls.txt']) }}",
+                "item_category": "{{ outputs['resolve-hero'].vars.category }}",
+                "minio_bucket": "{{ outputs['parse-message'].vars.bucket }}",
+                "minio_key": "{{ outputs['parse-message'].vars.object_key }}"
+              }
+
+          # ---- debug trail: the candidates nobody sees ----------------------
+          #
+          # Runs AFTER notify-endpoint on purpose. The intake webhook is what
+          # creates the run row, and a manifest has nothing to attach to until
+          # it exists. Both tasks allow failure: this is bookkeeping about work
+          # that has already been delivered, and it must never take a green
+          # execution red.
+          - id: upload-debug
+            type: io.kestra.plugin.docker.Run
+            containerImage: lightweight-tools:debian
+            networkMode: kafka_kafka-shared
+            allowFailure: true
+            inputFiles:
+              debug.tar: "{{ outputs['fal-edit'].outputFiles['debug.tar'] }}"
+              debug_report.txt: "{{ outputs['fal-edit'].outputFiles['debug_report.txt'] }}"
+            outputFiles:
+              - debug_manifest.json
+            env:
+              DO_SPACES_KEY: "DO00L8V2TTRUGRJZGJPJ"
+              DO_SPACES_SECRET: "Jy7LwX1AbL3b5MIh39wlGAmte5j3vCZnXvZgP350tBs"
+              DO_SPACES_REGION: "sfo3"
+              DO_SPACES_BUCKET: "gps"
+              UPLOAD_PATH: "product-laydown/debug/exec-{{ execution.id }}/"
+            entryPoint: ["/bin/sh", "-c"]
+            commands:
+              - |
+                set -e
+                # An empty manifest is a valid answer (a parked or candidate-less
+                # run), and it keeps the notify task's read() from failing.
+                echo '[]' > debug_manifest.json
+
+                echo "--- what fal-edit saw when it packed ---"
+                cat debug_report.txt 2>/dev/null || echo "(no report)"
+                echo "----------------------------------------"
+
+                mkdir -p bundle
+                echo "debug bundle: received $(wc -c < debug.tar) bytes"
+                if ! tar -xf debug.tar -C bundle 2>/tmp/untar_err.txt; then
+                  echo "debug bundle: EXTRACT FAILED -"
+                  head -10 /tmp/untar_err.txt
+                fi
+                if [ -z "$(find bundle -type f 2>/dev/null | head -1)" ]; then
+                  echo "debug bundle is empty; nothing to upload"
+                  exit 0
+                fi
+                echo "debug bundle: $(find bundle -type f | wc -l) files extracted"
+
+                S3_HOST="${DO_SPACES_REGION}.digitaloceanspaces.com"
+                cat > /tmp/.s3cfg <<EOF
+                [default]
+                access_key = ${DO_SPACES_KEY}
+                secret_key = ${DO_SPACES_SECRET}
+                host_base = ${S3_HOST}
+                host_bucket = %(bucket)s.${S3_HOST}
+                use_https = True
+                EOF
+                BASE="https://${DO_SPACES_BUCKET}.${S3_HOST}/${UPLOAD_PATH}"
+
+                # Flattened into the prefix: the harness's names are already
+                # unique within a run, and a flat listing is what the debug view
+                # reads back.
+                find bundle -type f | while read -r f; do
+                  name=$(basename "$f")
+                  case "$name" in
+                    *.png) mime="image/png" ;;
+                    *.jpg|*.jpeg) mime="image/jpeg" ;;
+                    *.json) mime="application/json" ;;
+                    *) mime="text/plain" ;;
+                  esac
+                  s3cmd -c /tmp/.s3cfg \
+                        --acl-public --no-mime-magic \
+                        --mime-type="$mime" \
+                        --add-header="Content-Type: $mime" \
+                        --add-header="Content-Disposition: inline" \
+                        --no-preserve --no-check-md5 \
+                        put "$f" "s3://${DO_SPACES_BUCKET}/${UPLOAD_PATH}${name}" >/dev/null
+                done
+
+                # pick2_cand_05.png -> "2 cand_05": which candidate won which
+                # delivered slot, straight from the harness's own naming.
+                : > /tmp/picks.txt
+                [ -f bundle/picks.txt ] && \
+                  sed -n 's/^pick\([0-9][0-9]*\).*_\(cand_[0-9][0-9]*\)\.png$/\1 \2/p' \
+                    bundle/picks.txt > /tmp/picks.txt
+
+                METRICS=bundle/archive/metrics.json
+                [ -f "$METRICS" ] || METRICS=/dev/null
+
+                : > /tmp/entries.jsonl
+                for f in bundle/archive/cand_*.png; do
+                  [ -e "$f" ] || continue
+                  name=$(basename "$f" .png)
+                  pick=$(awk -v n="$name" '$2 == n {print $1}' /tmp/picks.txt | head -1)
+                  score=$(jq -r --arg n "$name" \
+                    '[.candidates[]? | select(.cand == $n) | .score] | first // empty' \
+                    "$METRICS" 2>/dev/null || echo "")
+                  grade=$(jq -r --arg n "$name" \
+                    '[.candidates[]? | select(.cand == $n) | .grade] | first // empty' \
+                    "$METRICS" 2>/dev/null || echo "")
+                  jq -nc --arg name "$name" --arg url "${BASE}${name}.png" \
+                         --arg score "$score" --arg grade "$grade" --arg pick "$pick" \
+                    '{name: $name, url: $url, kind: "candidate"}
+                     + (if $score == "" then {} else {score: ($score | tonumber)} end)
+                     + (if $grade == "" then {} else {grade: ($grade | tonumber)} end)
+                     + (if $pick  == "" then {} else {picked_as: ($pick | tonumber)} end)' \
+                    >> /tmp/entries.jsonl
+                done
+
+                find bundle -type f ! -name 'cand_*.png' | while read -r f; do
+                  name=$(basename "$f")
+                  jq -nc --arg name "$name" --arg url "${BASE}${name}" \
+                    '{name: $name, url: $url, kind: "metadata"}' >> /tmp/entries.jsonl
+                done
+
+                jq -s . /tmp/entries.jsonl > debug_manifest.json
+                echo "manifest entries: $(jq 'length' debug_manifest.json)"
+
+          - id: notify-debug
+            type: io.kestra.plugin.core.http.Request
+            allowFailure: true
+            uri: "{{ vars.artifacts_url }}"
+            method: POST
+            contentType: application/json
+            headers:
+              Authorization: "Token 7d616826-0079-4088-8ab3-ce184c44bfa1"
+            body: |
+              {
+                "execution_id": "{{ execution.id }}",
+                "artifacts": {{ read(outputs['upload-debug'].outputFiles['debug_manifest.json']) }}
+              }
+
+        else:
+          # ---- parked path: upload the near-misses strip, register with Axis ----
+          - id: upload-near-misses
+            type: io.kestra.plugin.docker.Run
+            containerImage: lightweight-tools:debian
+            networkMode: kafka_kafka-shared
+            inputFiles:
+              file_info.json: "{{ outputs['parse-message'].outputFiles['file_info.json'] }}"
+              near_misses.jpg: "{{ outputs['fal-edit'].outputFiles['near_misses.jpg'] }}"
+            outputFiles:
+              - near_misses_url.txt
+            env:
+              DO_SPACES_KEY: "DO00L8V2TTRUGRJZGJPJ"
+              DO_SPACES_SECRET: "Jy7LwX1AbL3b5MIh39wlGAmte5j3vCZnXvZgP350tBs"
+              DO_SPACES_REGION: "sfo3"
+              DO_SPACES_BUCKET: "gps"
+              # Per execution as well: the contact sheet is evidence for one
+              # park, and the next run's near misses are a different answer.
+              UPLOAD_PATH: "product-laydown/no-hero/exec-{{ execution.id }}/"
+            entryPoint: ["/bin/sh", "-c"]
+            commands:
+              - |
+                set -e
+                original_filename=$(jq -r '.filename' file_info.json)
+                base_clean=$(echo "$original_filename" | sed -E 's/\.(jpg|jpeg|JPG|JPEG)$//')
+
+                # Empty placeholder (harness cp failed)? Skip upload, empty URL.
+                if [ ! -s near_misses.jpg ]; then
+                  echo "near_misses.jpg is empty; skipping upload"
+                  printf '%s' "" > near_misses_url.txt
+                  exit 0
+                fi
+
+                S3_HOST="${DO_SPACES_REGION}.digitaloceanspaces.com"
+                cat > /tmp/.s3cfg <<EOF
+                [default]
+                access_key = ${DO_SPACES_KEY}
+                secret_key = ${DO_SPACES_SECRET}
+                host_base = ${S3_HOST}
+                host_bucket = %(bucket)s.${S3_HOST}
+                use_https = True
+                EOF
+
+                cp near_misses.jpg "${base_clean}_near_misses.jpg"
+                s3cmd -c /tmp/.s3cfg \
+                      --acl-public --no-mime-magic \
+                      --mime-type="image/jpeg" \
+                      --add-header="Content-Type: image/jpeg" \
+                      --add-header="Content-Disposition: inline" \
+                      --no-preserve --no-check-md5 \
+                      put "${base_clean}_near_misses.jpg" "s3://${DO_SPACES_BUCKET}/${UPLOAD_PATH}${base_clean}_near_misses.jpg"
+
+                printf '%s' "https://${DO_SPACES_BUCKET}.${S3_HOST}/${UPLOAD_PATH}${base_clean}_near_misses.jpg" > near_misses_url.txt
+                cat near_misses_url.txt
+
+          # `timestamp` dates the run to THIS drop. Axis's day list files runs on
+          # timestamp, falling back to when the row was first created, and a
+          # registration that omits it wipes the field - so a re-drop of an older
+          # item would generate today and still be listed under the day it first
+          # arrived, where nobody is looking for it.
+          - id: park-no-library-reference
+            type: io.kestra.plugin.core.http.Request
+            uri: "{{ vars.intake_url }}"
+            method: POST
+            contentType: application/json
+            headers:
+              Authorization: "Token {{ vars.intake_token }}"
+            body: |
+              {
+                "execution_id": "{{ execution.id }}",
+                "flow_id": "{{ flow.id }}",
+                "namespace": "{{ flow.namespace }}",
+                "brand": "{{ outputs['resolve-hero'].vars.brand }}",
+                "item_category": "{{ outputs['resolve-hero'].vars.category }}",
+                "source_image_url": "{{ read(outputs['stage-source'].outputFiles['source_url.txt']) }}",
+                "minio_key": "{{ outputs['parse-message'].vars.object_key }}",
+                "timestamp": "{{ execution.startDate }}",
+                "reason": "library_no_reference",
+                "near_misses_url": "{{ read(outputs['upload-near-misses'].outputFiles['near_misses_url.txt']) }}"
+              }
