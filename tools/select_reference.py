@@ -22,9 +22,12 @@ Three stages, in decreasing order of how much they can be trusted:
      cannot work at all, then weight what is left into a number out of 100.
      Free, repeatable, and it cannot hallucinate a match.
 
-  C. CONFIRM.   One vision call showing the query and the survivors side by
-     side. It can only ever REJECT - it is a veto on B, not a replacement for
-     it. Both gates must pass.
+  C. CHOOSE.    One vision call showing the query and the survivors side by
+     side, asked which one the query could be laid out to match. It picks
+     among the candidates that cleared B, or rejects them all. B decides who
+     is in the room and in what order; C decides who wins. A one-point gap on
+     the form is noise, and on runs/20260902_115301 C took an 80.5 over an
+     81.4 on cut alone, at confidence 92 - which is the point of it.
 
 Two things it insists on, both because of how the rest of the harness behaves:
 
@@ -1133,8 +1136,9 @@ def main() -> int:
             print(f"  differences: {verdict.get('differences')}")
 
     # --- decision ----------------------------------------------------------
-    # Two independent gates, both must pass: the number clears the threshold,
-    # and the model does not reject the survivors on sight.
+    # Two gates, both must pass: the number clears the threshold, and the
+    # model does not reject the survivors on sight. Then the model's pick,
+    # not the top score, is the winner - see stage C in the module docstring.
     match_found = bool(qualifying)
     vetoed = False
     chosen = None
