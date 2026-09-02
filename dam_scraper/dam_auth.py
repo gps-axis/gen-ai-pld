@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import getpass
+import json
 import os
 import sys
+import tempfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from auth_session import (
     AuthStateError,
     AuthenticationExpired,
+    is_login_url,
     is_authenticated_dam_observation,
     load_storage_state,
     require_authenticated_url,
@@ -31,6 +36,32 @@ DEFAULT_AUTH_STATE = Path(
 )
 DEFAULT_TIMEOUT_MS = 60_000
 AUTH_DETECTION_TIMEOUT_MS = 10_000
+DAM_LOGIN_HOST = "digitalassets.gapinc.com"
+IDP_HOST = "onelogon.gap.com"
+SSO_GATEWAY_URL = "https://digitalassets.gapinc.com/saml2/login.aspx"
+IDP_PATH_SUFFIX = "/resumeSAML20/idp/SSO.ping"
+USERNAME_SELECTOR = 'input#username[name="pf.username"][type="text"]'
+PASSWORD_SELECTOR = 'input#password[name="pf.pass"][type="password"]'
+SIGN_ON_SELECTOR = 'a[title="Sign On"][onclick="postOk();"]'
+
+
+@dataclass(frozen=True)
+class Credentials:
+    login_id: str = field(repr=False)
+    password: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class _SsoGateway:
+    page: Any
+    link: Any
+
+
+@dataclass(frozen=True)
+class _IdpLoginForm:
+    username: Any
+    password: Any
+    submit: Any
 
 
 def _playwright() -> Any:
@@ -51,26 +82,242 @@ def _has_asset_management_link(page: Any) -> bool:
     return False
 
 
-def _find_authenticated_page(context: Any, dam_url: str) -> Any | None:
-    deadline = time.monotonic() + AUTH_DETECTION_TIMEOUT_MS / 1000
+def _authenticated_page(context: Any, dam_url: str) -> Any | None:
+    for page in reversed(context.pages):
+        if page.is_closed():
+            continue
+        try:
+            if is_authenticated_dam_observation(
+                url=page.url,
+                has_asset_management_link=_has_asset_management_link(page),
+                dam_url=dam_url,
+            ):
+                return page
+        except Exception:
+            # SSO can replace or close a page while Playwright inspects it.
+            continue
+    return None
+
+
+def _find_authenticated_page(
+    context: Any,
+    dam_url: str,
+    timeout_ms: int = AUTH_DETECTION_TIMEOUT_MS,
+) -> Any | None:
+    deadline = time.monotonic() + timeout_ms / 1000
+    while True:
+        authenticated_page = _authenticated_page(context, dam_url)
+        if authenticated_page is not None:
+            return authenticated_page
+
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.25)
+
+
+def _visible_controls(locator: Any) -> list[Any]:
+    return [
+        locator.nth(index)
+        for index in range(locator.count())
+        if locator.nth(index).is_visible()
+    ]
+
+
+def _verified_sso_gateway(page: Any) -> _SsoGateway:
+    location = urlsplit(page.url)
+    if (
+        location.scheme != "https"
+        or location.hostname != DAM_LOGIN_HOST
+        or not is_login_url(page.url)
+    ):
+        raise AuthenticationExpired(
+            f"Gap SSO reached an unexpected page: {_safe_location(page)}."
+        )
+
+    areas = _visible_controls(page.get_by_text("Gap Inc User Login", exact=True))
+    links = _visible_controls(
+        page.get_by_role("link", name="Login with SSO", exact=True)
+    )
+    if (
+        len(areas) != 1
+        or len(links) != 1
+        or urljoin(page.url, links[0].get_attribute("href") or "")
+        != SSO_GATEWAY_URL
+    ):
+        raise AuthenticationExpired(
+            "The expected Gap DAM SSO gateway was not found."
+        )
+    return _SsoGateway(page=page, link=links[0])
+
+
+def _click_sso_gateway(gateway: _SsoGateway, timeout_ms: int) -> None:
+    try:
+        gateway.link.click()
+    except Exception:
+        raise AuthenticationExpired("Gap SSO could not be opened.") from None
+    try:
+        gateway.page.wait_for_url(
+            "https://onelogon.gap.com/**",
+            timeout=timeout_ms,
+            wait_until="domcontentloaded",
+        )
+    except Exception:
+        raise AuthenticationExpired(
+            "Gap SSO did not reach the trusted employee login page."
+        ) from None
+
+
+def _is_trusted_idp_origin(page: Any) -> bool:
+    try:
+        location = urlsplit(page.url)
+        return location.scheme == "https" and location.hostname == IDP_HOST
+    except Exception:
+        return False
+
+
+def _is_expected_idp_page(page: Any) -> bool:
+    if not _is_trusted_idp_origin(page):
+        return False
+    try:
+        path = urlsplit(page.url).path
+        return (
+            path.startswith("/idp/")
+            and path.endswith(IDP_PATH_SUFFIX)
+            and page.title() == "Gap Inc Login"
+            and len(page.frames) == 1
+        )
+    except Exception:
+        return False
+
+
+def _verified_idp_form(page: Any) -> _IdpLoginForm:
+    if not _is_trusted_idp_origin(page):
+        raise AuthenticationExpired(
+            f"Gap SSO reached an unexpected page: {_safe_location(page)}."
+        )
+    if not _is_expected_idp_page(page):
+        raise AuthenticationExpired(
+            "The expected Gap SSO credential form was not found."
+        )
+
+    usernames = _visible_controls(page.locator(USERNAME_SELECTOR))
+    passwords = _visible_controls(page.locator(PASSWORD_SELECTOR))
+    submits = _visible_controls(page.locator(SIGN_ON_SELECTOR))
+    if (
+        len(usernames) != 1
+        or len(passwords) != 1
+        or len(submits) != 1
+        or submits[0].inner_text().strip() != "Sign On"
+    ):
+        raise AuthenticationExpired(
+            "The expected Gap SSO credential form was not found."
+        )
+    return _IdpLoginForm(usernames[0], passwords[0], submits[0])
+
+
+def _find_idp_page(context: Any, timeout_ms: int) -> Any | None:
+    deadline = time.monotonic() + timeout_ms / 1000
     while True:
         for page in reversed(context.pages):
             if page.is_closed():
                 continue
             try:
-                if is_authenticated_dam_observation(
-                    url=page.url,
-                    has_asset_management_link=_has_asset_management_link(page),
-                    dam_url=dam_url,
-                ):
-                    return page
-            except Exception:
-                # A page can disappear while SSO replaces or closes it.
+                _verified_idp_form(page)
+                return page
+            except AuthenticationExpired:
                 continue
-
         if time.monotonic() >= deadline:
             return None
         time.sleep(0.25)
+
+
+def _prompt_credentials() -> Credentials:
+    if not sys.stdin.isatty():
+        raise RuntimeError("Capture requires an interactive terminal.")
+
+    try:
+        login_id = input("Gap SSO login ID: ").strip()
+        if not login_id:
+            raise RuntimeError("The login ID cannot be blank.")
+        password = getpass.getpass("Gap SSO password: ")
+    except EOFError as exc:
+        raise RuntimeError("Capture requires an interactive terminal.") from exc
+
+    if not password.strip():
+        raise RuntimeError("The password cannot be blank.")
+    return Credentials(login_id=login_id, password=password)
+
+
+def _login_from_terminal(page: Any) -> None:
+    form = _verified_idp_form(page)
+    credentials = _prompt_credentials()
+    try:
+        form.username.fill(credentials.login_id)
+    except Exception:
+        raise AuthenticationExpired(
+            "Gap SSO login ID could not be entered."
+        ) from None
+    try:
+        form.password.fill(credentials.password)
+    except Exception:
+        raise AuthenticationExpired(
+            "Gap SSO password could not be entered."
+        ) from None
+    try:
+        form.submit.click()
+    except Exception:
+        raise AuthenticationExpired("Gap SSO sign-in could not be submitted.") from None
+
+
+def _safe_location(page: Any) -> str:
+    try:
+        location = urlsplit(page.url)
+        if not location.scheme or not location.hostname:
+            return "unknown page"
+        return f"{location.scheme}://{location.hostname}{location.path}"
+    except Exception:
+        return "unknown page"
+
+
+def _classify_failed_sso(pages: list[Any]) -> AuthenticationExpired:
+    open_pages = [page for page in reversed(pages) if not page.is_closed()]
+    for page in open_pages:
+        if not _is_trusted_idp_origin(page):
+            continue
+        try:
+            _verified_idp_form(page)
+        except AuthenticationExpired:
+            return AuthenticationExpired(
+                "Gap SSO requires additional verification or an unsupported SSO step."
+            )
+        return AuthenticationExpired(
+            "Gap SSO rejected the credentials or restarted sign-in."
+        )
+
+    location = _safe_location(open_pages[0]) if open_pages else "no open page"
+    return AuthenticationExpired(f"Gap SSO reached an unexpected page: {location}.")
+
+
+def _persist_storage_state(context: Any, auth_state: Path) -> None:
+    state = context.storage_state(indexed_db=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=auth_state.parent,
+            prefix=".dam-auth-",
+            suffix=".json",
+            delete=False,
+        ) as temporary_file:
+            json.dump(state, temporary_file)
+            temporary_path = Path(temporary_file.name)
+        secure_storage_state(temporary_path)
+        os.replace(temporary_path, auth_state)
+    except Exception:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def _safe_page_summary(page: Any) -> str:
@@ -84,41 +331,57 @@ def _safe_page_summary(page: Any) -> str:
 
 
 def capture(args: argparse.Namespace) -> int:
-    """Open a visible browser, wait for manual login, and save its state."""
+    """Sign in from the terminal and save the authenticated browser state."""
 
     auth_state = args.auth_state.expanduser().resolve()
     auth_state.parent.mkdir(parents=True, exist_ok=True)
 
-    launch_options: dict[str, Any] = {"headless": False}
+    launch_options: dict[str, Any] = {"headless": not args.headed}
     if args.channel:
         launch_options["channel"] = args.channel
 
     with _playwright()() as playwright:
         browser = playwright.chromium.launch(**launch_options)
-        context = browser.new_context()
-        page = context.new_page()
-        page.goto(args.url, wait_until="domcontentloaded", timeout=args.timeout_ms)
-
-        print("Complete the DAM login in the browser window.")
         try:
-            input("After the Gap asset page loads, press Enter here: ")
-        except EOFError as exc:
-            browser.close()
-            raise RuntimeError("Capture requires an interactive terminal.") from exc
+            context = browser.new_context()
+            page = context.new_page()
+            page.goto(
+                args.url,
+                wait_until="domcontentloaded",
+                timeout=args.timeout_ms,
+            )
 
-        authenticated_page = _find_authenticated_page(context, args.url)
-        if authenticated_page is None:
-            page_summaries = "; ".join(
-                _safe_page_summary(open_page) for open_page in context.pages
-            )
-            raise AuthenticationExpired(
-                "No authenticated Gap DAM asset page was open after login. "
-                f"Observed pages: {page_summaries or 'none'}."
-            )
-        context.storage_state(path=auth_state, indexed_db=True)
-        secure_storage_state(auth_state)
-        captured_page_summary = _safe_page_summary(authenticated_page)
-        browser.close()
+            authenticated_page = _authenticated_page(context, DEFAULT_DAM_URL)
+            if authenticated_page is None:
+                gateway = _verified_sso_gateway(page)
+                _click_sso_gateway(gateway, args.timeout_ms)
+                idp_page = _find_idp_page(context, args.timeout_ms)
+                if idp_page is None:
+                    raise _classify_failed_sso(context.pages)
+                _login_from_terminal(idp_page)
+                try:
+                    _verified_idp_form(idp_page)
+                except AuthenticationExpired:
+                    pass
+                else:
+                    raise AuthenticationExpired(
+                        "Gap SSO rejected the credentials or restarted sign-in."
+                    )
+                authenticated_page = _find_authenticated_page(
+                    context, DEFAULT_DAM_URL, args.timeout_ms
+                )
+            if authenticated_page is None:
+                raise _classify_failed_sso(context.pages)
+
+            _persist_storage_state(context, auth_state)
+            captured_page_summary = _safe_page_summary(authenticated_page)
+        finally:
+            closing_during_exception = sys.exception() is not None
+            try:
+                browser.close()
+            except Exception:
+                if not closing_during_exception:
+                    raise
 
     print(
         "Saved authenticated browser state from "
@@ -173,12 +436,17 @@ def build_parser() -> argparse.ArgumentParser:
         )
 
     capture_parser = subparsers.add_parser(
-        "capture", help="Log in manually once and save the browser state."
+        "capture", help="Log in from the terminal and save the browser state."
     )
     add_common_options(capture_parser)
     capture_parser.add_argument(
         "--channel",
         help="Installed Chromium channel, such as 'chrome'.",
+    )
+    capture_parser.add_argument(
+        "--headed",
+        action="store_true",
+        help="Show the browser for login diagnostics.",
     )
     capture_parser.set_defaults(handler=capture)
 

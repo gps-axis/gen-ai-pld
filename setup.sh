@@ -27,4 +27,4 @@ echo
 echo "Setup complete. DAM authentication has not been captured."
 echo "When ready, run:"
 echo "  cd \"$DAM_PROJECT\""
-echo "  uv run --locked python dam_auth.py capture --channel chrome"
+echo "  uv run --locked python dam_auth.py capture"
