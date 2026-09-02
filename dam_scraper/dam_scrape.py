@@ -28,6 +28,7 @@ DEFAULT_SEARCH_URL = (
     "#/DamView&TP=default&VBID=270HZOLSY3NGJ&PN=1&WS=270H397TAWK"
 )
 IMAGE_SUFFIXES = {".jpg", ".jpeg"}
+DEFAULT_IMAGE_ROOT = Path(__file__).resolve().parent.parent / "inputs" / "reference_library"
 
 
 class ScrapeError(RuntimeError):
@@ -466,6 +467,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-root",
         type=Path,
         default=Path(os.environ.get("DAM_OUTPUT_ROOT", "downloads")),
+        help="Where the source ZIP and manifest are kept, one folder per style.",
+    )
+    parser.add_argument(
+        "--image-root",
+        type=Path,
+        default=Path(os.environ.get("DAM_IMAGE_ROOT", DEFAULT_IMAGE_ROOT)),
+        help="Where the extracted JPGs are written; defaults to the reference library.",
     )
     parser.add_argument("--url", default=DEFAULT_SEARCH_URL)
     parser.add_argument("--headed", action="store_true")
@@ -482,6 +490,7 @@ def main(argv: list[str] | None = None) -> int:
         auth_state = args.auth_state.expanduser().resolve()
         load_storage_state(auth_state)
         output_directory = args.output_root.expanduser().resolve() / query_directory
+        images_directory = args.image_root.expanduser().resolve()
         manifest_path = output_directory / "manifest.json"
         if manifest_path.exists() and not args.force:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -493,7 +502,21 @@ def main(argv: list[str] | None = None) -> int:
                 for archive in archives
             )
             if manifest.get("status") == "complete" and archives_exist:
-                print(f"Already complete: {output_directory}")
+                missing = [
+                    entry["filename"]
+                    for entry in manifest.get("files", [])
+                    if isinstance(entry, dict)
+                    and isinstance(entry.get("filename"), str)
+                    and not (images_directory / entry["filename"]).is_file()
+                ]
+                if missing:
+                    for archive in archives:
+                        extract_archive(
+                            output_directory / archive["filename"], images_directory
+                        )
+                    print(f"Restored {len(missing)} JPG files to {images_directory}")
+                else:
+                    print(f"Already complete: {images_directory}")
                 return 0
 
         output_directory.mkdir(parents=True, exist_ok=True)
@@ -505,7 +528,6 @@ def main(argv: list[str] | None = None) -> int:
             timeout_ms=args.timeout_ms,
         )
         plan = choose_shot_batches(shot_counts)
-        images_directory = output_directory / "images"
         archives: list[dict[str, object]] = []
         files: list[dict[str, object]] = []
         selected_sources: list[dict[str, object]] = []
@@ -570,6 +592,7 @@ def main(argv: list[str] | None = None) -> int:
             "download_method": "Standard download",
             "result_count": sum(batch.limit for batch in plan),
             "selected_sources": selected_sources,
+            "image_root": str(images_directory),
             "archives": archives,
             "files": files,
             "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -577,7 +600,7 @@ def main(argv: list[str] | None = None) -> int:
         write_json_atomic(manifest_path, manifest)
         print(
             f"Downloaded {sum(batch.limit for batch in plan)} JPG files "
-            f"to {output_directory}"
+            f"to {images_directory}"
         )
         return 0
     except (AuthStateError, ScrapeError, PlaywrightTimeoutError, OSError, json.JSONDecodeError) as exc:
