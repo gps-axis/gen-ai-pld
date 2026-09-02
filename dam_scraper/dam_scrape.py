@@ -28,6 +28,17 @@ DEFAULT_SEARCH_URL = (
     "#/DamView&TP=default&VBID=270HZOLSY3NGJ&PN=1&WS=270H397TAWK"
 )
 IMAGE_SUFFIXES = {".jpg", ".jpeg"}
+# The DAM's facet titles and the values the scraper insists on. These four were
+# dropped by the merge of agen-ivn into agentic-gen-iteration (ad27d62) while
+# their uses survived, which is how a run died on NameError at the first
+# search; restored from 1ea1b13.
+ASSET_PRODUCTION_TYPE = "Asset Production Type"
+FINAL_ASSET_VALUE = "FINAL"
+SHOT_REQUEST_ID = "Shot Request ID"
+REQUIRED_FILTERS = {
+    "Shot Type": "L",
+    ASSET_PRODUCTION_TYPE: FINAL_ASSET_VALUE,
+}
 DEFAULT_IMAGE_ROOT = Path(__file__).resolve().parent.parent / "inputs" / "reference_library"
 
 
