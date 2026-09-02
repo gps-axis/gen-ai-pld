@@ -202,7 +202,7 @@ def main() -> int:
 
     ref = a.reference
     if ref is None:
-        guess = a.run / "archive" / "reference.jpg"
+        guess = C.reference_path(a.run)
         ref = guess if guess.exists() else None
 
     if a.set:

@@ -29,6 +29,9 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import common as C  # noqa: E402
+
 THUMB_DIR_NAME = "_thumbs"
 CAND_MAX = 560
 HERO_MAX = 900
@@ -270,7 +273,7 @@ def collect_run(run_dir: Path, runs_dir: Path, bank=None):
         "input": m[0] if m else None,
         "input_score": (m[1], m[2]) if m else None,
         "segmented": seg,
-        "reference": arch / "reference.jpg" if (arch / "reference.jpg").exists() else None,
+        "reference": ref if (ref := C.reference_path(run_dir)).exists() else None,
         "best_png": run_dir / "output" / "best.png" if (run_dir / "output" / "best.png").exists() else None,
         "winner": winner,
         "why": best.get("why"),

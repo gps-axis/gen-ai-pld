@@ -11,10 +11,13 @@
 #     -v pld-cache:/app/.cache -e FAL_KEY -e QWEN_API_KEY \
 #     pld-harness /in/off_set_image.jpg
 #
-# TWO inputs are needed now: the garment photo and the reference laydown to aim
-# at. The reference used to be found by searching a 45-image library baked into
-# the image; that search is gone and the caller supplies it. By default it is
-# whatever /in/reference*.{jpg,png} matches, or name it with -e REFERENCE=... .
+# The garment photo is required. The reference laydown it is being laid out to
+# match comes from one of two places, and an explicit one always wins:
+#
+#   * mount a library at /in/reference_library (or -e REFERENCE_LIBRARY=...) and
+#     the harness chooses the reference itself, for free
+#   * mount a single reference matching /in/reference* (or -e REFERENCE=...) and
+#     no search happens
 #
 # Anything after the image path is passed straight to harness.py.
 #
@@ -22,12 +25,12 @@
 #
 #    0   the run delivered
 #    1   the run broke, or had a budget and produced nothing
-#    2   this script was called wrong (no image, no reference, missing credential)
+#    2   this script was called wrong (no image, no reference AND no library,
+#        missing credential)
 #    3   the harness reported success but nothing reached /out
-#   20   RESERVED AND UNREACHABLE. It used to mean "no library reference is close
-#        enough to this garment, upload a hero". There is no library and no
-#        search, so nothing returns it. Kept documented rather than deleted so a
-#        caller that still branches on it keeps parsing.
+#   20   the library was searched and holds nothing close enough to this garment.
+#        A real answer, not a crash: nothing was generated and nothing billed.
+#        Remap it with NO_REFERENCE_EXIT.
 #   21   the segmenter returned an image with most of the garment missing
 set -uo pipefail
 
@@ -54,8 +57,10 @@ if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then
     [ -f "$INPUT" ] || die "no such image: $INPUT"
 else
     [ -d "$IN_DIR" ] || die "no image given and $IN_DIR is not mounted."
-    # maxdepth 1 keeps inputs/others/ out of it, and anything named reference* is
-    # the OTHER input rather than a candidate for this one.
+    # maxdepth 1 keeps both inputs/others/ and the reference library out of it -
+    # a library holds hundreds of garment photos, and every one of them would
+    # otherwise look like a candidate for the thing being laid out. Anything
+    # named reference* is the OTHER input rather than a candidate for this one.
     mapfile -t FOUND < <(find "$IN_DIR" -maxdepth 1 -type f \
         \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \
            -o -iname '*.tif' -o -iname '*.tiff' -o -iname '*.webp' \) \
@@ -72,17 +77,35 @@ else
 fi
 
 # --- and what are we laying it out LIKE? ------------------------------------
+#
+# An explicit reference wins outright; otherwise a mounted library is searched.
+# The find below deliberately excludes the library folder itself, so that
+# `-v .../reference_library:/in/reference_library` is not picked up as a single
+# reference file by the `reference*` glob.
 REFERENCE="${REFERENCE:-}"
 if [ -z "$REFERENCE" ]; then
     mapfile -t REFS < <(find "$IN_DIR" -maxdepth 1 -type f -iname 'reference*' \
         ! -name '.*' 2>/dev/null | sort)
     [ ${#REFS[@]} -gt 0 ] && REFERENCE="${REFS[0]}"
 fi
-[ -n "$REFERENCE" ] || die "no reference laydown.
-  Mount one at $IN_DIR/reference_greyscale.jpg, or name it with -e REFERENCE=...
-  It is the flat the garment is being laid out to match. There is no library to
-  search any more - the caller chooses it."
-[ -f "$REFERENCE" ] || die "no such reference: $REFERENCE"
+
+REFERENCE_LIBRARY="${REFERENCE_LIBRARY:-$IN_DIR/reference_library}"
+LIB_COUNT=0
+if [ -z "$REFERENCE" ] && [ -d "$REFERENCE_LIBRARY" ]; then
+    LIB_COUNT=$(find "$REFERENCE_LIBRARY" -type f \
+        \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' \) \
+        ! -name '.*' 2>/dev/null | wc -l | tr -d ' ')
+fi
+
+if [ -n "$REFERENCE" ]; then
+    [ -f "$REFERENCE" ] || die "no such reference: $REFERENCE"
+elif [ "$LIB_COUNT" -eq 0 ]; then
+    die "no reference laydown and no library to find one in.
+  Either mount a library at $IN_DIR/reference_library (or point
+  -e REFERENCE_LIBRARY at one), or mount a single reference at
+  $IN_DIR/reference_greyscale.jpg and name it with -e REFERENCE=... .
+  The reference is the flat the garment is being laid out to match."
+fi
 
 # --- how many images may this run buy? --------------------------------------
 #
@@ -109,14 +132,31 @@ mkdir -p /app/inputs "$RUN_DIR" "$OUT_DIR" || die "cannot write to $OUT_DIR"
 # Copied rather than symlinked: /in is usually mounted read-only and the harness
 # writes derived images beside these.
 cp "$INPUT" /app/inputs/off_set_image.jpg || die "could not stage $INPUT"
-# The extension is preserved because PIL opens by content but writes by suffix,
-# and the harness desaturates this file on its way into the run folder.
-REF_EXT="${REFERENCE##*.}"
-REF_STAGED="/app/inputs/reference_input.${REF_EXT:-jpg}"
-cp "$REFERENCE" "$REF_STAGED" || die "could not stage $REFERENCE"
+
+# Either --reference <file> or --reference-library <dir>, never both: the
+# harness triggers its search on the ABSENCE of --reference, so passing an empty
+# one would silently disable the library.
+REF_ARGS=()
+if [ -n "$REFERENCE" ]; then
+    # The extension is preserved because PIL opens by content but writes by
+    # suffix, and the harness desaturates this file into the run folder.
+    REF_EXT="${REFERENCE##*.}"
+    REF_STAGED="/app/inputs/reference_input.${REF_EXT:-jpg}"
+    cp "$REFERENCE" "$REF_STAGED" || die "could not stage $REFERENCE"
+    REF_ARGS=(--reference "$REF_STAGED")
+else
+    # Read in place. A library is hundreds of files and copying it would double
+    # the container's disk for no gain; /in being read-only is fine, because
+    # nothing writes to the library - the descriptions land in /app/.cache.
+    REF_ARGS=(--reference-library "$REFERENCE_LIBRARY")
+fi
 
 echo "  input     $INPUT"
-echo "  reference $REFERENCE"
+if [ -n "$REFERENCE" ]; then
+    echo "  reference $REFERENCE"
+else
+    echo "  reference searching $REFERENCE_LIBRARY ($LIB_COUNT images)"
+fi
 echo "  session   $LAYDOWN_SESSION  (max $LAYDOWN_MAX_IMAGES images)"
 echo "  text      ${QWEN_BASE_URL:-http://10.11.245.41:8091 (default)}"
 echo "  segmenter ${SEGMENT_URL:-http://10.11.245.145:4000/sam3-segment (default)}"
@@ -128,7 +168,7 @@ echo
 "$PY" /app/harness.py \
     --skill-file /app/task/SKILL.md \
     --source /app/inputs/off_set_image.jpg \
-    --reference "$REF_STAGED" \
+    "${REF_ARGS[@]}" \
     --yolo "$@"
 RC=$?
 
@@ -191,6 +231,31 @@ if t.exists():
 attempts = sorted(p.stem for p in (run / "archive").glob("cand_*.png")
                   if re.fullmatch(r"cand_\d+", p.stem))
 
+# The reference receipt, when the library was searched. Deliberately a summary
+# and not the whole record - the full thing, including every disqualified
+# candidate and the per-field breakdown, stays at reference_selection.json.
+# `null` when the reference was supplied by hand: there was no choice to report.
+reference = None
+sel = run / "reference_selection.json"
+if sel.exists():
+    try:
+        d = json.loads(sel.read_text())
+        reference = {
+            "match_found": d.get("match_found"),
+            "source": d.get("source"),
+            "score": d.get("score"),
+            "threshold": d.get("threshold"),
+            "library_count": d.get("library_count"),
+            "disqualified": len(d.get("disqualified") or []),
+            "closest": d.get("closest"),
+            "model_confidence": d.get("model_confidence"),
+            "model_vetoed": d.get("model_vetoed"),
+            "differences": d.get("differences"),
+            "construction_risk": (d.get("construction_risk") or {}).get("terms"),
+        }
+    except (ValueError, OSError):
+        reference = None
+
 # `outcome` is the field a caller routes on; `exit_code` is for whoever is
 # debugging rather than routing. They are not the same question: "the model
 # judged nothing here shippable" is a real answer that happens to end the run.
@@ -215,9 +280,10 @@ rec = {
     # ranked four. A caller that counted picks still counts something true.
     "picks": 1 if (out / "best.png").exists() else 0,
     "images": sorted(p.name for p in out.glob("*.png")),
-    # Retired with the reference search and the grader. Held as null rather than
-    # dropped so a downstream parser that reads them keeps working.
-    "reference": None,
+    # null when the reference was supplied rather than found - see above.
+    "reference": reference,
+    # Retired with the candidate grader. Held as null rather than dropped so a
+    # downstream parser that reads it keeps working.
     "grades": None,
 }
 print(json.dumps(rec, indent=2, default=str))
@@ -230,13 +296,17 @@ PY
 # script whose whole job is to report the run's own status.
 mkdir -p "$OUT_DIR/logs"
 for f in steps.log LOG.md run.log transcript.jsonl \
+         reference_selection.json reference_match.jpg \
          archive/lineage.json archive/prompt_sections.json \
          archive/notes.json archive/best.json archive/seeds.json; do
     [ -e "$RUN_DIR/$f" ] && cp -p "$RUN_DIR/$f" "$OUT_DIR/logs/"
 done
 # The two images the run was actually about, so a reviewer never has to guess
 # what the model was looking at.
-for f in source_clean.jpg reference.jpg; do
+# reference.jpg is the pre-rename name; both are listed so a run folder from
+# either era delivers its reference rather than silently omitting it.
+for f in source_clean.jpg reference_greyscale.jpg reference_original.jpg \
+         reference.jpg; do
     [ -e "$RUN_DIR/archive/$f" ] && cp -p "$RUN_DIR/archive/$f" "$OUT_DIR/logs/"
 done
 
@@ -257,12 +327,14 @@ if [ "$RC" -eq "$EXIT_UNCLEAN_SOURCE" ]; then
     echo "  look at   $OUT_DIR/logs/run.log"
 fi
 
-# Unreachable, and kept so that if it ever DOES fire the script says something
-# true rather than falling through to a bare exit code nobody can place.
 if [ "$RC" -eq "$EXIT_NO_REFERENCE" ]; then
     echo
-    echo "  outcome   exit 20, which this pipeline no longer produces - there is"
-    echo "            no reference search left to fail. Treat it as a bug."
+    echo "  outcome   the library holds nothing close enough to this garment."
+    echo "            Nothing was generated and nothing was billed."
+    echo "  next      add a suitable laydown to $REFERENCE_LIBRARY, or supply"
+    echo "            one directly with -e REFERENCE=/in/my_reference.jpg"
+    echo "  detail    $OUT_DIR/result.json (.reference.closest) and"
+    echo "            $OUT_DIR/logs/reference_match.jpg"
     exit "$NO_REFERENCE_EXIT"
 fi
 

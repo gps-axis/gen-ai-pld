@@ -23,6 +23,50 @@ ROOT = Path(__file__).resolve().parent.parent
 INPUTS = ROOT / "inputs"
 RUNS = ROOT / "runs"
 
+# Where the reference library lives, and where its descriptions are cached.
+# Both are named here rather than in select_reference.py so a tool that only
+# wants to read a cached record does not have to agree with it by hand.
+REFERENCE_LIBRARY = INPUTS / "reference_library"
+REFCACHE = ROOT / ".cache" / "refmatch"
+
+# The two reference files a run keeps, and they are deliberately two.
+#
+# REFERENCE_GREY is what the model is shown as image 2 - desaturated, because it
+# is a shape and lay reference and never a colour target. REFERENCE_ORIGINAL is
+# the library asset exactly as it arrived, in colour, kept only so the run can
+# be examined afterwards.
+#
+# Nothing in the pipeline has ever written back into the library - install()
+# reads from it and writes into the run folder - but "where did the original
+# colour go" is a question the run folder could not answer on its own, because
+# the only reference in it was the desaturated one. Both files, named for what
+# they are, is the answer. It also matters for diagnosing tone bleed: comparing
+# a candidate against the greyscale reference cannot show what the reference's
+# real colour was.
+REFERENCE_GREY = "reference_greyscale.jpg"
+REFERENCE_ORIGINAL = "reference_original.jpg"
+
+# What this file used to be called. Read-only compatibility: runs/ holds folders
+# from before the rename and make_contact_sheet.py builds its report over all of
+# them, so a reader that only knew the new name would show those runs as having
+# had no reference at all.
+REFERENCE_LEGACY = "reference.jpg"
+
+
+def reference_path(run_dir: Path) -> Path:
+    """The greyscale reference for a run, whatever it happens to be called.
+
+    Returns the new name when it exists, the legacy one when only that does, and
+    the new name when neither does - so a caller reporting "no reference" names
+    the file it should be looking for rather than the one it fell back to.
+    """
+    arch = Path(run_dir) / "archive"
+    new = arch / REFERENCE_GREY
+    if new.exists():
+        return new
+    old = arch / REFERENCE_LEGACY
+    return old if old.exists() else new
+
 # nano-banana-pro/edit at 4K is $0.30/image; 1K and 2K are both $0.15. Published
 # rates - fal exposes no billing API, so a reported cost is never a receipt.
 ENDPOINT = "fal-ai/nano-banana-pro/edit"
@@ -229,14 +273,117 @@ def md5(p: Path) -> str:
     return hashlib.md5(Path(p).read_bytes()).hexdigest()
 
 
+def ensure_small(src: Path, max_dim: int = 1024,
+                 cache: Path | None = None) -> Path:
+    """A downscaled copy of `src`, cached. Returns the path to it.
+
+    Library assets and phone photos are both far larger than any vision model
+    wants: the query on this project has been 5464x8192 / 23MB, and sending that
+    raw blows up the request before it blows up the model's image budget.
+
+    The parent folder is part of the cache name. Two libraries can hold a
+    `black.jpg` each, and keying on the stem alone had them silently overwriting
+    one another's downscale - a bug whose only symptom is the wrong picture
+    scoring well.
+
+    PIL rather than `sips`, which is what the old pipeline used: sips is macOS
+    only, and this runs in a Linux container.
+    """
+    src = Path(src)
+    cache = Path(cache) if cache is not None else (REFCACHE / "small")
+    cache.mkdir(parents=True, exist_ok=True)
+    tag = hashlib.sha1(str(src.resolve().parent).encode()).hexdigest()[:8]
+    dst = cache / f"{src.stem}__{tag}__{max_dim}.jpg"
+    if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime:
+        return dst
+    with Image.open(src) as im:
+        im = im.convert("RGB")
+        im.thumbnail((max_dim, max_dim), Image.LANCZOS)
+        im.save(dst, quality=92)
+    return dst
+
+
+def contact_sheet(tiles: list[tuple[str, Path]], dst: Path,
+                  cell: tuple[int, int] = (420, 560), pad: int = 8,
+                  colours: dict[str, tuple[int, int, int]] | None = None) -> Path:
+    """One labelled row of images, written to `dst`.
+
+    Replaces the old pipeline's `magick` + `montage` shell-out. ImageMagick is
+    not installed in the container and was never worth a dependency for a strip
+    of thumbnails with captions over them.
+
+    `colours` maps a label to its caption colour, so a caller can grey out the
+    entries that failed whatever test it applied. Anything unnamed is black.
+    """
+    from PIL import ImageDraw, ImageFont
+
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    colours = colours or {}
+    cw, ch = cell
+    bar = 44
+
+    try:
+        font = ImageFont.truetype(
+            "/System/Library/Fonts/Supplemental/Arial.ttf", 26)
+    except OSError:
+        try:                        # the container has DejaVu, not Arial
+            font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 26)
+        except OSError:
+            font = ImageFont.load_default()
+
+    n = len(tiles)
+    W = n * cw + (n + 1) * pad
+    H = ch + bar + 2 * pad
+    sheet = Image.new("RGB", (W, H), (230, 230, 230))
+    draw = ImageDraw.Draw(sheet)
+
+    for i, (label, path) in enumerate(tiles):
+        x = pad + i * (cw + pad)
+        sheet.paste(Image.new("RGB", (cw, ch + bar), (255, 255, 255)), (x, pad))
+        try:
+            with Image.open(path) as im:
+                im = im.convert("RGB")
+                im.thumbnail((cw, ch), Image.LANCZOS)
+                sheet.paste(im, (x + (cw - im.width) // 2,
+                                 pad + bar + (ch - im.height) // 2))
+        except Exception:  # noqa: BLE001 - a missing tile must not lose the sheet
+            draw.text((x + 8, pad + bar + 8), "(unreadable)", font=font,
+                      fill=(180, 60, 60))
+        w = draw.textlength(label, font=font)
+        draw.text((x + (cw - w) / 2, pad + 8), label, font=font,
+                  fill=colours.get(label, (0, 0, 0)))
+
+    sheet.save(dst, quality=92)
+    return dst
+
+
 def profile_for(garment_type: str) -> str | None:
     """Canonical profile for a garment_type string, or None if it means nothing
     here. Matching is on the normalised token, so 'sports_bra', 'Sports Bra'
-    and 'bras' all land on the same profile."""
+    and 'bras' all land on the same profile.
+
+    Falls back to matching each WORD in turn, because select_reference.py asks
+    for garment_type in free text and gets phrases back: 'wide-leg jean',
+    'hooded sweatshirt', 'cropped sports bra'. Whole-string matching alone
+    returned None for every one of those, and None here means the caller
+    silently measures the garment with the default profile's crop bands.
+
+    Words are tried right to left. English compounds put the head noun last -
+    'hooded sweatshirt' is a sweatshirt, 'fleece jacket' is a jacket - so the
+    rightmost match is the garment and anything before it is a modifier.
+    """
     w = re.sub(r"[^a-z]+", "_", str(garment_type).lower()).strip("_")
+    if not w:
+        return None
     for prof, terms in PROFILE_TERMS.items():
         if w in terms:
             return prof
+    for word in reversed(w.split("_")):
+        for prof, terms in PROFILE_TERMS.items():
+            if word in terms:
+                return prof
     return None
 
 
@@ -244,8 +391,8 @@ def garment_profile(run_dir: Path,
                     override: str | None = None) -> tuple[str, str, bool]:
     """Which region profile this run's garment needs: (profile, why, resolved).
 
-    Step 0 already classified the garment - select_reference.py writes the
-    garment_type it used to pick the library folder into
+    Step 0 already classified the garment - select_reference.py describes it
+    before it scores anything, and writes that description to
     <run>/reference_selection.json - so no tool needs to be told again, and a
     flag left off cannot quietly point a region-based check at the wrong part of
     the garment. That failure is silent and expensive: a bra measured with the

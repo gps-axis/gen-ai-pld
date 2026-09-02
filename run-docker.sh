@@ -6,7 +6,11 @@
 #
 #   ./run-docker.sh                          # the single image in inputs/
 #   ./run-docker.sh /in/other.jpg            # a specific one
-#   ./run-docker.sh --reference-category bras
+#   ./run-docker.sh --reference-threshold 82 # be stricter about the reference
+#
+# inputs/reference_library is mounted with the rest of inputs/, so the reference
+# is chosen from it. REFERENCE=/in/my_ref.jpg in .env.docker overrides that and
+# skips the search.
 #
 # Credentials come from .env.docker, which is gitignored. Never put a key on
 # the command line: it lands in shell history and in `ps` for every user on the
@@ -107,6 +111,7 @@ exec docker run --rm \
     -v "$HERE/inputs:/in:ro" \
     -v "$HERE/out:/out" \
     -v "$HERE/runs:/app/runs" \
+    -v pld-cache:/app/.cache \
     -e FAL_KEY \
     -e QWEN_API_KEY \
     -e QWEN_BASE_URL \
@@ -115,4 +120,5 @@ exec docker run --rm \
     -e SEGMENT_API_KEY \
     -e LAYDOWN_MAX_IMAGES \
     -e REFERENCE \
+    -e REFERENCE_LIBRARY \
     pld-harness "${ARGS[@]}"

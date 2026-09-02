@@ -67,6 +67,12 @@ from pathlib import Path
 # trace module is reached the same way they reach common.py.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
 from runlog import trace as TR, stream_subprocess  # noqa: E402
+# The reference filenames come from common.py rather than being spelled again
+# here. They are read by five tools and written by two, and a name mirrored into
+# each of them is a name that drifts - the harness would pin one file into turn 1
+# while generate.py sent fal a different one.
+from common import (REFERENCE_GREY, REFERENCE_ORIGINAL,  # noqa: E402
+                    reference_path)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -147,13 +153,16 @@ BASH_TIMEOUT = 900
 # set it in one place; --max-images lowers it per run.
 DEFAULT_BUDGET = int(os.environ.get("LAYDOWN_MAX_IMAGES", "10"))
 
-# RESERVED, AND NO LONGER REACHABLE. It used to mean "the library has nothing
-# close enough to this garment" - an expected answer from a reference search that
-# had to be distinguishable from a crash. The reference is now supplied by the
-# operator and there is no search to fail, so nothing in this file returns 20 any
-# more. The constant stays, and DOCKER.md says out loud that it cannot occur,
-# because a downstream workflow branching on it must keep parsing rather than
-# meet an unknown code.
+# "The library has nothing close enough to this garment." An expected answer,
+# not a crash: it means step 0 searched inputs/reference_library, found nothing
+# that could serve as this garment's lay reference, and stopped before a single
+# billed image. The fix is a human supplying a reference or adding to the
+# library, which is why it is not 1.
+#
+# It was unreachable for a while - the reference became operator-supplied and
+# there was no search left to fail - and both DOCKER.md and docker-entrypoint.sh
+# said so. tools/select_reference.py brings the search back, so this can occur
+# again and those notes have been corrected.
 EXIT_NO_REFERENCE = 20
 
 # "The segmentation gate rejected the source": the run worked, and what it
@@ -1080,7 +1089,7 @@ class Tools:
     def prompt_show(self) -> str:
         import promptfile as PF
         try:
-            return PF.show(self.run_dir, self._archive() / "reference.jpg")
+            return PF.show(self.run_dir, reference_path(self.run_dir))
         except RuntimeError as e:
             return f"ERROR: {e}"
 
@@ -1466,7 +1475,7 @@ class Session:
         # actually there turns "did the pins go" from a guess into a comparison -
         # and the model cannot tell a pin that was removed from one that was
         # never in the picture unless it was told at the start.
-        brief = self._brief()
+        brief = self._brief() + self._bleed_warning()
         found = self._props_check_path(run_dir / "archive" / "source_clean.jpg")
         if found:
             brief += ("\n\nWHAT IS ON THE SOURCE RIGHT NOW (read automatically "
@@ -1483,7 +1492,7 @@ class Session:
                          ("IMAGE 2 - the reference laydown. Copy how it LIES "
                           "and nothing else: its construction, trim and tone "
                           "belong to a different product.",
-                          run_dir / "archive" / "reference.jpg")):
+                          reference_path(run_dir))):
             b64 = encode_image(p) if p.exists() else None
             if b64:
                 first.append({"type": "text", "text": label})
@@ -1507,6 +1516,43 @@ class Session:
         TR.info("session", "skill loaded" if skill_text else "no skill",
                 chars=len(skill_text or ""))
 
+    def _bleed_warning(self) -> str:
+        """What the chosen reference carries that this product does not.
+
+        Step 0 asked the model, in the same breath as picking the reference,
+        what still differs between the two garments - and scanned that sentence
+        for words naming CONSTRUCTION rather than pose. Those words are the one
+        early warning available, and they are available before a penny is spent.
+
+        It matters because the failure is invisible afterwards. On one run of
+        the old pipeline the reference carried a defined V-neckline and seam
+        piping the real garment did not have, and four of ten candidates came
+        back with a neckline seam and topstitching down the straps. Invented
+        construction is plausible construction, so it survives casual review.
+
+        Empty string when nothing was flagged, or when the reference was
+        supplied by hand and never compared to anything.
+        """
+        f = self.run_dir / "reference_selection.json"
+        if not f.exists():
+            return ""
+        try:
+            risk = (json.loads(f.read_text()).get("construction_risk") or {})
+        except (json.JSONDecodeError, OSError):
+            return ""
+        if not risk.get("flagged") or not risk.get("terms"):
+            return ""
+        return ("\n\nWHAT IMAGE 2 HAS AND IMAGE 1 DOES NOT (read automatically "
+                "when the reference was chosen):\n"
+                f"  {', '.join(risk['terms'])}\n"
+                f"  \"{risk.get('line') or ''}\"\n\n"
+                "The reference is a different product. It was picked for how it "
+                "LIES and for nothing else, and the words above are the parts of "
+                "it that do not belong to this garment. Do not describe any of "
+                "them in a prompt, and check every candidate for them - a seam "
+                "or a pocket copied off image 2 looks exactly like one the "
+                "garment always had.")
+
     def _brief(self) -> str:
         arch = self.run_dir / "archive"
         return (
@@ -1517,7 +1563,7 @@ class Session:
             "is the whole job.\n\n"
             "THE ONLY TWO PATHS YOU NEED:\n"
             f"  image 1   {arch / 'source_clean.jpg'}\n"
-            f"  image 2   {arch / 'reference.jpg'}\n\n"
+            f"  image 2   {reference_path(self.run_dir)}\n\n"
             "Use those exact paths for view_image and compare_images. The raw "
             "photo in inputs/ is NOT what fal.ai receives - it still has the "
             "room, the wall and the shadow in it. Writing a prompt from the raw "
@@ -2023,7 +2069,7 @@ class Session:
         _lay_question(). A fixed list of parts only ever catches the defects
         someone anticipated when they wrote the list.
         """
-        ref = self.run_dir / "archive" / "reference.jpg"
+        ref = reference_path(self.run_dir)
         cand = self.run_dir / "archive" / f"{name}.png"
         if not ref.exists() or not cand.exists():
             return ""
@@ -2275,15 +2321,30 @@ def prepare_source(run_dir: Path, source: Path, python: str,
 
 
 def prepare_reference(run_dir: Path, reference: Path) -> Path:
-    """Install the operator's reference at archive/reference.jpg, desaturated.
+    """Install the operator's reference, desaturated, and keep the colour original.
 
-    Greyscale on purpose, and this is the one thing done TO the reference rather
-    than with it. It is a shape and lay reference, never a colour target: sent in
-    colour it is read as one, and the garment comes back wearing the reference's
-    tone. A reference that already arrived greyscale is copied unchanged.
+    Two files, and the operator's own file is neither of them - it is read, never
+    written:
+
+      archive/reference_greyscale.jpg   what the model is shown as image 2
+      archive/reference_original.jpg    the file as supplied, untouched
+
+    Greyscale on purpose, and it is the one thing done TO the reference rather
+    than with it: it is a shape and lay reference, never a colour target, and
+    sent in colour it is read as one. A reference that already arrived greyscale
+    is copied unchanged.
+
+    The colour copy exists because the desaturated one cannot answer "what did
+    the reference actually look like" - which is the first question asked when a
+    candidate's tone drifts, and the run folder could not answer it on its own.
     """
-    out = run_dir / "archive" / "reference.jpg"
-    out.parent.mkdir(parents=True, exist_ok=True)
+    arch = run_dir / "archive"
+    arch.mkdir(parents=True, exist_ok=True)
+    out = arch / REFERENCE_GREY
+    try:
+        shutil.copy2(reference, arch / REFERENCE_ORIGINAL)
+    except OSError as e:
+        TR.warn("step0", f"could not keep a colour copy of the reference: {e}")
     try:
         from PIL import Image
         im = Image.open(reference)
@@ -2293,12 +2354,106 @@ def prepare_reference(run_dir: Path, reference: Path) -> Path:
             print(c(DIM, f"  reference {reference.name} (already greyscale)"))
         else:
             im.convert("L").save(out, quality=95, subsampling=0)
-            print(c(DIM, f"  reference {reference.name} -> desaturated, so it "
-                         f"cannot be read as a colour target"))
+            print(c(DIM, f"  reference {reference.name} -> desaturated into "
+                         f"{REFERENCE_GREY}, so it cannot be read as a colour "
+                         f"target. The colour original is kept beside it."))
     except Exception as e:  # noqa: BLE001 - a copy still beats no reference
         TR.warn("step0", f"could not desaturate the reference: {e}")
         shutil.copy2(reference, out)
     return out
+
+
+def library_has_images(library: Path) -> int:
+    """How many images the reference library holds. 0 for a missing folder."""
+    if not library.is_dir():
+        return 0
+    exts = {".jpg", ".jpeg", ".png", ".webp"}
+    return sum(1 for p in library.rglob("*")
+               if p.is_file() and p.suffix.lower() in exts
+               and not p.name.startswith("."))
+
+
+def select_reference(run_dir: Path, library: Path, python: str,
+                     args) -> tuple[int, dict]:
+    """Search the library for this garment's lay reference. (rc, record).
+
+    THREE outcomes, not two, and the caller has to keep them apart: 0 found one,
+    2 searched and found nothing close enough, anything else broke. Collapsing
+    the last two into "no reference" reports a server that was down as "the
+    library holds nothing of this garment", which sends someone to shoot a new
+    laydown over a network blip. They also exit differently - 20 against 1.
+
+    Runs AFTER prepare_source and matches against archive/source_clean.jpg, the
+    segmented image - never the raw input. Every library asset is a garment on a
+    white plate, so scoring a raw phone photo against them charges the query for
+    its room and its hang tag, and that score is the number the whole run is
+    anchored to. Under --no-pre-clean that file is a copy of the raw photo, and
+    the run says so rather than pretending otherwise.
+
+    The tool writes the reference itself, greyscale, straight to
+    archive/reference_greyscale.jpg - the same path and the same treatment
+    prepare_reference() gives an operator-supplied file, so turn 1 cannot tell
+    which way the reference arrived.
+    """
+    argv = ["--run", str(run_dir), "--library", str(library),
+            "--threshold", str(args.reference_threshold),
+            "--top-k", str(args.reference_top_k)]
+    if args.no_pre_clean:
+        argv.append("--query-raw")
+    if args.no_reference_veto:
+        argv.append("--no-model-veto")
+    if args.reference_silhouette:
+        argv.append("--silhouette")
+
+    rc = stream_subprocess([python, str(HERE / "tools" / "select_reference.py"),
+                            *argv], cwd=HERE, comp="reference")
+
+    record = {}
+    f = run_dir / "reference_selection.json"
+    if f.exists():
+        try:
+            record = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            TR.warn("step0", f"reference_selection.json unreadable: {e}")
+
+    # A 0 that did not leave a reference on disk is a failure however the tool
+    # exited: turn 1 pins that file into the conversation, so a run that starts
+    # without it has no image 2 and no way to say what it is aiming at.
+    if rc == 0 and not reference_path(run_dir).exists():
+        TR.error("step0", "the search reported success but wrote no reference")
+        return 1, record
+    return rc, record
+
+
+def resolve_reference(args, workspace: Path) -> tuple[Path | None, Path | None]:
+    """What to use as the reference: (explicit file, library to search).
+
+    Exactly one is not None. The rule is the absence of --reference, which is
+    why that flag no longer carries a default - with one, "the operator chose
+    this file" and "the operator said nothing" were the same value and the
+    harness could not tell them apart.
+
+    Order: an explicit file wins outright, then the library, then the file the
+    workspace has always used. The last one keeps every existing command line
+    working on a checkout whose library is still empty.
+    """
+    if args.reference is not None:
+        return args.reference, None
+    library = args.reference_library
+    n = library_has_images(library)
+    if n:
+        return None, library
+    fallback = workspace / "inputs" / "reference_greyscale.jpg"
+    if fallback.exists():
+        print(c(YEL, f"  {library} is empty - falling back to "
+                     f"{fallback.name}. Populate the library, or pass "
+                     f"--reference, to stop seeing this."))
+        return fallback, None
+    raise SystemExit(
+        f"No reference, and nothing to find one with. Either:\n"
+        f"  put images in {library}\n"
+        f"  pass --reference <file>\n"
+        f"  put one at {fallback}")
 
 
 def auto_polish(run_dir: Path, pick: Path, python: str) -> tuple[Path, str]:
@@ -2431,10 +2586,43 @@ def main():
     ap.add_argument("--source", type=Path,
                     default=HERE / "inputs" / "off_set_image.jpg",
                     help="The off-set photo to re-lay.")
-    ap.add_argument("--reference", type=Path,
-                    default=HERE / "inputs" / "reference_greyscale.jpg",
+    # NO DEFAULT, on purpose. Its absence is what triggers the library search,
+    # and a default made "the operator chose this file" indistinguishable from
+    # "the operator said nothing". See resolve_reference().
+    ap.add_argument("--reference", type=Path, default=None,
                     help="The laydown to aim at. Desaturated before use - it is "
-                         "a shape reference, never a colour target.")
+                         "a shape reference, never a colour target. Omit it and "
+                         "the reference is chosen from --reference-library.")
+    ap.add_argument("--reference-library", type=Path,
+                    default=HERE / "inputs" / "reference_library",
+                    help="Searched for a reference when --reference is not "
+                         "given. tools/select_reference.py does the choosing; "
+                         "run it with --index after adding images so a live run "
+                         "does not pay to describe them.")
+    # Kept in step with select_reference.DEFAULT_THRESHOLD by hand rather than
+    # imported, because harness.py builds its parser before it has put tools/ on
+    # the path. If they drift, this one wins - it is passed explicitly on every
+    # run the harness starts.
+    ap.add_argument("--reference-threshold", type=float, default=78.0,
+                    metavar="SCORE",
+                    help="How well a library image must match to be used "
+                         "(default 78). PROVISIONAL - measured on nine assets, "
+                         "not on your library. Run tools/select_reference.py "
+                         "--calibrate and set this from the numbers.")
+    ap.add_argument("--reference-top-k", type=int, default=5, metavar="N",
+                    help="How many survivors the model sees before it confirms "
+                         "or vetoes the pick.")
+    ap.add_argument("--no-reference-veto", action="store_true",
+                    help="Install the top-scoring library image even when the "
+                         "model rejects it on sight. Trusts the score alone.")
+    ap.add_argument("--reference-silhouette", action="store_true",
+                    help="Install a line drawing of the chosen reference's "
+                         "OUTLINE instead of the photograph. Same pose, no "
+                         "construction, so nothing can bleed across. Check "
+                         "archive/reference_greyscale.jpg before trusting it: the "
+                         "outline "
+                         "is built from tone, so a striped or colour-blocked "
+                         "reference comes back with its dark bands cut out.")
     ap.add_argument("--max-images", type=int, default=None, metavar="N",
                     help=f"fal.ai images for the whole run. Default "
                          f"{DEFAULT_BUDGET} (LAYDOWN_MAX_IMAGES). 0 exercises "
@@ -2483,8 +2671,11 @@ def main():
         raise SystemExit(f"No such workspace: {workspace}")
     if not args.source.exists():
         raise SystemExit(f"No source photo: {args.source}")
-    if not args.reference.exists():
-        raise SystemExit(f"No reference: {args.reference}")
+    # Resolved before anything else spends time: an unusable reference setup is
+    # the cheapest possible failure and belongs next to the missing-source one.
+    ref_file, ref_library = resolve_reference(args, workspace)
+    if ref_file is not None and not ref_file.exists():
+        raise SystemExit(f"No reference: {ref_file}")
 
     budget = DEFAULT_BUDGET if args.max_images is None else max(0, args.max_images)
     # The child scripts read this, and generate.py treats it as a ceiling its own
@@ -2513,7 +2704,7 @@ def main():
             "argv": " ".join(sys.argv[1:]),
             "workspace": workspace,
             "source": args.source,
-            "reference": args.reference,
+            "reference": ref_file or f"(search {ref_library})",
             "budget": budget,
             "skill": skill_path or "(none)",
             "server": BASE_URL,
@@ -2547,7 +2738,46 @@ def main():
                      "gate rejected."))
         for f in gate_fails:
             print(c(DIM, f"    {f}"))
-    prepare_reference(run_dir, args.reference)
+
+    # The reference, after the source and never before it: the search matches
+    # against the SEGMENTED photo, so it needs prepare_source to have run.
+    selection = {}
+    if ref_library is not None:
+        rc, selection = select_reference(run_dir, ref_library, tools.python,
+                                         args)
+        if rc == 2:
+            print(c(RED, "\nNO REFERENCE - the library holds nothing that can "
+                         "serve as this garment's laydown."))
+            closest = (selection.get("closest") or {})
+            if selection.get("model_vetoed"):
+                print(c(DIM, f"    {selection.get('n_qualifying')} candidate(s) "
+                             f"cleared {args.reference_threshold:.0f}, but the "
+                             f"model rejected them on sight"))
+            elif closest.get("file"):
+                print(c(DIM, f"    closest was {closest['file']} at "
+                             f"{closest.get('score')}, needed "
+                             f"{args.reference_threshold:.0f}"))
+            if selection.get("contact_sheet"):
+                print(c(DIM, f"    near misses: {selection['contact_sheet']}"))
+            print(c(DIM, "  Nothing was generated and nothing was billed. Add "
+                         "a suitable laydown to the library, or pass "
+                         "--reference to supply one directly."))
+            TR.error("step0", "no reference found in the library",
+                     closest=closest.get("score"),
+                     vetoed=selection.get("model_vetoed"),
+                     threshold=args.reference_threshold)
+            return EXIT_NO_REFERENCE
+        if rc != 0:
+            # A broken search, not an empty library. Exits 1 like any other
+            # broken step, and says which it was so nobody goes looking for a
+            # garment to photograph over an unreachable server.
+            print(c(RED, f"\nthe reference search FAILED (exit {rc}). This is "
+                         f"not 'no match found' - the step itself broke."))
+            print(c(DIM, f"  see {run_dir / 'run.log'}"))
+            return 1
+        ref_file = Path(selection["source"])
+    else:
+        prepare_reference(run_dir, ref_file)
 
     approver = Approver(args.yolo)
     sess = Session(task, skill_text, workspace, run_dir, tools, approver,
@@ -2558,7 +2788,22 @@ def main():
     print(c(DIM, f"  context   {n_ctx} tokens (compacting past {sess.compact_at})"))
     print(c(DIM, f"  server    {BASE_URL}"))
     print(c(DIM, f"  source    {args.source.name}"))
-    print(c(DIM, f"  reference {args.reference.name}"))
+    if selection:
+        print(c(DIM, f"  reference {ref_file.name}  "
+                     f"({selection.get('score')}/100 from "
+                     f"{ref_library.name}/, {selection.get('library_count')} "
+                     f"images)"))
+        runner = selection.get("runner_up") or {}
+        if runner.get("file"):
+            print(c(DIM, f"            runner-up {runner['file']} "
+                         f"({runner.get('score')})"))
+        risk = selection.get("construction_risk") or {}
+        if risk.get("flagged"):
+            print(c(YEL, f"            bleed risk: "
+                         f"{', '.join(risk.get('terms', []))} - named in the "
+                         f"opening brief"))
+    else:
+        print(c(DIM, f"  reference {ref_file.name}"))
     print(c(DIM, f"  budget    {budget} image(s)"
                  + ("  - nothing will be billed" if budget == 0 else
                     f"  (~{budget * 15}c at 2K)")))
@@ -2567,7 +2812,8 @@ def main():
     print(c(DIM, f"  approval  {'OFF (--yolo)' if args.yolo else 'on'}"))
     sess.log("start", {"task": task, "model": model, "budget": budget,
                        "source": str(args.source),
-                       "reference": str(args.reference)})
+                       "reference": str(ref_file),
+                       "reference_selection": selection or None})
 
     t0 = time.time()
     try:

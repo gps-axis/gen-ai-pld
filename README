@@ -5,11 +5,11 @@ One job: take an off-set garment photo and get it to lie like a reference
 laydown - square, flat, wrinkles relaxed, clean white plate, no shadows -
 without redrawing the garment.
 
-    ./run.sh --yolo
+    ./run.sh --yolo                     # reference chosen from the library
 
     ./run.sh --source inputs/off_set_image.jpg \
              --reference inputs/reference_greyscale.jpg \
-             --max-images 6 --yolo
+             --max-images 6 --yolo      # ...or supplied, which skips the search
 
     ./run.sh --max-images 0 --yolo      # runs the whole loop, bills nothing
 
@@ -72,9 +72,15 @@ What a run leaves behind
       transcript.jsonl    structured turns
       steps.log           the run in a few lines, including the spend
       LOG.md              the model's own write-up
+      reference_selection.json  which library image won, what it scored, and
+                                what was disqualified. Written whether or not
+                                anything matched, so `match_found` is always
+                                there to branch on.
+      reference_match.jpg the garment beside the top candidates and their scores
       archive/
         source_clean.jpg  the segmented source - what fal actually receives
-        reference.jpg     the reference, desaturated on the way in
+        reference_greyscale.jpg   the reference, desaturated - image 2
+        reference_original.jpg    the library asset, colour, untouched
         prompt_sections.json    the editable prompt
         prompt_<hash>.txt       a snapshot per generation
         cand_01.png ...         every attempt
@@ -89,13 +95,44 @@ What a run leaves behind
 The reference
 -------------
 
-Supplied by the operator, not searched for. --reference defaults to
-inputs/reference_greyscale.jpg.
+Chosen from inputs/reference_library, or supplied with --reference. Passing the
+flag skips the search entirely; its absence is what triggers one.
 
 It is desaturated on the way into the run folder. That is deliberate and it is
 the one thing done TO it: it is a shape and lay reference, never a colour
 target, and sent in colour it gets read as one - the garment comes back wearing
 the reference's tone.
+
+    tools/select_reference.py --index       describe the library, once
+    tools/select_reference.py --calibrate   where to put the threshold
+    tools/select_reference.py --dry-run     decide, install nothing
+
+Step 0 does it in three stages, none of them billed. It DESCRIBES the garment
+and every library image against one fixed form - body region, sleeve, leg,
+length, silhouette, front opening, neckline, waist, hem, fabric, structure. It
+SCORES each one out of 100 in plain arithmetic, disqualifying outright anything
+whose lay could not transfer at all: a different body region, sleeves against
+none, legs against none, a front that opens all the way against one that does
+not. Then it CONFIRMS, showing the survivors to the model, which picks one or
+answers "none".
+
+Both gates must pass - the score clears the threshold AND the model does not
+reject the pick. Otherwise the run stops at step 0 and exits 20, having
+generated nothing. runs/<stamp>/reference_match.jpg shows the near misses.
+
+Descriptions are cached on content in .cache/refmatch, so the library is
+described once and every run after that is free. Run --index after adding to it.
+
+The threshold is PROVISIONAL. 78 was measured on nine of this project's own
+assets, not on your library - run --calibrate, which scores every library image
+against every other and prints where same-garment pairs sit against
+different-garment ones, and pass what you read off it as --reference-threshold.
+
+Whatever the reference turns out to be, it is a different product. The model is
+asked what still differs between it and the garment, and that sentence is
+scanned for words naming CONSTRUCTION rather than pose - seam, placket, pocket,
+zip. Any hit goes into the agent's opening brief, because a seam copied off the
+reference looks exactly like one the garment always had.
 
 
 Chained edits

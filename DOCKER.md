@@ -15,23 +15,64 @@ Two images in, one re-laid flat out.
 `out/best.png` is the delivery. `out/logs/` gets `steps.log`, `LOG.md`,
 `run.log`, `transcript.jsonl`, the run's `lineage.json`, `prompt_sections.json`,
 `notes.json`, and the two images the model was actually working from
-(`source_clean.jpg` and `reference.jpg`).
+(`source_clean.jpg`, `reference_greyscale.jpg` and `reference_original.jpg`).
 
-## Two inputs, and the reference is yours now
+## The reference: found, or supplied
 
-The reference laydown used to be found by searching a 45-image library baked
-into the image. That search is gone, the library is not shipped, and the caller
-supplies the reference.
+The reference laydown is chosen automatically from a library, and you can
+override that by supplying one.
 
-By default the entrypoint takes whatever matches `/in/reference*`; name it
-explicitly with `-e REFERENCE=/in/my_reference.jpg`. The garment photo is either
-the path you pass as the first argument, or - if you pass none - the single
-image in `/in` that is *not* named `reference*`. It refuses to guess between
-several: choosing the wrong one costs a full run at fal.ai.
+**Mount a library** at `/in/reference_library` (or point `REFERENCE_LIBRARY` at
+it) and the harness picks the reference itself: it describes the garment, scores
+every library image against it, and confirms the winner with the model. Nothing
+is billed by any of that. See "Choosing the reference" below.
+
+**Or supply one** and no search happens. The entrypoint takes whatever matches
+`/in/reference*`, or name it explicitly with `-e REFERENCE=/in/my_reference.jpg`.
+An explicit reference always wins over the library.
+
+The garment photo is either the path you pass as the first argument, or - if you
+pass none - the single image in `/in` that is *not* named `reference*` and is not
+inside the library folder. It refuses to guess between several: choosing the
+wrong one costs a full run at fal.ai.
+
+With neither a library nor a reference, the run stops before it starts and says
+so.
 
 Anything after the image path goes straight to `harness.py`:
 
     docker run ... pld-harness /in/photo.jpg --max-iters 60 --max-images 4
+
+## Choosing the reference
+
+When a library is mounted, step 0 picks the reference before the agent starts and
+before anything is billed:
+
+1. **Describe.** One model call fills in a fixed form for the garment and for
+   each library image - body region, sleeve, leg, length, silhouette, front
+   opening, neckline, waist, hem, fabric, structure. Cached on content under
+   `/app/.cache/refmatch`, so a library is described once.
+2. **Score.** Plain arithmetic, no model. Anything that cannot work at all is
+   disqualified outright - a different body region, sleeves against none, legs
+   against none, a front that opens all the way against one that does not - and
+   the rest are weighted into a number out of 100.
+3. **Confirm.** One call showing the garment and the survivors side by side. The
+   model picks one or answers "none". Both gates must pass: the score clears the
+   threshold *and* the model does not reject it. Otherwise exit 20.
+
+`runs/<session>/reference_match.jpg` shows the garment beside the top candidates
+with their scores, and is copied to `/out/logs/`.
+
+**The threshold is provisional.** It defaults to 78, which was measured on nine
+of this project's own assets, not on your library. Set it from your own data:
+
+    docker run ... --entrypoint /app/.venv/bin/python pld-harness \
+      /app/tools/select_reference.py --library /in/reference_library --calibrate
+
+That scores every library image against every other and prints where same-garment
+pairs sit against different-garment ones. Pass the number you read off it as
+`--reference-threshold`. Use `--index` the same way after adding images, so a
+live run never pays to describe them.
 
 ## The container is a client, not a system
 
@@ -50,8 +91,10 @@ be reachable from inside the container:
 `.env` are in `.dockerignore` on purpose, because anyone who can pull an image
 can read its layers. Pass them with `-e`.
 
-`REFMATCH_BASE_URL` is no longer read by anything - it belonged to the reference
-matcher. Passing it is harmless and ignored.
+`REFMATCH_BASE_URL` is not read by anything. The reference search is back, but
+it talks to `QWEN_BASE_URL` like everything else - there was a second vision box
+when that variable existed, and two names for one endpoint meant one of them was
+always stale. Passing it is harmless and ignored.
 
 The LAN endpoints resolve from inside the container over Docker's NAT with no
 extra flags.
@@ -67,8 +110,10 @@ artefacts, and the attempts that were not chosen go with the container. Add
 `-e SHIP_CANDIDATES=1` to have every attempt copied to `/out` alongside the
 winner instead.
 
-`-v pld-cache:/app/.cache` is no longer worth much - the attribute cache it
-existed for belonged to the reference matcher. Harmless to keep.
+`-v pld-cache:/app/.cache` is worth having again. The reference search caches one
+description per library image under `.cache/refmatch/`, keyed on content, and
+without a persistent cache every container re-describes the whole library on
+every run - one model call per image. Nothing is billed either way; it is time.
 
 **On colima:** a bind mount only works if the host path is one colima shares
 with its VM - `$HOME` by default. A folder under `/tmp` silently appears empty
@@ -91,19 +136,26 @@ for free, and it exits 0.
 |---|---|
 | 0 | delivered |
 | 1 | the run broke, or had a budget and produced nothing |
-| 2 | misconfigured: missing credential, no image, no reference, several images |
+| 2 | misconfigured: missing credential, no image, no reference and no library, several images |
 | 3 | the harness reported success but nothing reached `/out` |
-| 20 | **reserved and unreachable** - see below |
+| 20 | nothing in the library is close enough to this garment - see below |
 | 21 | the segmenter returned an image with most of the garment missing |
 
-### 20 can no longer occur
+### 20: no reference could be found
 
-It used to mean "nothing in the library is close enough to this garment, a human
-has to upload a hero". There is no library and no search, so nothing returns it.
+The library was searched and holds nothing that can serve as this garment's
+laydown. Not a fault, and not a crash: the run stops before the agent starts and
+before a single billed image, and `runs/<session>/reference_selection.json`
+carries `match_found: false` along with the closest miss and its score.
+`reference_match.jpg` shows the near misses side by side, which is usually the
+argument for adding one asset rather than shooting a new garment.
 
-It is documented rather than deleted because a workflow that branches on 20 must
-keep parsing rather than meet an unknown code. `NO_REFERENCE_EXIT` still works
-and still remaps it. If you ever see a 20, treat it as a bug.
+The fix is a human supplying `-e REFERENCE=...`, or adding a suitable laydown to
+the library. `NO_REFERENCE_EXIT` remaps the code for a caller that needs a
+different one.
+
+This was documented as unreachable for a while, when the reference was
+operator-supplied and there was no search left to fail. It can occur again.
 
 ### How a finish status becomes an exit code
 
@@ -157,9 +209,15 @@ debugging rather than routing. Kestra reds a task on any non-zero code, so a
 flow that wants to handle "nothing shippable" as data rather than as a failure
 should read `outcome`.
 
-`reference` and `grades` are **retired but held as `null`** rather than dropped,
-so a downstream parser that reads them keeps working. They carried the reference
-receipt and the grader's scores; neither exists any more.
+`reference` carries the selection receipt again when the library was searched -
+which library image won, what it scored, and what the model said still differs.
+It stays `null` when the reference was supplied by hand, because there was no
+choice to record. The full record is always at
+`runs/<session>/reference_selection.json`.
+
+`grades` is **retired but held as `null`** rather than dropped, so a downstream
+parser that reads it keeps working. It carried the candidate grader's scores; that
+step does not exist any more.
 
 ## What the image patches, and why
 

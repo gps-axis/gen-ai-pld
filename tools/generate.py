@@ -396,7 +396,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--run", type=Path, required=True)
     ap.add_argument("--reference", type=Path,
-                    help="default <run>/archive/reference.jpg")
+                    help="default <run>/archive/reference_greyscale.jpg")
     ap.add_argument("--source", default="source",
                     help="'source', a candidate name like cand_03, or a path")
     ap.add_argument("-n", "--num", type=int, default=1)
@@ -426,7 +426,7 @@ def main() -> int:
     run = a.run
     arch = run / "archive"
     arch.mkdir(parents=True, exist_ok=True)
-    reference = a.reference or arch / "reference.jpg"
+    reference = a.reference or C.reference_path(run)
 
     src = resolve_source(run, a.source)
     if not src.exists():

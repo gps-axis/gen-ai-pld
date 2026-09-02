@@ -62,18 +62,23 @@ RUN set -eux; \
     fi; \
     magick -version >/dev/null
 
-# Kept from the annotated-contact-sheet era: the tools that passed this exact
-# path to ImageMagick's -font have been retired to old/, but the symlink is one
-# line and costs nothing, and removing it is the kind of change that is only
-# discovered to have mattered on a Linux box at 2am.
+# The macOS font path, pointed at a metric-compatible Linux face. common.py's
+# contact_sheet() asks PIL for this exact file when it labels the reference-match
+# strip, and falls back to DejaVu if it is missing - but the fallback is a
+# different face at the same size, so the labels would silently reflow. One line,
+# and it keeps the container's output identical to the host's.
 RUN mkdir -p /System/Library/Fonts/Supplemental \
     && ln -s /usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf \
              /System/Library/Fonts/Supplemental/Arial.ttf
 
-# profiles/ and library_reference/ are deliberately NOT copied any more. They
-# belonged to the reference search, which is gone - the reference now arrives
-# from the caller. Together they were ~150 MB of an image that otherwise holds
-# five scripts.
+# The reference LIBRARY is deliberately not baked in. It is mounted at
+# /in/reference_library and read in place: it is the part that changes, it is
+# ~150 MB of an image that otherwise holds five scripts, and a library rebuilt
+# into the image is a library nobody can add to without a rebuild.
+#
+# Its descriptions are cached under /app/.cache/refmatch, so mount a volume
+# there (`-v pld-cache:/app/.cache`) or every container re-describes the whole
+# library once. Nothing is billed by that; it is time.
 COPY harness.py ./
 COPY tools/ tools/
 COPY task/ task/
