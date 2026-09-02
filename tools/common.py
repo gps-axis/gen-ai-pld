@@ -1180,6 +1180,508 @@ def colour_drift(rgb_a: np.ndarray, rgb_b: np.ndarray) -> dict:
             "de": float(np.linalg.norm(srgb_to_lab(a) - srgb_to_lab(b)))}
 
 
+
+# ---------------------------------------------------------------------------
+# Tone: how light the garment is, and making the reference agree with the source
+# ---------------------------------------------------------------------------
+#
+# Desaturating the reference removes its HUE. It does not touch its LIGHTNESS,
+# and lightness travels just as well. runs/20260901_222258: the source garment
+# measured L* 44.6, the reference chosen for it L* 80.0, and every candidate
+# that copied the pose copied the tone with it - the winner shipped at L* ~82,
+# dE 37 from the product. Contrast between the two images does not protect the
+# garment's tone; it sets the size of the error.
+#
+# So the reference garment is re-toned to the source garment before turn 1.
+# Multiplicative in linear light, which is what a change of fabric albedo IS:
+# shading is light times albedo, so scaling every garment pixel by one factor
+# keeps the crease-to-highlight ratios of the lay and changes only how light
+# the fabric reads. A gamma curve was considered and rejected - it pins black
+# and white, so darkening a pale garment by 35 L* spreads its shadows to near
+# black and its highlights barely move, and the lay comes back with creases
+# three times as deep as the photograph had.
+#
+# The plate is not touched. The scale is applied through a soft alpha built from
+# the garment mask with its pose holes open, so the gap between two sleeves
+# stays white and the garment's own edge keeps its softness.
+
+# The 8-bit level a pixel must stay below in linear light before the scale is
+# eased off, so brightening a dark garment cannot clip its highlights flat.
+TONE_KNEE = 0.80
+
+# A hole this much of the garment's area or larger is pose (a sleeve gap, the
+# space between two legs) and stays plate; smaller ones are print and are toned
+# with the fabric around them. Same rule and same number as outline_map().
+TONE_HOLE_FRAC = 0.015
+
+# Two garments closer than this in mean L* are the same tone as far as the
+# generator can copy it, and the reference is left alone.
+TONE_TOLERANCE_L = 1.0
+
+# The fabric's colour is read off its FULLY LIT pixels - the brightest 3% of
+# the garment's core by luminance - not off the whole mask and not off its
+# brightest quarter. The source is a creased, shadowed photograph and a
+# candidate is a flat, evenly lit one, so the candidate's whole surface
+# corresponds to the few source pixels that face the light squarely.
+#
+# Measured on the cream joggers of runs/20260902_100812 and _104708, source
+# side, eroded core:
+#
+#     whole mask       L* 59.4    recoloured to it: olive
+#     brightest 25%    L* 74.4    recoloured to it: still olive, shipped and
+#                                 rejected by eye on _104708
+#     brightest 10%    L* 79.3    between
+#     brightest 3%     L* 84.5    reads as the same cream as the photograph
+#
+# And the generator's own untouched render sat at L* 85.5: it was rendering the
+# lit fabric all along, and "25 L* paler than the product" was the whole-mask
+# mean talking. So the target is the bright end, the recolour becomes mostly a
+# hue correction on a well-lit render, and a dark render still gets brought up.
+#
+# A BAND, not a tail, and read off the mask's eroded CORE on both sides. The
+# first cut of this was "the top 3%", and it was fragile in two ways that
+# showed up at once: the solver read the un-eroded mask, whose boundary pixels
+# are part plate and own the top 3% outright, while the check read the core -
+# one reference landed at L* 96 against a target of 84 - and a per-channel
+# scale reorders which pixels are brightest, so a 3% set on the output is not
+# the set that was solved on, and a corrected winner measured hue 8 against
+# its own target. Pixels between the 90th and 98th percentile of luminance
+# are the fully lit fabric with the extreme 2% - fibres catching the light,
+# any specular - trimmed off, and the set is wide enough to hold still.
+#
+# The known weak case: a bright logo or trim on a dark garment owns this band
+# on BOTH sides, so the scale solves logo to logo and the fabric is left
+# roughly alone - muted rather than wrong.
+TONE_LIT_BAND = (90.0, 98.0)
+TONE_LIT_PCT = TONE_LIT_BAND[0]      # kept for callers that only want a floor
+
+# How far past the luminance mask the garment is allowed to extend, as a
+# fraction of the long side, and how much area that growth may add before it
+# is disbelieved. See _tone_mask().
+TONE_GROW_MAX = 0.05
+TONE_GROW_CAP = 0.20
+# The mask is grown only when the lit fabric is within this many levels of the
+# cue's threshold (plate minus margin). Past it, nothing pale outside the mask
+# can be fabric.
+TONE_GROW_REACH = 20.0
+
+
+def _srgb_to_linear(x: np.ndarray) -> np.ndarray:
+    return np.where(x > 0.04045, ((x + 0.055) / 1.055) ** 2.4, x / 12.92)
+
+
+def _linear_to_srgb(y: np.ndarray) -> np.ndarray:
+    return np.where(y > 0.0031308, 1.055 * np.power(y, 1 / 2.4) - 0.055,
+                    12.92 * y)
+
+
+def grey_for_L(L: float) -> float:
+    """The neutral 8-bit grey whose L* is `L`. Inverse of srgb_to_lab on the
+    grey axis, so a coloured source's lightness can be stated as the grey a
+    desaturated reference has to reach."""
+    L = float(np.clip(L, 0.0, 100.0))
+    fy = (L + 16.0) / 116.0
+    y = fy ** 3 if fy > 6.0 / 29.0 else 3 * (6.0 / 29.0) ** 2 * (fy - 4.0 / 29.0)
+    return float(np.clip(_linear_to_srgb(np.array(y)), 0.0, 1.0) * 255.0)
+
+
+def L_for_grey(grey: float) -> float:
+    """L* of a neutral 8-bit grey."""
+    return float(srgb_to_lab(np.array([grey, grey, grey], dtype=float))[0])
+
+
+def lit_select(px: np.ndarray, band=TONE_LIT_BAND) -> np.ndarray:
+    """Boolean selector of the lit pixels in a (N, C) or (N,) array: those whose
+    luminance sits inside `band` percentiles. Never empty for N >= 1."""
+    lum = px.mean(axis=1) if px.ndim == 2 else px
+    if not len(lum):
+        return np.zeros(0, dtype=bool)
+    lo, hi = np.percentile(lum, band[0]), np.percentile(lum, band[1])
+    sel = (lum >= lo) & (lum <= hi)
+    return sel if sel.any() else lum >= lo
+
+
+def lit_rgb(path: Path, mask: np.ndarray, band=TONE_LIT_BAND) -> np.ndarray:
+    """Mean RGB of the garment's lit fabric: the pixels whose luminance sits in
+    `band` percentiles of the mask's core. See TONE_LIT_BAND.
+
+    The core, not the mask: the mask's boundary pixels are part plate, and at
+    the bright end the plate is what wins. Eroded by the same 9 px the
+    luminance cue uses for its own contrast reading.
+    """
+    im = Image.open(path).convert("RGB")
+    im = im.resize((mask.shape[1], mask.shape[0]), Image.LANCZOS)
+    px = np.asarray(im, dtype=np.float32)[_core(mask)]
+    if not len(px):
+        return np.zeros(3, dtype=np.float32)
+    return px[lit_select(px)].mean(axis=0)
+
+
+def garment_colour(path: Path, mask: np.ndarray | None = None,
+                   long_side: int = 1024, cue: str | None = None) -> dict:
+    """The garment's colour, read off its lit fabric: RGB, Lab, grey, area.
+
+    This is the reading every colour decision uses - the reference re-tone,
+    the recolour of the winner, and the lit dE in metrics.py - so all three
+    agree on what "the garment's colour" means.
+
+    `found` is False when no plausible mask came back; every other field is then
+    None rather than a confident number about nothing.
+    """
+    if mask is None:
+        e = garment_evidence(Path(path), long_side, cue)
+        mask, cue_used, why = e["mask"], e["cue"], e["cue_why"]
+    else:
+        cue_used, why = cue or "given", "mask supplied"
+    if not mask.any() or float(mask.mean()) < CHROMA_MIN_AREA:
+        return {"found": False, "rgb": None, "L": None, "a": None, "b": None,
+                "grey": None, "area": float(mask.mean()), "cue": cue_used,
+                "why": why}
+    rgb = lit_rgb(Path(path), mask)
+    lab = srgb_to_lab(rgb)
+    return {"found": True, "rgb": [round(float(v), 2) for v in rgb],
+            "L": round(float(lab[0]), 2), "a": round(float(lab[1]), 2),
+            "b": round(float(lab[2]), 2), "grey": round(float(rgb.mean()), 2),
+            "area": round(float(mask.mean()), 4), "cue": cue_used,
+            "lit_band": list(TONE_LIT_BAND)}
+
+
+def garment_tone(path: Path, long_side: int = 1024,
+                 cue: str | None = None) -> dict:
+    """How light the garment's lit fabric is. garment_colour() by another name,
+    kept because the tone ranking and the reference re-tone read it."""
+    return garment_colour(Path(path), None, long_side, cue)
+
+
+def _tone_curve(y: np.ndarray, k: float, top: float = 1.0) -> np.ndarray:
+    """y * k in linear light, eased into `top` above TONE_KNEE * top instead of
+    clipping. Continuous with slope 1 at the knee; monotone; never exceeds
+    `top`. `top` is the plate's own level: brightening a dark garment also
+    brightens the edge band the mask picked up beside it, and a band that
+    saturates at 255 against a 249 plate is a pale halo. Saturating at the
+    plate makes it vanish into the plate instead."""
+    knee = TONE_KNEE * top
+    s = y * k
+    over = s > knee
+    if over.any():
+        s = np.where(over, knee + (top - knee)
+                     * (1.0 - np.exp(-(s - knee) / (top - knee))), s)
+    return s
+
+
+def _tone_mask(g: np.ndarray, strong: np.ndarray, plate: float,
+               luma_margin: float) -> tuple:
+    """Grow the garment mask into the pale rim the luminance cue leaves out.
+    Returns (mask, grown fraction of the garment's area, note).
+
+    Only when the garment's LIT fabric sits within reach of the cue's
+    threshold - closer to it than TONE_GROW_REACH levels - because that is the
+    one case where fabric can sit above the threshold. A dark garment's lit
+    fabric is far below it, and what lies outside its mask is penumbra: on two
+    dark hoodies the band outside the mask measured grey 204-241 against fabric
+    at 43, 7% of the garment's area, shadow and not cloth. Growing into that
+    and brightening it pushed the mean the solver sees 12 levels above what
+    the garment itself reached.
+
+    Read off the lit fabric rather than off whether the margin was the floor,
+    because a pale garment with dark panels gets a margin above the floor and
+    a rim above the threshold at the same time: PB_gp_4553223 in
+    inputs/reference_library has lit fabric at 240 on a 249 plate with a
+    margin of 23, and under the floor rule its rim stayed pale and the toned
+    output landed 3.6 L* high.
+
+    The cue finds fabric at `plate - margin` and below, and on a pale garment
+    the margin is the 18-level floor - so a highlight on a hood rim at 240
+    against a 249 plate is plate as far as the cue is concerned. Scale the
+    garment through that mask and the rim stays pale, with a jagged edge where
+    the scale stopped. Measured on the light heather hoodie in
+    inputs/reference_library: 2.6% of the garment sat outside the mask, at
+    grey 231-243, within 19 px of it at 1024 wide, and all of it was fabric.
+
+    Hysteresis: every pixel darker than the plate by more than the plate's own
+    noise, connected to the garment, within TONE_GROW_MAX of it. On a
+    retouched packshot - a garment on a flat white plate with nothing else in
+    the frame - that is the rest of the garment. On a reference with a drop
+    shadow the shadow joins too, and a darkened shadow is a halo, so growth is
+    capped: past TONE_GROW_CAP of the garment's area something other than a
+    rim has joined, and the plain mask is used instead. The record says which.
+    """
+    px = g[strong]
+    lit = float(px[px >= np.percentile(px, TONE_LIT_PCT)].mean()) if len(px) else 0.0
+    if plate - lit > luma_margin + TONE_GROW_REACH:
+        return strong, 0.0, (f"lit fabric at {lit:.0f} sits {plate - lit:.0f} "
+                             f"below the plate, well under the {luma_margin:.0f} "
+                             f"margin, so what lies outside the mask is penumbra")
+    border = _border_px(g)
+    noise = float(np.percentile(plate - border, 99))
+    weak = g < plate - max(4.0, noise + 2.0)
+    lab, n = ndimage.label(weak)
+    if n == 0:
+        return strong, 0.0, "nothing darker than the plate beside the garment"
+    seeds = np.unique(lab[strong])
+    seeds = seeds[seeds > 0]
+    near = ndimage.distance_transform_edt(~strong) <= TONE_GROW_MAX * max(g.shape)
+    grown = (np.isin(lab, seeds) & near) | strong
+    frac = float((grown & ~strong).sum()) / max(float(strong.sum()), 1.0)
+    if frac > TONE_GROW_CAP:
+        return strong, frac, (f"growth of {frac * 100:.0f}% of the garment "
+                              f"exceeds the {TONE_GROW_CAP * 100:.0f}% cap - "
+                              f"a shadow or a prop joined; plain mask used")
+    return grown, frac, f"mask grown {frac * 100:.1f}% into the garment's rim"
+
+
+def tone_match_grey(src: Path, dst: Path, target_grey: float | None,
+                    long_side: int = 1024) -> dict:
+    """Write `src` to `dst` as greyscale, with its garment's lit-fabric grey
+    moved to `target_grey`. Returns a record of what was measured and done.
+
+    `target_grey` None writes a plain desaturation - the record says so. The
+    scale factor is solved by bisection so the garment's lit grey (see
+    TONE_LIT_PCT), measured over the same mask the scale is applied through,
+    lands on the target to within 0.25 of a level. A garment too dark to be brightened that far (the
+    scale is capped at 50x) is brightened as far as it goes and the shortfall is
+    recorded, not hidden.
+    """
+    src, dst = Path(src), Path(dst)
+    rec: dict = {"applied": False, "target_grey": target_grey}
+    with Image.open(src) as im:
+        im.load()
+        grey_full = np.asarray(im.convert("L"), dtype=np.float32) / 255.0
+    H, W = grey_full.shape
+
+    def write(arr01: np.ndarray) -> None:
+        out = np.clip(np.rint(arr01 * 255.0), 0, 255).astype(np.uint8)
+        Image.fromarray(out, mode="L").save(dst, quality=95, subsampling=0)
+
+    if target_grey is None:
+        write(grey_full)
+        rec["why"] = "no target - plain desaturation"
+        return rec
+
+    e = garment_evidence(src, long_side=long_side)
+    strong = e["mask_open"]
+    if not strong.any() or float(e["mask"].mean()) < CHROMA_MIN_AREA:
+        write(grey_full)
+        rec["why"] = f"no garment mask on the reference ({e['cue_why']})"
+        return rec
+
+    # Solve at working resolution: the mean is scale-invariant and the full
+    # frame is 10M pixels.
+    small = np.asarray(Image.fromarray((grey_full * 255).astype(np.uint8))
+                       .resize((strong.shape[1], strong.shape[0]),
+                               Image.BILINEAR), dtype=np.float32) / 255.0
+    m, grown, grow_note = _tone_mask(small * 255.0, strong, e["plate_level"],
+                                     e["luma_margin"])
+    m, holes_closed = _pose_holes(m, min_frac=TONE_HOLE_FRAC)
+    core = m
+    # Solved on the LIT pixels of the mask's eroded core - the same cut
+    # garment_colour() reads - so the reference's lit fabric lands on the
+    # source's lit fabric. The scale is monotone, so the set is fixed once from
+    # the input and never re-picked.
+    px = small[_core(core)]
+    lit = lit_select(px)
+    y_small = _srgb_to_linear(px[lit])
+    before = float(px[lit].mean() * 255.0)
+    # Nothing comes out brighter than the plate. A plate this dark is not a
+    # plate, and then the ceiling is white.
+    y_plate = float(_srgb_to_linear(np.array(e["plate_level"] / 255.0)))
+    top = y_plate if e["plate_level"] >= 200 else 1.0
+    rec.update({"grey_before": round(before, 2), "cue": e["cue"],
+                "statistic": f"lit fabric, p{TONE_LIT_BAND[0]:.0f}-p"
+                             f"{TONE_LIT_BAND[1]:.0f} of the core by luminance",
+                "plate": round(float(e["plate_level"]), 1),
+                "holes_closed": int(holes_closed),
+                "mask_grown_pct": round(grown * 100, 1), "mask_note": grow_note,
+                "mask_area": round(float(core.mean()), 4)})
+
+    if abs(L_for_grey(before) - L_for_grey(target_grey)) <= TONE_TOLERANCE_L:
+        write(grey_full)
+        rec["why"] = "already within tolerance"
+        rec["grey_after"] = round(before, 2)
+        return rec
+
+    def mean_at(k: float) -> float:
+        return float(_linear_to_srgb(_tone_curve(y_small, k, top)).mean()
+                     * 255.0)
+
+    lo, hi = np.log(0.02), np.log(50.0)
+    for _ in range(48):
+        mid = 0.5 * (lo + hi)
+        if mean_at(float(np.exp(mid))) < target_grey:
+            lo = mid
+        else:
+            hi = mid
+    k = float(np.exp(0.5 * (lo + hi)))
+    achieved_small = mean_at(k)
+
+    # Alpha at full size, feathered INWARD: the mask's edge is the garment's
+    # edge now, so a feather that spilled outward would scale a band of plate
+    # and draw a fringe round the garment. The bilinear resample ramps 0-1
+    # across the boundary; keeping the inner half of that ramp and a 1 px blur
+    # softens the step without ever touching a plate pixel.
+    ramp = np.asarray(Image.fromarray((m * 255).astype(np.uint8))
+                      .resize((W, H), Image.BILINEAR), dtype=np.float32) / 255.0
+    alpha = np.clip((ramp - 0.5) * 2.0, 0.0, 1.0)
+    alpha = ndimage.gaussian_filter(alpha, sigma=1.0) * (ramp >= 0.5)
+    y_full = _srgb_to_linear(grey_full)
+    scaled = _linear_to_srgb(_tone_curve(y_full, k, top))
+    out = grey_full + alpha * (scaled - grey_full)
+    write(np.clip(out, 0.0, 1.0))
+
+    rec.update({"applied": True, "scale": round(k, 4),
+                "grey_after": round(achieved_small, 2),
+                "shortfall": round(float(target_grey - achieved_small), 2)
+                if abs(target_grey - achieved_small) > 0.5 else 0.0,
+                "why": "garment scaled in linear light to the source's tone"})
+    return rec
+
+
+def recolour_garment(src: Path, dst: Path, target_rgb, whiten_plate: bool = True,
+                     long_side: int = 1024) -> dict:
+    """Write `src` to `dst` with its garment's lit-fabric colour moved to
+    `target_rgb` and, by default, its plate taken to white. Returns a record.
+
+    The generator is asked for the reference's lay first and the real garment's
+    colour second, and when it delivers the lay by repainting the garment it
+    also repaints the colour: cand_07 and cand_10 of runs/20260902_100812 hit
+    the reference silhouette at 0.96 and came back 25 L* paler than the
+    product. Colour is the one property that can be put back deterministically,
+    so it is put back here rather than traded against the shape in the pick.
+
+    Per channel, multiplicative in linear light, through the same soft alpha
+    and grown mask as tone_match_grey(): a change of fabric colour is a change
+    of albedo, and scaling keeps every crease-to-highlight ratio the candidate
+    has. Solved on the lit pixels so the target means what garment_colour()
+    measures.
+
+    The plate: a repainted candidate comes back on a plate a few levels grey
+    (236 on that run against 254 for a genuine edit). Outside the garment the
+    pixels are scaled so the plate's own level lands on white, shadows lifted in
+    proportion and never past white. Skipped when the plate is already at 250
+    or is under 200 - the second is not a plate.
+    """
+    src, dst = Path(src), Path(dst)
+    target = np.asarray(target_rgb, dtype=np.float64) / 255.0
+    rec: dict = {"applied": False, "target_rgb": [round(float(v), 1)
+                                                  for v in target * 255.0]}
+    with Image.open(src) as im:
+        im.load()
+        full = np.asarray(im.convert("RGB"), dtype=np.float32) / 255.0
+    H, W, _ = full.shape
+
+    def write(arr01: np.ndarray) -> None:
+        out = np.clip(np.rint(arr01 * 255.0), 0, 255).astype(np.uint8)
+        Image.fromarray(out, mode="RGB").save(dst)
+
+    e = garment_evidence(src, long_side=long_side)
+    strong = e["mask_open"]
+    if not strong.any() or float(e["mask"].mean()) < CHROMA_MIN_AREA:
+        write(full)
+        rec["why"] = f"no garment mask on the candidate ({e['cue_why']})"
+        return rec
+
+    small = np.asarray(Image.fromarray((full * 255).astype(np.uint8))
+                       .resize((strong.shape[1], strong.shape[0]),
+                               Image.BILINEAR), dtype=np.float32) / 255.0
+    grey_small = small.mean(axis=2) * 255.0
+    m, grown, grow_note = _tone_mask(grey_small, strong, e["plate_level"],
+                                     e["luma_margin"])
+    m, holes_closed = _pose_holes(m, min_frac=TONE_HOLE_FRAC)
+    px = small[_core(m)]
+    lit = lit_select(px)
+    before = px[lit].mean(axis=0)
+    plate_rgb = np.asarray(e["plate_rgb"], dtype=np.float64) / 255.0
+    plate_level = float(e["plate_level"])
+    top = float(_srgb_to_linear(np.array(plate_level / 255.0))) \
+        if plate_level >= 200 else 1.0
+    rec.update({"cue": e["cue"], "plate_before": round(plate_level, 1),
+                "holes_closed": int(holes_closed),
+                "mask_grown_pct": round(grown * 100, 1), "mask_note": grow_note,
+                "mask_area": round(float(m.mean()), 4),
+                "rgb_before": [round(float(v * 255.0), 1) for v in before],
+                "statistic": f"lit fabric, p{TONE_LIT_BAND[0]:.0f}-p"
+                             f"{TONE_LIT_BAND[1]:.0f} of the core by luminance"})
+
+    ks = []
+    for c in range(3):
+        y = _srgb_to_linear(px[lit, c].astype(np.float64))
+        lo, hi = np.log(0.02), np.log(50.0)
+        for _ in range(48):
+            mid = 0.5 * (lo + hi)
+            got = float(_linear_to_srgb(_tone_curve(y, float(np.exp(mid)),
+                                                    top)).mean())
+            if got < target[c]:
+                lo = mid
+            else:
+                hi = mid
+        ks.append(float(np.exp(0.5 * (lo + hi))))
+
+    # The plate's scale takes its own level to white, hard-clipped: a soft knee
+    # here would leave the plate at 246, which is the grey it was meant to lose.
+    whiten = whiten_plate and 200 <= plate_level < 250
+    kp = (1.0 / np.maximum(_srgb_to_linear(plate_rgb), 1e-4)) if whiten \
+        else np.ones(3)
+
+    ramp = np.asarray(Image.fromarray((m * 255).astype(np.uint8))
+                      .resize((W, H), Image.BILINEAR), dtype=np.float32) / 255.0
+    alpha = np.clip((ramp - 0.5) * 2.0, 0.0, 1.0)
+    alpha = ndimage.gaussian_filter(alpha, sigma=1.0) * (ramp >= 0.5)
+    out = np.empty_like(full)
+    for c in range(3):
+        y = _srgb_to_linear(full[..., c])
+        garment = _linear_to_srgb(_tone_curve(y, ks[c], top))
+        plate = _linear_to_srgb(np.minimum(y * kp[c], 1.0)) if whiten \
+            else full[..., c]
+        out[..., c] = alpha * garment + (1.0 - alpha) * plate
+    write(np.clip(out, 0.0, 1.0))
+
+    after = garment_colour(dst, mask=m)
+    rec.update({"applied": True, "scale": [round(k, 4) for k in ks],
+                "plate_scale": [round(float(k), 4) for k in kp],
+                "plate_whitened": bool(whiten),
+                "plate_after": round(float(plate_level_of(dst)), 1),
+                "rgb_after": after.get("rgb"),
+                "lab_after": [after.get("L"), after.get("a"), after.get("b")],
+                "why": "garment scaled per channel in linear light to the "
+                       "source's lit-fabric colour"
+                       + (", plate taken to white" if whiten else "")})
+    return rec
+
+
+def plate_level_of(path: Path) -> float:
+    """plate_level() under a name that does not shadow a local."""
+    return plate_level(Path(path))
+
+
+def prepare_reference_image(src: Path, dst: Path, match_to: Path | None,
+                            greyscale: bool = True) -> dict:
+    """Desaturate `src` into `dst` and, when `match_to` is a photo with a
+    garment in it, re-tone the reference garment to that garment's lightness.
+
+    One function for both ways a reference arrives - chosen from the library or
+    handed over with --reference - so turn 1 cannot tell which it was.
+    `greyscale=False` copies the colour through untouched, and no tone matching
+    is done: that flag means "I want the reference read as a colour target".
+    """
+    src, dst = Path(src), Path(dst)
+    if not greyscale:
+        with Image.open(src) as im:
+            im.convert("RGB").save(dst, quality=95, subsampling=0)
+        return {"applied": False, "why": "installed in colour (--colour)"}
+    target = None
+    source_tone: dict = {}
+    if match_to is not None and Path(match_to).exists():
+        source_tone = garment_tone(Path(match_to))
+        if source_tone.get("found"):
+            target = round(grey_for_L(source_tone["L"]), 2)
+    rec = tone_match_grey(src, dst, target)
+    rec["source"] = {k: source_tone.get(k) for k in ("L", "grey", "cue", "area")}
+    if match_to is not None and not source_tone.get("found"):
+        rec["why"] = (f"no garment mask on the source ({source_tone.get('why')})"
+                      if source_tone else f"source not found: {match_to}")
+    return rec
+
+
 # A numeric wrinkle metric was tried and removed once, and the reason is worth
 # keeping: creases are broad, soft, oriented ridges, and an isotropic band-pass
 # at every scale from sigma 3-12 to 2-60 ranked the visibly SMOOTHEST candidate
@@ -1377,14 +1879,25 @@ VIEWPOINT_PHRASES = ("back view", "front view", "rear view", "side view",
 
 VIEWPOINT_WINDOW = 40      # chars after a lead in which a face word counts
 
-# Absolutes that ask for MORE than flat: they push the model past relaxing the
-# handling folds and into repainting the fabric as a smooth surface, which is
-# this project's documented redraw driver. A warning, not a refusal - the
-# wording is a judgement call, and metrics.py measures the consequence directly
-# as a wrinkle ratio that falls too far.
-SOFTEN = ("wrinkle-free", "wrinkle free", "no creases", "no wrinkles",
-          "completely smooth", "perfectly smooth", "freshly steamed",
-          "steamed and pressed", "ironed", "no fold lines", "flawless")
+# RETIRED, and kept as a record. These used to be warned about as "asking for
+# more than flat", the redraw driver. The deliverable is now judged on the
+# reference's lay first - flat, smooth, sized like the reference - so asking
+# for a completely flat garment is asking for the job. What still has to
+# survive a flat redraw is
+# CONSTRUCTION, and that is checked by the pins-and-labels read on every
+# candidate, not by policing the word "smooth".
+SOFTEN: tuple[str, ...] = ()
+
+# Wording that asks the generator to preserve the thing the job removes. The
+# old fidelity hint said "keep the knit texture" and "proportions unchanged",
+# and the generator read both as reasons to leave the garment where it lay:
+# cand_09 of runs/20260902_100812 shipped at 0.892 against the reference
+# silhouette while the two candidates that hit 0.96 were passed over.
+KEEP_CREASES = ("keep the creases", "keep its creases", "keep the folds",
+                "keep its folds", "preserve the creases", "preserve the folds",
+                "natural creases", "natural folds", "original proportions",
+                "proportions unchanged", "keep the proportions",
+                "without ironing", "not ironed")
 
 # What a prompt is expected to say. Advisory - see the tier note above.
 MUST_MENTION = (
@@ -1530,14 +2043,14 @@ def check_prompt(prompt: str, reference: Path | None = None,
     if not any(re.search(rf"\b{w}\b", low) for w in LIMB_WORDS):
         warnings.append(f"never says where the sleeves or legs go - {LIMB_WHY}")
 
-    hits = [w for w in SOFTEN if w in low]
+    hits = [w for w in KEEP_CREASES if w in low]
     if hits:
         warnings.append(
-            f"asks for absolute smoothness ({', '.join(hits)}). Relaxing handling "
-            f"folds is the job; ironing the knit out of existence is a redraw, and "
-            f"the wrinkle ratio falls just as far in that direction. Prefer "
-            f"'relax the folds so the fabric lies flat, keep the knit's real "
-            f"texture'.")
+            f"asks to keep the fabric's folds or surface ({', '.join(hits)}). "
+            f"The finished flat is ironed smooth and shaped like image 2; what "
+            f"must survive is the construction, colour and pattern, not the "
+            f"creases. Say 'lies completely flat and smooth' and name the seams, "
+            f"pockets and labels that stay.")
 
     if reference is not None:
         try:

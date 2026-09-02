@@ -261,11 +261,21 @@ def main() -> int:
             except Exception as e:  # noqa: BLE001 - a check is not the delivery
                 print(f"  (could not measure texture against the source: {e})")
 
+        # Two lists. `verdicts` are contract breaches and stop the polish from
+        # shipping; `notes` are printed and recorded and change nothing. The
+        # split moved on 2026-09-02, when the deliverable became the
+        # reference's lay first: a garment ironed completely flat is now the
+        # job, so it cannot be a reason to ship the creased parent instead.
+        # What still breaks the contract is the pass changing the SHAPE -
+        # re-framing the garment - painting the fabric itself out from under
+        # the folds, or shifting the colour, which nothing downstream puts
+        # back.
         verdicts = []
+        notes = []
         if ratio is not None and ratio < 0.5:
-            verdicts.append(
-                f"IRONED FLAT: wrinkle ratio {ratio:.2f}. Far below 1 is not a "
-                f"de-wrinkled garment, it is a repainted one")
+            notes.append(
+                f"ironed flat: wrinkle ratio {ratio:.2f} against its parent. "
+                f"That is the job now - check the construction survived")
 
         # SHAPE OF THE DATA, not a magnitude. Broad falling while fine holds is
         # the pass working; fine falling meaningfully faster than broad is the
@@ -286,12 +296,9 @@ def main() -> int:
         # sits between them. Treat it as the line that flags "go and look",
         # not as a calibration - it will move once there are more runs behind it.
         if fine_vs_source is not None and fine_vs_source < 0.65:
-            verdicts.append(
-                f"TEXTURE SPENT: the polished file keeps x{fine_vs_source:.2f} "
-                f"of the ORIGINAL photograph's fabric texture. The polish is "
-                f"within its contract against its parent, but generation and "
-                f"polish together have gone too far - ship the unpolished "
-                f"parent, or soften the flatten section and regenerate")
+            notes.append(
+                f"texture spent: the polished file keeps x{fine_vs_source:.2f} "
+                f"of the ORIGINAL photograph's fabric texture")
         if de > 3.0:
             verdicts.append(
                 f"COLOUR SHIFTED: dE {de:.1f} against its parent, which the "
@@ -308,13 +315,16 @@ def main() -> int:
             "silhouette_iou": iou, "colour_de": de, "wrinkle_ratio": ratio,
             "wrinkle_fine_ratio": fine, "wrinkle_broad_ratio": broad,
             "wrinkle_fine_vs_source": fine_vs_source,
-            "scale": scale, "verdicts": verdicts, "broke_contract": bool(verdicts),
+            "scale": scale, "verdicts": verdicts, "notes": notes,
+            "broke_contract": bool(verdicts),
         }, indent=2) + "\n")
 
         if verdicts:
             print("\n  WARNING: the polish broke its own instruction.")
             for v in verdicts:
                 print(f"    - {v}")
+        for v in notes:
+            print(f"  note: {v}")
         line = f"\n  shape  IoU {iou:.3f} vs parent"
         if scale:
             line += f"   scale {scale:.2f}x"

@@ -242,8 +242,11 @@ def collect_run(run_dir: Path, runs_dir: Path, bank=None):
     cands = []
     for png in sorted(arch.glob("cand_*.png")):
         name = png.stem
+        # Derived names carry a suffix per step: s segmented, p polished,
+        # c recoloured. The parent is the name with the last letter dropped.
         is_polish = name.endswith("p")
-        parent = name[:-1] if is_polish else None
+        derived = bool(re.fullmatch(r"cand_\d+[spc]+", name))
+        parent = name[:-1] if derived else None
         info = lineage.get(name, {}) or seeds.get(name, {})
         cands.append({
             "name": name,

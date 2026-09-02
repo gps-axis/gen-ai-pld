@@ -1,6 +1,6 @@
 ---
 name: laydown
-description: "Re-lay an off-set product photo so the garment lies flat and square like the reference laydown, keeping its real colour, texture and construction. Write the prompt yourself, generate with fal.ai, look at what comes back, and iterate until it is right or the images run out."
+description: "Re-lay an off-set product photo into the reference laydown: the same silhouette, ironed flat, the same size in the frame, keeping the garment's real construction and colour. Write the prompt yourself, generate with fal.ai, look at what comes back, and iterate until it is right or the images run out."
 ---
 
 # Laydown
@@ -11,12 +11,27 @@ Image 1 is a real garment photographed off-set - pinned to a wall, creased,
 shadowed. Image 2 is what a finished ecommerce laydown looks like: square, flat,
 sleeves symmetric, clean white plate, no shadows.
 
-Get image 1 to lie like image 2 **without redrawing it**. Same garment, same
-colour, same knit, same trim, same buttons, same construction. Only the pose, the
-creases and the plate change.
+Get image 1 into the lay of image 2. **In this order:**
 
-Image 2 is a **different product**. Its collar, its trim and its tone are not
-yours. Take the lay and nothing else.
+1. **The silhouette matches image 2** - the same shape, the sleeves or legs at
+   the same angle and spacing, square and level.
+2. **Ironed flat** - every crease and handling fold gone, the fabric smooth.
+3. **The same size in the frame as image 2**, with the same margins.
+4. **The construction is image 1's** - every seam, pocket, waistband, cuff,
+   sewn-in label and logo. This is a gate, not a score: a candidate that hit
+   the lay by inventing a seam or losing the logo is not shippable.
+5. **Colour** is second-level. A flat, evenly lit render reads lighter than a
+   creased photograph, and that is not a fault: judge colour on the **hue**
+   part of the reading. Under 4 is the same colourway. Over 8 is a different
+   one - a blue where the garment is green - and that disqualifies, however
+   good the lay. Between the two, the lay decides.
+
+Image 2 is a **different product**. Its collar, its trim and its pockets are
+not yours. Take the lay, the flatness and the size, and nothing else.
+
+Why this order is written down: `runs/20260902_100812` shipped a candidate at
+0.892 against the reference silhouette, with good colour, while two candidates
+at 0.96 - flat, sized like the reference - were passed over for being pale.
 
 ## The loop
 
@@ -237,50 +252,56 @@ viewed from directly above", "top-down" all pass.
 
 **Warned, not blocked:**
 
-- **Absolute smoothness** - "wrinkle-free", "freshly steamed", "no creases". This
-  is the redraw driver. It asks for more than flat and gets the knit repainted as
-  a smooth surface. Ask for relaxed folds with the texture kept.
+- **Asking to keep the creases, folds, texture or proportions.** The finished
+  flat is ironed smooth and shaped like image 2; what survives is the
+  construction, the colour and the pattern. Say "lies completely flat and
+  smooth" and name the seams, pockets and labels that stay.
 - **Naming a tag, pin, clip or label - it is already handled, so do not.** Every
   prompt carries a standing clause covering this, and your own version fights it.
   See below.
 
-## The three numbers
+## The numbers
 
-They arrive automatically under each new candidate. They are **advice, not a
-score** - nothing is blocked, ranked or rejected by them, and your eyes overrule
-them in both directions. They exist for the one failure eyes miss: the generator
-drawing a new garment that is already flat instead of re-laying the real one.
+They arrive automatically under each new candidate, **in the order they
+matter**, and all against the **original** source and the run's reference,
+never a candidate's parent.
 
-Always measured against the **original** source, never against a candidate's
-parent. Comparing to the parent measures one hop and calls a three-hop drift
-small.
+```
+cand_10  LAY 0.969 vs ref (source starts 0.867)  size x0.99  flat x0.39  colour dE 24.1 (hue 4.2)  same-garment IoU 0.863
+```
 
-Measured on ten real candidates plus controls (`runs/20260827_143253`):
+**LAY - the primary number.** The candidate's silhouette against image 2,
+bbox-normalised. The source's own number is printed beside it so you can read
+movement: on `runs/20260902_100812` the source started at 0.867, the shipped
+candidate reached 0.892 (it barely moved), and the two best lays hit 0.959 and
+0.969. Below about 0.90 the pose is still the source's. The pose section, or
+`match_pose`, is what moves it.
 
-**Silhouette IoU - weak, and know why before you use it.** Its whole range is
-narrow. The same garment measured against itself across nothing but a background
-change scored **0.728**; a completely *different* garment scored **0.581**. The
-ten real candidates all landed between **0.633 and 0.661**. So a 0.02 difference
-between two candidates means nothing, and IoU cannot separate a good re-lay from
-a mediocre one. What it can do is catch a collapse: below about **0.58** you are
-not looking at the same object. Some IoU loss is correct - relaxing a folded
-sleeve genuinely changes the outline.
+**size** - the garment's share of the frame over image 2's. 1.0 is right. A
+candidate at 1.4 kept the source's framing; a redraw usually lands near 1.0.
 
-**Colour dE - the one that discriminates.** Under **1** is invisible, under about
-**2.5** is the same colourway, **5** is drifting, **8+** is a different colour.
-On the calibration batch the dE ordering reproduced the old pipeline's top three
-picks exactly, in order. Trust this one first.
+**flat** - surface energy over the source's. **Below 1 is wanted now.** A flat
+redraw sits at 0.4-0.5; a re-lay that kept the creases sits near or above 1.
+Far below 1 is only a problem if the construction went with the creases - check
+the PINS AND LABELS read, not the number.
 
-**Wrinkle ratio (candidate ÷ source) - not "lower is better".** It measures
-texture energy, and a generated image renders knit *crisper* than a soft studio
-photo, so normal candidates came back **1.25 to 1.55**, above the source rather
-than below it. Read it as a distance from 1 in either direction: far below - say
-**0.5** or less - means the knit was ironed out of existence, and far above -
-**2.0** or more - means something went wrong. The worst candidate in the batch
-sat at 2.62 with 438 background specks and dE 8.6; all three numbers agreed.
+**colour dE (hue)** - read off the lit fabric of both garments, so a creased
+photo and a flat candidate compare as fairly as they can. Even so, a flat
+render reads several L* lighter than the photograph, so the whole dE runs
+5-10 on a good candidate. **Second-level, and judged on the `hue` part**:
+under 4 is the same colourway; over about 8 is a different one and
+disqualifies; between, the lay decides.
 
-**Specks** is a good tiebreaker when two candidates look alike: the cleanest of
-the ten had 27, the worst 438.
+**same-garment IoU** - the candidate against the source silhouette. It **falls
+when the lay changes**, which is the job, so a high number here with a low LAY
+means the candidate stayed where it was. Below about 0.58 you are not looking at
+the same object at all.
+
+**Specks** is a good tiebreaker when two candidates look alike.
+
+`pick_best` tells you when another candidate sits closer to the reference's lay
+than your pick. If you are passing it over, say what disqualifies it -
+construction, a second garment, a hanger - in a `note`.
 
 ## The lay check - read it, it is the one that catches the pose
 
@@ -375,10 +396,12 @@ without one the whole frame is squeezed to 1024px and you see nothing of the kin
 
 ## The polish: automatic, at the very end
 
-**You do not need to call this.** After you `finish`, the harness runs the winner
-through a different model - `openai/gpt-image-2/edit` - with a narrow
+**You do not need to call this.** After you `finish`, the harness runs the
+winner through a different model - `openai/gpt-image-2/edit` - with a narrow
 instruction: take the wrinkles out, change nothing else. `cand_04` becomes
-`cand_04p`, and that is what ships.
+`cand_04p`, and that is what ships. It is skipped when the pick is already
+flatter than the source (flat under 0.6), because there is nothing left to
+de-wrinkle.
 
 It is automatic because it was optional and got skipped: on
 `runs/20260828_104807` the run went `pick_best` → write the log → `finish`, and
@@ -409,10 +432,13 @@ what the polish changed.
 It prints that comparison and **refuses to ship the polish** on three
 unambiguous failures, delivering the unpolished parent instead and saying why:
 
-- **ironed flat** - wrinkle ratio under 0.5, the knit repainted as a smooth
-  surface, which is a redraw wearing a tidy face.
+- **knit painted out** - the fine texture fell much faster than the creases, so
+  the pass smoothed the fabric itself rather than the folds in it.
 - **colour shifted** - dE over 3 against the parent.
 - **re-framed** - the garment now covers a very different share of the frame.
+
+A polish that irons the garment completely flat is noted and shipped: flat is
+the job.
 
 Shape and scale are **reported, not enforced**. Three polishes measured so far:
 two at IoU ~0.834 where the sleeves and the framing had visibly moved, and one at

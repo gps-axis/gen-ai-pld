@@ -35,13 +35,32 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import common as C  # noqa: E402
 
 
-def compare(source: Path, candidate: Path, long_side: int = 1024) -> dict:
-    """The three numbers, plus the cheap extras, for one candidate.
+def compare(source: Path, candidate: Path, long_side: int = 1024,
+            reference: Path | None = None) -> dict:
+    """The numbers for one candidate: against the source, and when a reference
+    is given, against the reference's lay.
+
+    THE LAY NUMBERS COME FIRST when they exist. `lay_iou` is the candidate's
+    silhouette against the REFERENCE, bbox-normalised, with `lay_iou_source` -
+    where the untouched source starts from - beside it so movement can be
+    read. `size_vs_ref` is the garment's share of the frame over the
+    reference's. runs/20260902_100812 is why: every number then measured
+    distance from the source, so the two candidates that hit the reference at
+    0.96 read as the worst in the batch and the one that had barely moved
+    shipped.
+
+    Colour is read two ways. `colour_de` is the whole-mask mean, kept for
+    continuity with every run before it. `colour_de_lit` is the lit-fabric
+    reading (common.TONE_LIT_PCT) and `hue_de` its a*b* part alone: the lit
+    number is the honest one between a creased photo and a flat candidate, and
+    hue is what cannot be put back by a recolour, so it is the gate.
 
     The source is read first so its detection cue can be forced onto the
     candidate. common.garment_evidence picks between a chroma cue and a
@@ -111,6 +130,22 @@ def compare(source: Path, candidate: Path, long_side: int = 1024) -> dict:
     iou = C.silhouette_iou(src_mask, cand_mask)
     drift = C.colour_drift(C.garment_rgb(Path(source), src_mask),
                            C.garment_rgb(Path(candidate), cand_mask))
+    lit_src = C.lit_rgb(Path(source), src_mask)
+    lit_cand = C.lit_rgb(Path(candidate), cand_mask)
+    lit_drift = C.colour_drift(lit_src, lit_cand)
+    lab_s, lab_c = C.srgb_to_lab(lit_src), C.srgb_to_lab(lit_cand)
+    hue_de = float(np.linalg.norm(lab_s[1:] - lab_c[1:]))
+
+    lay = {"lay_iou": None, "lay_iou_source": None, "size_vs_ref": None}
+    if reference is not None and Path(reference).exists():
+        ref = C.garment_evidence(Path(reference), long_side=long_side)
+        ref_area = float(ref["mask"].mean())
+        if ref["mask"].any() and ref_area >= C.CHROMA_MIN_AREA:
+            lay = {"lay_iou": round(float(C.silhouette_iou(ref["mask"],
+                                                           cand_mask)), 4),
+                   "lay_iou_source": round(float(C.silhouette_iou(ref["mask"],
+                                                                  src_mask)), 4),
+                   "size_vs_ref": round(cand_area / ref_area, 3)}
 
     w_src = C.wrinkle_energy(Path(source), src_mask, long_side=long_side)
     w_cand = C.wrinkle_energy(Path(candidate), cand_mask, long_side=long_side)
@@ -128,7 +163,10 @@ def compare(source: Path, candidate: Path, long_side: int = 1024) -> dict:
         "candidate": str(candidate),
         "cue": cue,
         "silhouette_iou": round(float(iou), 4),
+        **lay,
         "colour_de": round(float(drift["de"]), 2),
+        "colour_de_lit": round(float(lit_drift["de"]), 2),
+        "hue_de": round(hue_de, 2),
         "wrinkle_source": round(float(w_src), 4),
         "wrinkle_candidate": round(float(w_cand), 4),
         "wrinkle_ratio": (None if w_src <= 0 else round(float(ratio), 3)),
@@ -143,12 +181,24 @@ def compare(source: Path, candidate: Path, long_side: int = 1024) -> dict:
 
 
 def line(m: dict, name: str | None = None) -> str:
-    """One-line rendering - this is what gets printed under a candidate image."""
+    """One-line rendering - this is what gets printed under a candidate image.
+
+    Lay first, colour second, same-garment IoU last, in the order the pick is
+    meant to weigh them. Without a reference it falls back to the old line.
+    """
     who = name or Path(m["candidate"]).stem
     ratio = "n/a" if m["wrinkle_ratio"] is None else f"{m['wrinkle_ratio']:.2f}"
-    out = (f"{who}  IoU {m['silhouette_iou']:.3f}  "
-           f"dE {m['colour_de']:.1f}  "
-           f"wrinkle x{ratio}")
+    hue = m.get("hue_de")
+    colour = (f"colour dE {m.get('colour_de_lit', m['colour_de']):.1f}"
+              + (f" (hue {hue:.1f})" if hue is not None else ""))
+    if m.get("lay_iou") is not None:
+        out = (f"{who}  LAY {m['lay_iou']:.3f} vs ref "
+               f"(source starts {m['lay_iou_source']:.3f})  "
+               f"size x{m['size_vs_ref']:.2f}  flat x{ratio}  {colour}  "
+               f"same-garment IoU {m['silhouette_iou']:.3f}")
+    else:
+        out = (f"{who}  IoU {m['silhouette_iou']:.3f}  {colour}  "
+               f"wrinkle x{ratio}")
     # Printed only when the two scales disagree enough to mean something. On a
     # normal candidate they track each other and a second pair of numbers on
     # every line is noise; when they part company that IS the finding.
@@ -181,18 +231,27 @@ def main() -> int:
                     help="defaults to <run>/archive/source_clean.jpg")
     ap.add_argument("--candidate", type=Path, action="append", dest="candidates",
                     help="repeatable; omit to take the whole archive")
+    ap.add_argument("--reference", type=Path,
+                    help="the lay reference; defaults to the run's "
+                         "archive/reference_greyscale.jpg. The LAY numbers "
+                         "need it.")
     ap.add_argument("--long-side", type=int, default=1024)
     ap.add_argument("--json", action="store_true", help="machine-readable")
     a = ap.parse_args()
 
+    reference = a.reference
     if a.run:
         arch = a.run / "archive"
         source = a.source or arch / "source_clean.jpg"
         cands = a.candidates or candidates(arch)
+        if reference is None:
+            reference = C.reference_path(a.run)
     else:
         if not a.source or not a.candidates:
             ap.error("give --run, or both --source and --candidate")
         source, cands = a.source, a.candidates
+    if reference is not None and not Path(reference).exists():
+        reference = None
 
     if not Path(source).exists():
         print(f"source not found: {source}", file=sys.stderr)
@@ -208,7 +267,7 @@ def main() -> int:
             failed += 1
             continue
         try:
-            rows.append(compare(Path(source), Path(c), a.long_side))
+            rows.append(compare(Path(source), Path(c), a.long_side, reference))
         except Exception as e:  # noqa: BLE001 - one bad image must not stop the rest
             print(f"  {Path(c).name}: {type(e).__name__}: {e}", file=sys.stderr)
             failed += 1
@@ -218,7 +277,9 @@ def main() -> int:
     else:
         print(f"source {Path(source).name}"
               + (f"  (wrinkle energy {rows[0]['wrinkle_source']:.3f}, "
-                 f"cue {rows[0]['cue']})" if rows else ""))
+                 f"cue {rows[0]['cue']})" if rows else "")
+              + (f"   reference {Path(reference).name}" if reference else
+                 "   no reference - LAY numbers unavailable"))
         for m in rows:
             print("  " + line(m))
     return 0 if rows and not failed else (0 if rows else 1)

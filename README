@@ -47,21 +47,27 @@ segmenting, rewriting the prompt.
 is billed, and the run exits 0. It is how you check a deployment for free.
 
 
-The three numbers
------------------
+The numbers
+-----------
 
     tools/metrics.py --run runs/<stamp>
 
-Silhouette IoU, colour dE76, and wrinkle energy as a candidate/source ratio -
-all against the ORIGINAL source, never a candidate's parent. No model, no
-network, no money.
+In the order the pick weighs them: LAY, the candidate's silhouette against the
+REFERENCE (with where the untouched source starts beside it); size, its share
+of the frame over the reference's; flat, surface energy over the source's,
+below 1 wanted; colour dE off the lit fabric with its hue part alone, which is
+the part to judge because a flat render reads lighter than a creased
+photograph; and same-garment IoU against
+the source, which falls when the lay changes. No model, no network, no money.
 
-They are advice, never a gate. Nothing is blocked, scored or ranked by them.
-They exist for the one failure eyes reliably miss: the generator drawing a NEW
-garment that is already flat instead of re-laying the real one. task/SKILL.md
-carries the measured bands - read those before reading a number, because the
-useful ranges are not the obvious ones (a normal candidate's wrinkle ratio is
-ABOVE 1, not below).
+They are advice, never a gate. Nothing is blocked by them. The eye still owns
+construction: a candidate that hit the lay by inventing a seam is not shippable,
+and the pins-and-labels read on each candidate is where that shows.
+
+The deliverable is judged in that order since 2026-09-02. tools/recolour.py can
+scale a candidate's garment to the source garment's lit-fabric colour and take
+its plate to white (cand_10 becomes cand_10c); it is a manual tool and no run
+calls it.
 
 
 What a run leaves behind
@@ -79,12 +85,13 @@ What a run leaves behind
       reference_match.jpg the garment beside the top candidates and their scores
       archive/
         source_clean.jpg  the segmented source - what fal actually receives
-        reference_greyscale.jpg   the reference, desaturated - image 2
+        reference_greyscale.jpg   the reference, desaturated and re-toned - image 2
         reference_original.jpg    the library asset, colour, untouched
         prompt_sections.json    the editable prompt
         prompt_<hash>.txt       a snapshot per generation
         cand_01.png ...         every attempt
         cand_03s.png            a candidate after segmentation
+        cand_09p.png            the winner after the polish - this ships
         lineage.json      parent, depth, prompt hash and seed per candidate
         notes.json        the model's own note per candidate
         uploads.json      content hash -> fal URL, so nothing uploads twice
@@ -98,10 +105,20 @@ The reference
 Chosen from inputs/reference_library, or supplied with --reference. Passing the
 flag skips the search entirely; its absence is what triggers one.
 
-It is desaturated on the way into the run folder. That is deliberate and it is
-the one thing done TO it: it is a shape and lay reference, never a colour
-target, and sent in colour it gets read as one - the garment comes back wearing
-the reference's tone.
+It is desaturated on the way into the run folder: it is a shape and lay
+reference, never a colour target, and sent in colour it gets read as one - the
+garment comes back wearing the reference's hue.
+
+It is also re-toned, and that is the only other thing done TO it. Greyscale
+strips hue and keeps lightness, and lightness is copied off image 2 just as
+readily - one run put an L* 80 reference in front of an L* 45 garment and every
+candidate came back pale, dE 37 from the product. So the reference garment is
+scaled in linear light until its mean lightness equals the source garment's,
+plate untouched. --no-tone-match leaves it alone. What was measured and what was
+done is under `tone_match` in reference_selection.json, or in run.log when the
+reference came from --reference. Tone also orders the candidates in the search
+(closest tone first, so the pick needs the least correction) but never decides
+whether one qualifies - the threshold is judged on construction alone.
 
     tools/select_reference.py --index       describe the library, once
     tools/select_reference.py --calibrate   where to put the threshold

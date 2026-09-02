@@ -31,6 +31,12 @@ Two things it insists on, both because of how the rest of the harness behaves:
   * GREYSCALE. The reference is a shape and lay reference, never a colour
     target. Sent in colour it is read as one, and the garment comes back wearing
     the reference's tone. --colour opts out.
+  * TONE-MATCHED. Greyscale strips hue and keeps lightness, and lightness is
+    copied just as readily: runs/20260901_222258 put an L* 80 reference in
+    front of an L* 45 garment and every candidate that copied the pose shipped
+    pale, dE 37 from the product. So the reference garment is scaled in linear
+    light until its mean lightness equals the source garment's, plate untouched
+    - common.prepare_reference_image(). --no-tone-match opts out.
   * ONE answer, written down either way. reference_selection.json is produced
     for BOTH outcomes, carrying `match_found`, so a caller that routes on the
     answer has one file that always exists and always answers the same question.
@@ -72,6 +78,7 @@ Image.MAX_IMAGE_PIXELS = None
 
 SMALL = C.REFCACHE / "small"
 ATTRS = C.REFCACHE / "attrs"
+TONE = C.REFCACHE / "tone"
 
 # The one path the harness reads. prepare_reference() writes the same file on
 # the operator-supplied path, so whichever way the reference arrived, image 2 of
@@ -182,6 +189,23 @@ WEIGHTS = {
     "structure": 1.0,
 }
 COLOUR_WEIGHT_DEFAULT = 0.5
+
+# Tone: the MEASURED lightness gap between the two garments, in L*, read off
+# the pixels rather than off the form. Not a field and not part of the
+# threshold. The threshold was calibrated on construction alone, and the
+# reference is re-toned before it is used, so tone can neither make a
+# candidate a match nor stop it being one. What it can do is order the
+# candidates that ARE matches: a reference already close in tone needs a
+# smaller correction and keeps more of its own shading. So it is a penalty on
+# the RANK, in score points: 0 for an equal tone, the full TONE_WEIGHT at
+# TONE_SPAN_L apart or more. 4 points is what a 1.0-weight field is worth on
+# this scale - detail, below every construction field.
+TONE_WEIGHT_DEFAULT = 4.0
+TONE_SPAN_L = 40.0
+# Bump when common.garment_tone() changes what it measures.
+# t2: the statistic moved from the whole-mask mean to the fully lit fabric
+# (common.TONE_LIT_PCT), so every cached tone is a different number.
+TONE_VERSION = "t2"
 
 FIELDS = list(WEIGHTS)
 
@@ -378,13 +402,17 @@ def hex_to_rgb(h: str):
 
 
 def colour_sim(a: str, b: str) -> float:
-    """1.0 for the same colour, falling to 0 at dE76 60. Uses the harness's own
-    Lab conversion so the number means what it means everywhere else."""
+    """Agreement in HUE and saturation only: the a*b* distance between the two
+    reported hexes, 1.0 for the same colour, 0 at 60 apart. Lightness is left
+    out on purpose - it is measured off the pixels and handled as tone, see
+    tone_sim() - and it was what this term used to be wrong about: it scored
+    two greys 35 L* apart as different colours, at a weight too small to
+    matter, and that gap was the one that bled."""
     try:
         import numpy as np
         la = C.srgb_to_lab(np.array(hex_to_rgb(a), dtype=float))
         lb = C.srgb_to_lab(np.array(hex_to_rgb(b), dtype=float))
-        de = float(np.linalg.norm(la - lb))
+        de = float(np.linalg.norm(la[1:] - lb[1:]))
     except Exception:  # noqa: BLE001 - a missing or malformed hex is not fatal
         return 0.5
     return max(0.0, 1.0 - de / 60.0)
@@ -419,7 +447,7 @@ def score(q: dict, c: dict, colour_weight: float) -> tuple[float, dict]:
         max_total += WEIGHTS[f]
     if colour_weight > 0:
         s = colour_sim(q.get("color_hex", ""), c.get("color_hex", ""))
-        parts["colour"] = round(s, 3)
+        parts["hue"] = round(s, 3)
         total += colour_weight * s
         max_total += colour_weight
     if skipped:
@@ -427,6 +455,46 @@ def score(q: dict, c: dict, colour_weight: float) -> tuple[float, dict]:
     if max_total <= 0:
         return 0.0, parts
     return 100.0 * total / max_total, parts
+
+
+def tone_sim(dL: float | None) -> float:
+    """1.0 for an equal tone, falling to 0 at TONE_SPAN_L apart. None - one
+    side could not be measured - is 0.5, real uncertainty, as for a one-sided
+    unknown field."""
+    if dL is None:
+        return 0.5
+    return max(0.0, 1.0 - abs(dL) / TONE_SPAN_L)
+
+
+def rank_score(score: float, dL: float | None, tone_weight: float) -> float:
+    """The order candidates are shown in and chosen from. The threshold is
+    judged on `score`; this can only move a candidate DOWN the list, never
+    across the line."""
+    return score - tone_weight * (1.0 - tone_sim(dL))
+
+
+def tone_cache_path(img: Path) -> Path:
+    key = f"{img.resolve()}|{img.stat().st_mtime_ns}|{TONE_VERSION}"
+    return TONE / f"{hashlib.sha1(key.encode()).hexdigest()}.json"
+
+
+def tone_of(img: Path) -> dict:
+    """common.garment_tone(), cached on path and mtime like the descriptions.
+    It is a second of numpy per image, and a library is measured once."""
+    TONE.mkdir(parents=True, exist_ok=True)
+    cp = tone_cache_path(img)
+    if cp.exists():
+        try:
+            return json.loads(cp.read_text())
+        except (json.JSONDecodeError, OSError):
+            cp.unlink(missing_ok=True)
+    t = C.garment_tone(img)
+    cp.write_text(json.dumps(t))
+    return t
+
+
+def fmt_dL(dL: float | None) -> str:
+    return "  n/a " if dL is None else f"{dL:+5.1f}"
 
 
 # ---------------------------------------------------------------------------
@@ -710,8 +778,12 @@ def construction_terms(text: str | None) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def install(src: Path, dst: Path, greyscale: bool = True,
-            silhouette: bool = False) -> tuple[bool, str]:
-    """Write the winner to dst. Returns (changed, description).
+            silhouette: bool = False,
+            match_to: Path | None = None) -> tuple[bool, str, dict]:
+    """Write the winner to dst. Returns (changed, description, tone record).
+
+    `match_to` is the source photo the reference garment's lightness is moved
+    to - see common.prepare_reference_image(). None leaves the tone alone.
 
     Skips the write when the bytes would be identical, so a re-run does not
     churn the mtime - anything fingerprinting inputs reads an mtime that moved
@@ -727,11 +799,14 @@ def install(src: Path, dst: Path, greyscale: bool = True,
         tmp_outline = dst.with_name(f".{dst.stem}.outline.jpg")
         C.outline_map(src, tmp_outline)
         src = tmp_outline
-    with Image.open(src) as im:
-        out = im.convert("L") if greyscale else im.convert("RGB")
     # Hidden, so a temp file left by a crash is not mistaken for a reference.
     tmp = dst.with_name(f".{dst.stem}.tmp.jpg")
-    out.save(tmp, quality=95, subsampling=0)
+    if silhouette:
+        with Image.open(src) as im:
+            im.convert("L").save(tmp, quality=95, subsampling=0)
+        tone = {"applied": False, "why": "outline map - nothing to re-tone"}
+    else:
+        tone = C.prepare_reference_image(src, tmp, match_to, greyscale=greyscale)
     changed = not (dst.exists() and C.md5(dst) == C.md5(tmp))
     if changed:
         tmp.replace(dst)
@@ -740,7 +815,7 @@ def install(src: Path, dst: Path, greyscale: bool = True,
     if tmp_outline and tmp_outline.exists():
         tmp_outline.unlink()
     with Image.open(dst) as check:
-        return changed, f"{check.width}x{check.height} mode={check.mode}"
+        return changed, f"{check.width}x{check.height} mode={check.mode}", tone
 
 
 # ---------------------------------------------------------------------------
@@ -764,6 +839,9 @@ def calibrate(recs: list[dict], colour_weight: float) -> int:
     before a run depends on it.
 
     Costs nothing after --index: every record is already on disk.
+
+    Tone is not part of this. It never enters the gate - see TONE_WEIGHT_DEFAULT
+    - so the threshold read off here is the one the gate actually uses.
     """
     same: list[float] = []
     diff: list[float] = []
@@ -848,6 +926,19 @@ def main() -> int:
                     help=f"0 ignores colour entirely (default "
                          f"{COLOUR_WEIGHT_DEFAULT}: the winner is desaturated, "
                          f"so colour is a tiebreak, not a driver)")
+    ap.add_argument("--tone-weight", type=float, default=TONE_WEIGHT_DEFAULT,
+                    metavar="POINTS",
+                    help=f"how many score points a candidate loses in the "
+                         f"RANKING for being {TONE_SPAN_L:.0f} L* or more "
+                         f"from the garment's lightness (default "
+                         f"{TONE_WEIGHT_DEFAULT}). Never touches the "
+                         f"threshold. 0 ignores tone in the order.")
+    ap.add_argument("--no-tone-match", action="store_true",
+                    help="install the reference at its own lightness. By "
+                         "default the reference garment is scaled in linear "
+                         "light to the query garment's mean L*, because "
+                         "greyscale removes hue and not tone, and tone is "
+                         "copied off image 2 just as readily.")
     ap.add_argument("--colour", "--color", dest="colour", action="store_true",
                     help="install the reference in colour; the default "
                          "desaturates it so it cannot act as a colour target")
@@ -955,6 +1046,11 @@ def main() -> int:
         return 1
 
     # --- stage B -----------------------------------------------------------
+    # The query's tone is measured off the segmented photo. A raw photo's mask
+    # takes in the bench and the wall, so under --query-raw the number is not
+    # trusted: tone drops out of the ranking and nothing is re-toned.
+    q_tone = ({"found": False, "L": None, "why": "query is unsegmented"}
+              if a.query_raw else tone_of(query))
     ranked: list[dict] = []
     excluded: list[dict] = []
     for r in recs:
@@ -963,29 +1059,43 @@ def main() -> int:
             excluded.append({"file": r.get("_file"), "why": why})
             continue
         s, parts = score(q_attrs, r, a.colour_weight)
-        ranked.append({**r, "score": s, "parts": parts})
-    ranked.sort(key=lambda r: -r["score"])
+        t = tone_of(Path(r["_path"]))
+        dL = (round(t["L"] - q_tone["L"], 1)
+              if t.get("found") and q_tone.get("found") else None)
+        ranked.append({**r, "score": s, "parts": parts, "tone_L": t.get("L"),
+                       "tone_dL": dL, "rank": rank_score(s, dL, a.tone_weight)})
+    # Ordered by rank - score less the tone penalty - so the labels the model
+    # sees, and the default pick, prefer the match that needs least re-toning.
+    ranked.sort(key=lambda r: -r["rank"])
     for i, r in enumerate(ranked):
         r["label"] = chr(ord("A") + i) if i < a.top_k else ""
 
-    print(f"\nstage B: scoring (colour weight {a.colour_weight}, "
-          f"threshold {a.threshold:.0f})")
+    print(f"\nstage B: scoring (colour weight {a.colour_weight}, tone weight "
+          f"{a.tone_weight}, threshold {a.threshold:.0f})")
     print(f"  {len(excluded)} of {len(recs)} disqualified outright"
           + (f" - e.g. {excluded[0]['file']}: {excluded[0]['why']}"
              if excluded else ""))
+    if q_tone.get("found"):
+        print(f"  query garment L* {q_tone['L']:.1f} (grey {q_tone['grey']:.0f}); "
+              f"dL* below is each candidate's garment against it")
+    else:
+        print(f"  query garment tone not measured ({q_tone.get('why')}) - "
+              f"tone is out of the ranking")
     if not ranked:
         print("\nNO REFERENCE - every library image was disqualified. The "
               "library holds nothing of this kind of garment.")
     for i, r in enumerate(ranked[:max(a.top_k, 8)], 1):
         print(f"  {i:>2}. {r['score']:6.1f} "
               f"{'PASS' if r['score'] >= a.threshold else '  - '}  "
-              f"{str(r['_file'])[:48]:<48} {r.get('garment_type', '?')}, "
+              f"dL* {fmt_dL(r['tone_dL'])} -> rank {r['rank']:5.1f}  "
+              f"{str(r['_file'])[:40]:<40} {r.get('garment_type', '?')}, "
               f"{r.get('silhouette', '?')}, {r.get('fabric_finish', '?')}")
 
     # A candidate below the threshold is not a match, so it is not eligible to
-    # win stage C either. Gate before spending the comparison call.
+    # win stage C either. Gate on SCORE before spending the comparison call;
+    # the survivors keep their rank order.
     qualifying = [r for r in ranked if r["score"] >= a.threshold][:a.top_k]
-    best = ranked[0] if ranked else {}
+    best = max(ranked, key=lambda r: r["score"]) if ranked else {}
 
     # --- stage C -----------------------------------------------------------
     verdict = None
@@ -1086,15 +1196,25 @@ def main() -> int:
         "model": model,
         "threshold": a.threshold,
         "colour_weight": a.colour_weight,
+        "tone_weight": a.tone_weight,
+        "query_tone": q_tone,
         "n_qualifying": len(qualifying),
         "model_vetoed": vetoed,
         "model_confidence": (verdict or {}).get("confidence"),
         "source": str(chosen["_path"]) if chosen else None,
         "score": round(chosen["score"], 1) if chosen else None,
         "closest": {"file": best.get("_file"),
-                    "score": round(best["score"], 1) if best else None},
+                    "score": round(best["score"], 1) if best else None,
+                    "dL": best.get("tone_dL")},
         "runner_up": {"file": runner.get("_file"),
-                      "score": round(runner["score"], 1) if runner else None},
+                      "score": round(runner["score"], 1) if runner else None,
+                      "dL": runner.get("tone_dL")},
+        # The pick's tone against the query's, and what was done about it.
+        # `tone_match` is filled in once the file is written.
+        "tone": ({"reference_L": chosen.get("tone_L"),
+                  "query_L": q_tone.get("L"), "dL": chosen.get("tone_dL"),
+                  "rank": round(chosen["rank"], 1)} if chosen else None),
+        "tone_match": None,
         "reason": (verdict or {}).get("reason"),
         "differences": (verdict or {}).get("differences"),
         "construction_risk": bleed,
@@ -1144,13 +1264,22 @@ def main() -> int:
     if a.dry_run:
         print(f"\nDRY RUN - would install {src} -> {dst}"
               + ("" if a.colour else " (greyscale)")
-              + (" (as an outline map)" if a.silhouette else ""))
+              + (" (as an outline map)" if a.silhouette else "")
+              + ("" if (a.colour or a.silhouette or a.no_tone_match
+                        or not q_tone.get("found"))
+                 else f" (garment re-toned to L* {q_tone['L']:.1f})"))
         (run / "reference_selection.json").write_text(
             json.dumps(record, indent=2, default=str))
         return 0
 
-    changed, desc = install(src, dst, greyscale=not a.colour,
-                            silhouette=a.silhouette)
+    changed, desc, tone = install(
+        src, dst, greyscale=not a.colour, silhouette=a.silhouette,
+        match_to=None if (a.no_tone_match or a.query_raw) else query)
+    if a.no_tone_match:
+        tone["why"] = "--no-tone-match"
+    elif a.query_raw and not tone.get("applied"):
+        tone["why"] = "query is unsegmented, its garment tone cannot be trusted"
+    record["tone_match"] = tone
 
     # The library asset, byte for byte, beside the desaturated one. Copied and
     # never converted: the library is read-only as far as this tool is
@@ -1186,6 +1315,15 @@ def main() -> int:
     if record.get("original"):
         print(f"  colour copy  {Path(record['original']).name}  "
               f"(the library asset, unmodified)")
+    if tone.get("applied"):
+        print(f"  tone         garment grey {tone['grey_before']:.0f} -> "
+              f"{tone['grey_after']:.0f}, to match the source's "
+              f"{tone['target_grey']:.0f}  (x{tone['scale']:.3f} in linear "
+              f"light)"
+              + (f"   SHORT by {tone['shortfall']:.0f} levels"
+                 if tone.get("shortfall") else ""))
+    else:
+        print(f"  tone         left alone - {tone.get('why')}")
     if runner:
         print(f"  runner-up    {runner.get('_file')} ({runner['score']:.1f})")
     if record["differences"]:
@@ -1198,6 +1336,8 @@ def main() -> int:
 
     C.log(run, f"reference {src.name[:26]} ({chosen['score']:.0f}/100)"
                + ("" if not a.query_raw else " vs RAW query")
+               + (f", toned {tone['grey_before']:.0f}->{tone['grey_after']:.0f}"
+                  if tone.get("applied") else "")
                + (f", bleed: {','.join(bleed['terms'][:3])}"
                   if bleed["flagged"] else "")
                + (" [outline]" if a.silhouette else ""))

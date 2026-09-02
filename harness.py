@@ -72,7 +72,7 @@ from runlog import trace as TR, stream_subprocess  # noqa: E402
 # each of them is a name that drifts - the harness would pin one file into turn 1
 # while generate.py sent fal a different one.
 from common import (REFERENCE_GREY, REFERENCE_ORIGINAL,  # noqa: E402
-                    reference_path)
+                    prepare_reference_image, reference_path)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -624,8 +624,9 @@ TOOL_SPECS = [
                              "description": "Default true. False sends image 1 "
                                             "alone."},
            "match_pose": {"type": "boolean",
-                          "description": "Take the sleeve angle and cuff spacing "
-                                         "off image 2 instead of from your words. "
+                          "description": "Take the sleeve angle, cuff spacing "
+                                         "and size in frame off image 2 instead "
+                                         "of from your words. "
                                          "Use it when you have already described "
                                          "the pose correctly and the generator "
                                          "ignored you - a sleeve angle is a "
@@ -646,8 +647,8 @@ TOOL_SPECS = [
           "once, on the candidate you have already decided to ship, when the lay "
           "and the construction are right and only creases are left. It is not a "
           "way to fix a bad candidate - a targeted edit cannot re-lay a garment. "
-          "cand_04 becomes cand_04p. The result is measured against the original "
-          "source automatically and warns you if the knit got ironed flat.",
+          "cand_04 becomes cand_04p. The harness runs it for you at the end "
+          "unless the pick is already flat, so you rarely need to.",
           {"candidate": dict(_CANDIDATE,
                              description="The candidate to clean up. Defaults to "
                                          "whatever pick_best last named."),
@@ -660,10 +661,11 @@ TOOL_SPECS = [
           []),
 
     _tool("measure",
-          "Re-read the three free numbers for a candidate against the ORIGINAL "
-          "source: silhouette IoU, colour dE, and wrinkle energy as a ratio. "
-          "They already arrive automatically with each new candidate, so this is "
-          "for after a segmentation pass, or when a reading has scrolled out of "
+          "Re-read the free numbers for a candidate: LAY against the reference "
+          "first, then size vs the reference, flatness, colour dE with its hue "
+          "part, and same-garment IoU against the original source. They "
+          "already arrive automatically with each new candidate, so this is for "
+          "after a segmentation pass, or when a reading has scrolled out of "
           "context. Free.",
           {"candidate": _CANDIDATE}, ["candidate"]),
 
@@ -678,7 +680,8 @@ TOOL_SPECS = [
     _tool("pick_best",
           "Name the candidate you would ship, and why. Call it as often as you "
           "like - the last call wins, and whatever is named when the run ends is "
-          "what gets delivered.",
+          "what gets delivered. Judge the lay first: it tells you when another "
+          "candidate sits closer to the reference than your pick.",
           {"candidate": _CANDIDATE, "why": {"type": "string"}},
           ["candidate", "why"]),
 
@@ -1009,7 +1012,7 @@ class Tools:
         arch = self._archive()
         if name in ("source", "src", "original"):
             return arch / "source_clean.jpg"
-        if re.fullmatch(r"cand_\d+[sp]*", name):
+        if re.fullmatch(r"cand_\d+[spc]*", name):
             return arch / f"{name}.png"
         return None
 
@@ -1125,8 +1128,10 @@ class Tools:
             return f"ERROR: {p.name} does not exist. Known: {self._known()}"
         if not src.exists():
             return f"ERROR: no {src.name} to measure against."
+        ref = reference_path(self.run_dir)
         try:
-            return MET.line(MET.compare(src, p), candidate)
+            return MET.line(MET.compare(src, p, reference=ref if ref.exists()
+                                        else None), candidate)
         except Exception as e:  # noqa: BLE001
             return f"ERROR measuring {candidate}: {type(e).__name__}: {e}"
 
@@ -1145,6 +1150,32 @@ class Tools:
         return (f"noted on {candidate}. This is what stays in the conversation "
                 f"once its image is elided.")
 
+    def _lay_table(self) -> list[tuple[str, float]]:
+        """(name, lay IoU vs the reference) for every candidate on disk, best
+        first. Each file is measured once and cached on its mtime."""
+        import metrics as MET
+        src = self._archive() / "source_clean.jpg"
+        ref = reference_path(self.run_dir)
+        if not src.exists() or not ref.exists():
+            return []
+        cache = self.__dict__.setdefault("_lay_cache", {})
+        rows = []
+        for p in sorted(self._archive().glob("cand_*.png")):
+            if not re.fullmatch(r"cand_\d+[spc]*", p.stem):
+                continue
+            key = (p.stem, p.stat().st_mtime_ns)
+            if key not in cache:
+                try:
+                    m = MET.compare(src, p, reference=ref)
+                    cache[key] = (m.get("lay_iou"), bool(m.get("cue_note")))
+                except Exception:  # noqa: BLE001 - a nudge is not the delivery
+                    cache[key] = (None, True)
+            iou, unreliable = cache[key]
+            if iou is not None and not unreliable:
+                rows.append((p.stem, float(iou)))
+        rows.sort(key=lambda r: -r[1])
+        return rows
+
     def pick_best(self, candidate: str, why: str) -> str:
         p = self._image_path(candidate)
         if p is None:
@@ -1157,8 +1188,26 @@ class Tools:
         f.write_text(json.dumps(
             {"candidate": candidate, "why": why.strip(),
              "at": datetime.now().isoformat(timespec="seconds")}, indent=2) + "\n")
+        # A nudge, not a veto. runs/20260902_100812 shipped a candidate at
+        # 0.892 against the reference while two sat at 0.96, and nothing in the
+        # run said so. Now the pick is told, and asked to name what disqualifies
+        # the closer ones if it is passing them over.
+        note = ""
+        table = self._lay_table()
+        mine = next((v for n, v in table if n == candidate), None)
+        if mine is not None:
+            ahead = [(n, v) for n, v in table
+                     if n != candidate and v >= mine + 0.03]
+            if ahead:
+                top = ", ".join(f"{n} {v:.3f}" for n, v in ahead[:3])
+                note = (f"\n  NOTE: {top} sit closer to the reference's lay "
+                        f"than {candidate} ({mine:.3f}). The lay comes first "
+                        f"and colour second, and a lighter render is not a "
+                        f"different colour. If you are passing those over, say "
+                        f"what disqualifies them - construction, a second "
+                        f"garment, a hanger, a different hue - in a note.")
         return (f"best is now {candidate}. Call pick_best again to change it; "
-                f"whatever is named when the run ends is what ships.")
+                f"whatever is named when the run ends is what ships." + note)
 
     def generate(self, source: str = "source", num: int = 1,
                  resolution: str = "2K", seed: int | None = None,
@@ -1293,12 +1342,18 @@ the prompt - is free and unlimited.
   prompt re-rolls every decision that was already right.
 - Buy small. One or two images, then look at them. A whole budget spent in one
   wave cannot learn anything from itself.
-- The three numbers that arrive under each candidate are advice, not a score.
-  Nothing is blocked or ranked by them. They exist to catch the failure your eyes
-  miss: the generator drawing a NEW garment that is already flat instead of
-  re-laying the real one. Your eyes have the last word in both directions -
-  reject a good-looking redraw, and keep a candidate whose numbers you can see
-  are wrong.
+- The numbers under each candidate are in the order they matter. LAY is the
+  candidate's silhouette against image 2, with where the untouched source
+  starts from beside it - higher is closer, and a candidate that barely moved
+  sits near the source's own number. size is the garment's share of the frame
+  over image 2's; 1.0 is right. flat is surface energy over the source's;
+  below 1 is wanted. colour dE is second-level: a flat render reads lighter
+  than a creased photograph, so read the hue part - under 4 is the same
+  colourway, over 8 is a different one and disqualifies.
+  same-garment IoU is against the source and drops when the lay changes,
+  which is the job. Nothing is blocked by any of them, and your eyes still
+  have the last word on construction: a candidate that hit the lay by
+  inventing a seam or losing the logo is not shippable.
 - Ground every claim in output you actually saw. Never report a number you did
   not measure or a file you did not create.
 - Keep tool output small. Print the few numbers you need, not whole arrays;
@@ -1489,9 +1544,11 @@ class Session:
         for label, p in (("IMAGE 1 - the garment, background already dropped. "
                           "This is what fal.ai receives as image 1.",
                           run_dir / "archive" / "source_clean.jpg"),
-                         ("IMAGE 2 - the reference laydown. Copy how it LIES "
-                          "and nothing else: its construction, trim and tone "
-                          "belong to a different product.",
+                         ("IMAGE 2 - the reference laydown, desaturated and "
+                          "re-toned. THE TARGET: match its silhouette, its "
+                          "flatness and its size in the frame. Its construction "
+                          "and trim belong to a different product. Image 1 is "
+                          "the only colour target.",
                           reference_path(run_dir))):
             b64 = encode_image(p) if p.exists() else None
             if b64:
@@ -1556,11 +1613,13 @@ class Session:
     def _brief(self) -> str:
         arch = self.run_dir / "archive"
         return (
-            "Both images are below. Image 1 is the product and its construction, "
-            "colour and texture must survive exactly. Image 2 shows the target "
-            "lay - square, flat, sleeves symmetric, clean white plate, no "
-            "shadows. Getting image 1 to lie like image 2, without redrawing it, "
-            "is the whole job.\n\n"
+            "Both images are below. Image 2 is the target: its silhouette, its "
+            "flatness and its size in the frame are what a candidate is judged "
+            "on first. Image 1 is the product: its construction - seams, "
+            "pockets, cuffs, labels, logo - must survive exactly, in image 1's "
+            "colour. Colour comes second: a flat render reads lighter than a "
+            "creased photograph and that is not a fault, but a different hue "
+            "is. A candidate with the wrong silhouette is out first.\n\n"
             "THE ONLY TWO PATHS YOU NEED:\n"
             f"  image 1   {arch / 'source_clean.jpg'}\n"
             f"  image 2   {reference_path(self.run_dir)}\n\n"
@@ -2206,10 +2265,11 @@ def load_skill(p: Path) -> tuple[str, str]:
 
 
 DEFAULT_TASK = (
-    "Re-lay the garment in image 1 so it looks like the laydown in image 2: "
-    "square and flat on a clean white plate, wrinkles and handling folds relaxed, "
-    "no odd creases and no shadows - while staying the SAME garment, with its own "
-    "colour, texture, trim and construction untouched.\n\n"
+    "Re-lay the garment in image 1 into the laydown in image 2: the same "
+    "silhouette, ironed completely flat, the same size in the frame, on a clean "
+    "white plate with no shadows. It must still be the SAME product - every "
+    "seam, pocket, cuff, label and logo is image 1's, in image 1's colour. "
+    "Judge candidates on the lay first and on colour second.\n\n"
     "Work iteratively. Look at both images and say what actually differs. Write "
     "the prompt section by section. Buy one or two images, look at what came "
     "back, and decide: change a section and try again from the original, or take "
@@ -2320,8 +2380,10 @@ def prepare_source(run_dir: Path, source: Path, python: str,
     return out, []
 
 
-def prepare_reference(run_dir: Path, reference: Path) -> Path:
-    """Install the operator's reference, desaturated, and keep the colour original.
+def prepare_reference(run_dir: Path, reference: Path,
+                      tone_match: bool = True) -> Path:
+    """Install the operator's reference, desaturated and re-toned, and keep the
+    colour original.
 
     Two files, and the operator's own file is neither of them - it is read, never
     written:
@@ -2329,10 +2391,16 @@ def prepare_reference(run_dir: Path, reference: Path) -> Path:
       archive/reference_greyscale.jpg   what the model is shown as image 2
       archive/reference_original.jpg    the file as supplied, untouched
 
-    Greyscale on purpose, and it is the one thing done TO the reference rather
-    than with it: it is a shape and lay reference, never a colour target, and
-    sent in colour it is read as one. A reference that already arrived greyscale
-    is copied unchanged.
+    Two things are done TO the reference, and they are the only two. Greyscale,
+    because it is a shape and lay reference, never a colour target, and sent in
+    colour it is read as one. And re-toned, because greyscale removes hue and
+    keeps lightness, and lightness is copied off image 2 just as readily -
+    runs/20260901_222258 put an L* 80 reference in front of an L* 45 garment
+    and every candidate shipped pale, dE 37 from the product. The reference
+    garment is scaled in linear light until its mean lightness equals the
+    source garment's, measured on archive/source_clean.jpg; the plate is left
+    alone. Same function as the library path uses, so turn 1 cannot tell which
+    way the reference arrived.
 
     The colour copy exists because the desaturated one cannot answer "what did
     the reference actually look like" - which is the first question asked when a
@@ -2346,17 +2414,23 @@ def prepare_reference(run_dir: Path, reference: Path) -> Path:
     except OSError as e:
         TR.warn("step0", f"could not keep a colour copy of the reference: {e}")
     try:
-        from PIL import Image
-        im = Image.open(reference)
-        im.load()
-        if im.mode == "L":
-            shutil.copy2(reference, out)
-            print(c(DIM, f"  reference {reference.name} (already greyscale)"))
+        match_to = (arch / "source_clean.jpg") if tone_match else None
+        rec = prepare_reference_image(reference, out, match_to)
+        if not tone_match:
+            rec["why"] = "--no-tone-match"
+        if rec.get("applied"):
+            print(c(DIM, f"  reference {reference.name} -> {REFERENCE_GREY}: "
+                         f"desaturated, garment re-toned "
+                         f"{rec['grey_before']:.0f} -> {rec['grey_after']:.0f} "
+                         f"to match image 1 (source {rec['target_grey']:.0f})"
+                         + (f", SHORT by {rec['shortfall']:.0f} levels"
+                            if rec.get("shortfall") else "")
+                         + ". The colour original is kept beside it."))
         else:
-            im.convert("L").save(out, quality=95, subsampling=0)
-            print(c(DIM, f"  reference {reference.name} -> desaturated into "
-                         f"{REFERENCE_GREY}, so it cannot be read as a colour "
-                         f"target. The colour original is kept beside it."))
+            print(c(DIM, f"  reference {reference.name} -> {REFERENCE_GREY}: "
+                         f"desaturated; tone left alone ({rec.get('why')}). "
+                         f"The colour original is kept beside it."))
+        TR.info("step0", "reference prepared", tone=rec)
     except Exception as e:  # noqa: BLE001 - a copy still beats no reference
         TR.warn("step0", f"could not desaturate the reference: {e}")
         shutil.copy2(reference, out)
@@ -2404,6 +2478,8 @@ def select_reference(run_dir: Path, library: Path, python: str,
         argv.append("--no-model-veto")
     if args.reference_silhouette:
         argv.append("--silhouette")
+    if args.no_tone_match:
+        argv.append("--no-tone-match")
 
     rc = stream_subprocess([python, str(HERE / "tools" / "select_reference.py"),
                             *argv], cwd=HERE, comp="reference")
@@ -2500,6 +2576,12 @@ def auto_polish(run_dir: Path, pick: Path, python: str) -> tuple[Path, str]:
     return child, f"de-wrinkled from {pick.stem}"
 
 
+# A pick already this much flatter than the source has nothing left to
+# de-wrinkle: cand_10 of runs/20260902_100812 measured x0.39, and a polish on
+# it is 15 cents spent on a second generative hop over a finished flat.
+ALREADY_FLAT = 0.6
+
+
 def ship_best(run_dir: Path, python: str,
               polish: bool = True) -> tuple[str | None, bool, str]:
     """Write output/best.png. Returns (candidate, chosen_by_harness, note).
@@ -2507,10 +2589,16 @@ def ship_best(run_dir: Path, python: str,
     Runs only when at least one candidate exists, so a run that generated nothing
     ends with an empty output/ and says so, rather than shipping a placeholder
     that a downstream reader would take for a delivery.
+
+    The polish is automatic and is skipped when the pick is already flatter
+    than the source by ALREADY_FLAT. Both files stay on disk - cand_10,
+    cand_10p - and the note says which one went. An automatic recolour ran
+    here for one run (20260902_104708) and was removed at the operator's
+    request; tools/recolour.py remains as a manual tool and no run calls it.
     """
     arch, outdir = run_dir / "archive", run_dir / "output"
     cands = sorted(p for p in arch.glob("cand_*.png")
-                   if re.fullmatch(r"cand_\d+[sp]*", p.stem))
+                   if re.fullmatch(r"cand_\d+[spc]*", p.stem))
     if not cands:
         return None, False, ""
 
@@ -2530,12 +2618,28 @@ def ship_best(run_dir: Path, python: str,
         # is recorded as the harness's choice so nobody reads it as the model's.
         pick, by_harness = cands[-1], True
 
-    note = ""
+    notes = []
     # Skipped when the pick is already a polish - re-polishing a polish is two
-    # generative hops on a cleanup and there is nothing left for it to smooth.
-    if polish and not pick.stem.endswith("p"):
-        print(c(BOLD, "\nfinal step") + c(DIM, "  de-wrinkling the winner"))
-        pick, note = auto_polish(run_dir, pick, python)
+    # generative hops on a cleanup and there is nothing left for it to smooth -
+    # and when the pick is already flat.
+    if polish and not re.search(r"[pc]", pick.stem[5:]):
+        flat = None
+        try:
+            sys.path.insert(0, str(HERE / "tools"))
+            import metrics as MET
+            src = arch / "source_clean.jpg"
+            if src.exists():
+                flat = MET.compare(src, pick).get("wrinkle_ratio")
+        except Exception as e:  # noqa: BLE001 - a check is not the delivery
+            TR.warn("polish", f"could not measure flatness: {e}")
+        if flat is not None and flat < ALREADY_FLAT:
+            notes.append(f"polish skipped: already flatter than the source "
+                         f"(x{flat:.2f}), nothing left to de-wrinkle")
+        else:
+            print(c(BOLD, "\nfinal step") + c(DIM, "  de-wrinkling the winner"))
+            pick, pnote = auto_polish(run_dir, pick, python)
+            notes.append(pnote)
+    note = "; ".join(n for n in notes if n)
 
     outdir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(pick, outdir / "best.png")
@@ -2623,6 +2727,14 @@ def main():
                          "outline "
                          "is built from tone, so a striped or colour-blocked "
                          "reference comes back with its dark bands cut out.")
+    ap.add_argument("--no-tone-match", action="store_true",
+                    help="Leave the reference garment at its own lightness. By "
+                         "default it is scaled in linear light to the source "
+                         "garment's mean L* before turn 1, because greyscale "
+                         "removes hue and not tone, and the generator copies "
+                         "tone off image 2 - one run shipped dE 37 from an "
+                         "L* 80 reference on an L* 45 garment. Applies to both "
+                         "a library pick and --reference.")
     ap.add_argument("--max-images", type=int, default=None, metavar="N",
                     help=f"fal.ai images for the whole run. Default "
                          f"{DEFAULT_BUDGET} (LAYDOWN_MAX_IMAGES). 0 exercises "
@@ -2777,7 +2889,7 @@ def main():
             return 1
         ref_file = Path(selection["source"])
     else:
-        prepare_reference(run_dir, ref_file)
+        prepare_reference(run_dir, ref_file, tone_match=not args.no_tone_match)
 
     approver = Approver(args.yolo)
     sess = Session(task, skill_text, workspace, run_dir, tools, approver,
@@ -2802,6 +2914,13 @@ def main():
             print(c(YEL, f"            bleed risk: "
                          f"{', '.join(risk.get('terms', []))} - named in the "
                          f"opening brief"))
+        tone = selection.get("tone_match") or {}
+        if tone.get("applied"):
+            print(c(DIM, f"            tone: garment re-toned "
+                         f"{tone['grey_before']:.0f} -> {tone['grey_after']:.0f} "
+                         f"to match the source"))
+        else:
+            print(c(YEL, f"            tone: left alone - {tone.get('why')}"))
     else:
         print(c(DIM, f"  reference {ref_file.name}"))
     print(c(DIM, f"  budget    {budget} image(s)"

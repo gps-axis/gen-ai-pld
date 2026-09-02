@@ -44,20 +44,26 @@ SEEDS: tuple[tuple[str, str], ...] = (
      "sleeve and hem treatment, any trim. Names the thing so the model does not "
      "invent a different one."),
     ("fidelity",
-     "What must survive unchanged: colour, knit texture, proportions, and the "
-     "construction exactly as it is, with nothing added, removed or redesigned."),
+     "What must survive: the construction exactly as it is - every seam, "
+     "pocket, waistband, cuff, label and logo - and the colour and pattern. "
+     "Say nothing about keeping creases, folds, texture or proportions: the "
+     "lay, the flatness and the size in the frame come from image 2."),
     ("flatten",
-     "The job. Relax the creases and handling folds so the garment lies flat, "
-     "WITHOUT ironing the fabric's real texture out of existence."),
+     "The job. The garment lies completely flat and smooth, every crease and "
+     "handling fold gone, as in a finished catalogue flat. The fabric still "
+     "reads as its own fabric - fleece, knit, denim - just pressed."),
     ("pose",
-     "How it should sit: square to the frame, hem parallel to the bottom edge, "
-     "sleeves arranged symmetrically, no tilt, whole garment inside the frame."),
+     "How it should sit, read off image 2: square to the frame, hem parallel "
+     "to the bottom edge, sleeves or legs at image 2's angle and spacing, no "
+     "tilt, and the garment the same size in the frame as image 2's, with "
+     "the same margins."),
     ("background",
      "The plate: plain, even white, no shadows, no props, nothing else in "
      "frame."),
     ("reference",
-     "What image 2 is for, in your own words - a layout guide only. Say its "
-     "construction, trim and tone do not belong on this garment."),
+     "What image 2 is for, in your own words - the layout guide. Say it sets "
+     "the lay, the flatness and the size in frame, and that its construction "
+     "and trim do not belong on this garment."),
 )
 
 SEED_ORDER = [name for name, _ in SEEDS]

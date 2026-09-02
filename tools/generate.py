@@ -70,12 +70,12 @@ SYSTEM = (
     "You are a product photography retoucher. You produce catalogue flat lays: "
     "one garment, photographed from directly above, lying flat and square on a "
     "plain white background. "
-    "The first input image is the product. Its construction, colour, pattern, "
-    "texture and proportions are reproduced exactly as they are. "
+    "The first input image is the product. Its construction, colour, pattern "
+    "and markings are reproduced exactly as they are. "
     "Any further input image is a layout guide. It shows how the garment should "
-    "be arranged and it is reference material rather than content: it "
-    "contributes arrangement only, and its own subject stays out of the "
-    "picture you produce. "
+    "be arranged, how flat it lies and how large it sits in the frame, and it "
+    "is reference material rather than content: it contributes arrangement "
+    "only, and its own subject stays out of the picture you produce. "
     "Every image you return is a single photograph of one garment."
 )
 
@@ -85,7 +85,7 @@ SYSTEM = (
 # --------------------------------------------------------------------------
 
 CAND_RE = re.compile(r"^cand_(\d+)$")          # generated - counts against budget
-DERIVED_RE = re.compile(r"^cand_(\d+)[sp]+$")  # segmented / polished - not a buy
+DERIVED_RE = re.compile(r"^cand_(\d+)[spc]+$")  # segmented / polished / recoloured - not a buy
 
 
 def generated(arch: Path) -> list[Path]:
@@ -223,8 +223,9 @@ def pose_clause() -> str:
         "\n\nFor the arrangement only, read the geometry off image 2: place the "
         "sleeves at the same angle away from the body as the sleeves in image 2, "
         "with the cuffs the same distance out from the sides and the hem sitting "
-        "the same way. Geometry only - the garment being photographed is the one "
-        "in image 1.\n")
+        "the same way, and give the garment the same size within the frame and "
+        "the same margins around it. Geometry only - the garment being "
+        "photographed is the one in image 1.\n")
 
 
 def lay_clause(chained: bool) -> str:
@@ -254,7 +255,9 @@ def lay_clause(chained: bool) -> str:
               "",
               "IMAGE 2 IS A LAY REFERENCE ONLY. It shows how the garment should "
               "be ARRANGED - how it lies, how straps or legs are positioned, how "
-              "square and symmetric the lay is. Take NOTHING else from it. Every "
+              "square and symmetric the lay is, how flat and smooth the fabric "
+              "sits, and how large the garment is within the frame. Take "
+              "NOTHING else from it. Every "
               "seam, stitch line, neckline shape, panel, binding, trim and piece "
               "of hardware comes from image 1 and only from image 1. If image 2 "
               "shows construction image 1 does not have, it belongs to a "
@@ -315,7 +318,9 @@ def lay_clause(chained: bool) -> str:
               "symmetrically with each other, each cuff clear of the body and "
               "clear of the hem. Shoulders level, hem level and parallel to the "
               "bottom of the frame, the garment upright and centred with no "
-              "rotation or tilt, the whole garment inside the frame. This is how "
+              "rotation or tilt, the whole garment inside the frame. The fabric "
+              "lies completely flat and smooth, every crease and handling fold "
+              "gone, as a finished catalogue flat does. This is how "
               "the finished flat lies, whatever arrangement the garment happens "
               "to be in when photographed.",
               "",
@@ -324,10 +329,11 @@ def lay_clause(chained: bool) -> str:
               # image 2 as something to reproduce.
               "Any instruction above to keep the garment unchanged, untouched or "
               "exactly as in image 1 refers to its CONSTRUCTION, COLOUR, PATTERN "
-              "and TEXTURE only. It never refers to the pose. Re-laying the "
-              "garment flat and square IS the task, so moving a sleeve, "
-              "straightening a hem or squaring the body is required, not a "
-              "change to be avoided.",
+              "and MARKINGS only. It never refers to the pose, the creases or "
+              "the size in the frame. Re-laying the garment flat and square IS "
+              "the task, so moving a sleeve, straightening a hem, smoothing a "
+              "fold or squaring the body is required, not a change to be "
+              "avoided.",
               "",
               # The flip is not a construction error and no construction clause
               # prevents it: every seam can be correct and the garment still
@@ -625,9 +631,14 @@ def main() -> int:
     rows = []
     if source_clean.exists():
         print()
+        # The lay numbers are against the run's reference whether or not this
+        # wave sent it: the target does not change because one wave went
+        # without it.
+        lay_ref = C.reference_path(run)
         for name in got:
             try:
-                m = M.compare(source_clean, arch / f"{name}.png")
+                m = M.compare(source_clean, arch / f"{name}.png",
+                              reference=lay_ref if lay_ref.exists() else None)
                 m["depth"] = parent_depth + 1
                 rows.append(m)
                 print("  " + M.line(m, name))
