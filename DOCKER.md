@@ -13,10 +13,38 @@ Two images in, one re-laid flat out.
       pld-harness /in/off_set_image.jpg
 
 `out/best.png` is rank 1 of the delivery, with `best_2.png` to `best_4.png`
-beside it and `picks.json` saying who chose each. `out/logs/` gets `steps.log`, `LOG.md`,
-`run.log`, `transcript.jsonl`, the run's `lineage.json`, `prompt_sections.json`,
-`notes.json`, and the two images the model was actually working from
-(`source_clean.jpg`, `reference_greyscale.jpg` and `reference_original.jpg`).
+beside it. `out/result.json` is the receipt, `out/used_prompt.txt` the prompt
+rank 1 was generated with. `out/logs/` gets `steps.log`, `LOG.md`, `run.log`,
+`transcript.jsonl`, the run's `lineage.json`, `prompt_sections.json`,
+`notes.json`, `picks.json`, `metrics.json`, and the two images the model was
+actually working from (`source_clean.jpg`, `reference_greyscale.jpg` and
+`reference_original.jpg`). All of it is written by `tools/deliver.py`, which
+runs by hand too.
+
+## Under the Kestra flows
+
+The flows in `kestra/` were written against the retired pipeline in `old/`, and
+Axis reads their webhook payloads, so the container keeps that contract rather
+than the flows changing. The entrypoint translates:
+
+| the flow sends | what happens |
+|---|---|
+| `--reference-category CAT` | only `<library>/CAT` is searched; a missing or empty folder falls back to the whole library |
+| `--no-reference-select` | the file at `/app/inputs/reference_greyscale.jpg` is the reference, no search |
+| `--task` naming `grade_flats`, `stage_batch` or `--ship` | dropped with a warning; the harness delivers four on its own |
+| `-e OUTPUT_PATTERN=generated_{n}.png` | the ranked picks land in `OUT_DIR` under that name |
+| no `REFERENCE_LIBRARY`, no `/in/reference_library` | `/app/library_reference`, where the flows mount the shared library |
+
+And `deliver.py` writes the files the flows read back: `used_prompt.txt`,
+`result_top_matches.jpg` and `match_results.json` (the reference near-miss strip
+and selection record under their old names, in `OUT_DIR` and in the run
+folder), `output/pickN_cand_XX.png` copies of the picks, and
+`archive/metrics.json` with one row per candidate whose `score` is the lay
+match to the reference as a percentage.
+
+Two things the flows need that the old image did not: `SEGMENT_URL` and
+`SEGMENT_API_KEY` for the segmenter. Without the key the run continues from
+the raw photo and says so in `run.log`.
 
 ## The reference: found, or supplied
 
@@ -197,8 +225,9 @@ Written every run, whatever happened:
   "images_used": 3,
   "budget": 10,
   "attempts": ["cand_01", "cand_02", "cand_03"],
-  "picks": 1,
-  "images": ["best.png"],
+  "picks": 4,
+  "ranked": [{"rank": 1, "candidate": "cand_10", "chosen_by": "model"}, "..."],
+  "images": ["best.png", "best_2.png", "best_3.png", "best_4.png"],
   "reference": null,
   "grades": null
 }

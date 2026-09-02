@@ -7,7 +7,9 @@
 #
 # Build:  docker build -t pld-harness .
 # Run:    see docker-entrypoint.sh, or DOCKER.md
-FROM python:3.10-slim
+# 3.14, because pyproject.toml pins requires-python to 3.14.* and the host venv
+# is 3.14: an image on an older interpreter runs code that was never exercised.
+FROM python:3.14-slim
 
 # ImageMagick is no longer called by anything that ships in this image - the
 # tools that shelled out to `magick`/`montage` are retired to old/. It stays
@@ -21,7 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # The source photos are ~45MP (5464x8192). ImageMagick 7 on trixie already
-# allows 1GiB/256MP, which clears that comfortably - but `python:3.10-slim` is a
+# allows 1GiB/256MP, which clears that comfortably - but `python:*-slim` is a
 # moving tag that shipped ImageMagick 6 on bookworm not long ago, and IM6's
 # Debian policy caps memory at 256MiB, which pushes every operation on an image
 # this size into the disk-backed cache and makes a run crawl for no visible
@@ -84,6 +86,11 @@ COPY tools/ tools/
 COPY task/ task/
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# The path the Kestra flows mount the shared library at. Created empty so a
+# run without the mount searches an empty folder and says so, rather than
+# failing on a path that does not exist.
+RUN mkdir -p /app/library_reference
 
 # The skill used to hardcode the developer's absolute workspace path. It no
 # longer does, and this asserts that rather than assuming it: a path that creeps

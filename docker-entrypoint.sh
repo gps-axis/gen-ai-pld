@@ -19,7 +19,23 @@
 #   * mount a single reference matching /in/reference* (or -e REFERENCE=...) and
 #     no search happens
 #
-# Anything after the image path is passed straight to harness.py.
+# Anything after the image path is passed straight to harness.py, except four
+# things the Kestra flows still send from the retired pipeline, which are
+# translated here so that Axis and its webhook payloads never had to change:
+#
+#   --reference-category CAT    search only <library>/CAT (falls back to the
+#                               whole library when that folder is missing)
+#   --no-reference-select       use the reference the flow dropped at
+#                               /app/inputs/reference_greyscale.jpg; no search
+#   --task "...grade_flats..."  a task naming a retired script is dropped, with
+#                               a warning; the harness has its own default
+#   OUTPUT_PATTERN=generated_{n}.png
+#                               name the ranked picks that way in $OUT_DIR
+#                               instead of best.png, best_2.png ..
+#
+# tools/deliver.py writes everything the flows read after the run: the picks,
+# used_prompt.txt, result_top_matches.jpg, match_results.json, result.json, the
+# pickN_cand_XX.png names in the run's output/ and archive/metrics.json.
 #
 # Exit codes:
 #
@@ -76,6 +92,35 @@ else
     esac
 fi
 
+# --- the retired pipeline's flags, translated -------------------------------
+CATEGORY=""
+NO_SELECT=""
+TASK=""
+HAS_TASK=""
+ARGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --reference-category)   CATEGORY="${2:-}"; shift 2 ;;
+        --reference-category=*) CATEGORY="${1#*=}"; shift ;;
+        --no-reference-select)  NO_SELECT=1; shift ;;
+        --task)                 TASK="${2:-}"; HAS_TASK=1; shift 2 ;;
+        --task=*)               TASK="${1#*=}"; HAS_TASK=1; shift ;;
+        *)                      ARGS+=("$1"); shift ;;
+    esac
+done
+if [ -n "$HAS_TASK" ]; then
+    if [ -z "$TASK" ]; then
+        echo "entrypoint: --task is empty; using the skill's own goal" >&2
+    elif printf '%s' "$TASK" | grep -qiE 'grade_flats|stage_batch|--ship|match_reference'; then
+        echo "entrypoint: --task names a retired tool and is dropped:" >&2
+        echo "  $TASK" >&2
+        echo "  The harness delivers the best four on its own now." >&2
+    else
+        ARGS+=(--task "$TASK")
+    fi
+fi
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
 # --- and what are we laying it out LIKE? ------------------------------------
 #
 # An explicit reference wins outright; otherwise a mounted library is searched.
@@ -83,13 +128,43 @@ fi
 # `-v .../reference_library:/in/reference_library` is not picked up as a single
 # reference file by the `reference*` glob.
 REFERENCE="${REFERENCE:-}"
+if [ -n "$NO_SELECT" ] && [ -z "$REFERENCE" ]; then
+    # The commands flow copies the operator's approved reference here before
+    # calling, then asks for no search.
+    REFERENCE="/app/inputs/reference_greyscale.jpg"
+    [ -f "$REFERENCE" ] || die "--no-reference-select given but $REFERENCE is missing.
+  Copy the reference there first, or pass -e REFERENCE=<file>."
+fi
 if [ -z "$REFERENCE" ]; then
     mapfile -t REFS < <(find "$IN_DIR" -maxdepth 1 -type f -iname 'reference*' \
         ! -name '.*' 2>/dev/null | sort)
     [ ${#REFS[@]} -gt 0 ] && REFERENCE="${REFS[0]}"
 fi
 
-REFERENCE_LIBRARY="${REFERENCE_LIBRARY:-$IN_DIR/reference_library}"
+# The library: -e REFERENCE_LIBRARY, else /in/reference_library, else the path
+# the Kestra flows mount the shared library at.
+if [ -z "${REFERENCE_LIBRARY:-}" ]; then
+    if [ -d "$IN_DIR/reference_library" ]; then
+        REFERENCE_LIBRARY="$IN_DIR/reference_library"
+    else
+        REFERENCE_LIBRARY="/app/library_reference"
+    fi
+fi
+if [ -n "$CATEGORY" ] && [ -z "$REFERENCE" ]; then
+    # Axis already knows the category; searching only its folder is what the
+    # retired matcher did with the same flag. A folder that does not exist or
+    # holds nothing falls back to the whole library rather than to exit 20.
+    SUB="$REFERENCE_LIBRARY/$CATEGORY"
+    SUB_COUNT=$(find "$SUB" -type f \
+        \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' \) \
+        ! -name '.*' 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$SUB_COUNT" -gt 0 ]; then
+        REFERENCE_LIBRARY="$SUB"
+        echo "  category  $CATEGORY -> searching $SUB ($SUB_COUNT images)"
+    else
+        echo "  category  $CATEGORY has no folder or no images under $REFERENCE_LIBRARY; searching the whole library"
+    fi
+fi
 LIB_COUNT=0
 if [ -z "$REFERENCE" ] && [ -d "$REFERENCE_LIBRARY" ]; then
     LIB_COUNT=$(find "$REFERENCE_LIBRARY" -type f \
@@ -175,146 +250,20 @@ RC=$?
 # --- deliver ----------------------------------------------------------------
 #
 # Run unconditionally: a run that failed halfway still leaves a candidate worth
-# looking at, and always leaves the logs that explain what went wrong.
-DELIVER=()
-if [ -e "$RUN_DIR/output/best.png" ]; then
-    cp -p "$RUN_DIR/output/best.png" "$OUT_DIR/${OUTPUT_NAME:-best.png}"
-    DELIVER+=("${OUTPUT_NAME:-best.png}")
-fi
-
-# SHIP_CANDIDATES=1 delivers every attempt beside the winner, so a reviewer can
-# see what was rejected. Named by their run-folder stems, which are stable and
-# already carry the ordering the model generated them in.
-if [ -n "${SHIP_CANDIDATES:-}" ] && [ -d "$RUN_DIR/archive" ]; then
-    for cand in "$RUN_DIR"/archive/cand_*.png; do
-        [ -e "$cand" ] || continue
-        cp -p "$cand" "$OUT_DIR/$(basename "$cand")"
-        DELIVER+=("$(basename "$cand")")
-    done
-fi
-
-# Settled before result.json is written, so the receipt and the exit code cannot
-# disagree. A harness that reported success while nothing reached /out is an
-# entrypoint-level delivery failure and has its own code.
-SHORT=""
-if [ "$RC" -eq 0 ] && [ ${#DELIVER[@]} -eq 0 ]; then
-    SHORT=1
-fi
-
-# `status`, `attempts` and `images_used` come from the transcript rather than
-# being re-derived here: the harness already resolved them, including the
-# coercion that turns finish("done") with nothing generated into no_candidates.
-"$PY" - "$RUN_DIR" "$OUT_DIR" "$LAYDOWN_SESSION" "$RC" "$LAYDOWN_MAX_IMAGES" \
-    > "$OUT_DIR/result.json" <<'PY'
-import json, pathlib, re, sys
-
-run, out = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
-session, rc, budget = sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
-
-status, summary, best = None, "", None
-t = run / "transcript.jsonl"
-if t.exists():
-    for line in t.read_text().splitlines():
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
-        if rec.get("kind") in ("finish", "end"):
-            d = rec.get("data", {})
-            d = d.get("result", d)
-            status = d.get("status", status)
-            summary = d.get("summary", summary) or summary
-            best = d.get("best") or best
-        if rec.get("kind") == "end":
-            best = rec.get("data", {}).get("shipped") or best
-
-attempts = sorted(p.stem for p in (run / "archive").glob("cand_*.png")
-                  if re.fullmatch(r"cand_\d+", p.stem))
-
-# The reference receipt, when the library was searched. Deliberately a summary
-# and not the whole record - the full thing, including every disqualified
-# candidate and the per-field breakdown, stays at reference_selection.json.
-# `null` when the reference was supplied by hand: there was no choice to report.
-reference = None
-sel = run / "reference_selection.json"
-if sel.exists():
-    try:
-        d = json.loads(sel.read_text())
-        reference = {
-            "match_found": d.get("match_found"),
-            "source": d.get("source"),
-            "score": d.get("score"),
-            "threshold": d.get("threshold"),
-            "library_count": d.get("library_count"),
-            "disqualified": len(d.get("disqualified") or []),
-            "closest": d.get("closest"),
-            "model_confidence": d.get("model_confidence"),
-            "model_vetoed": d.get("model_vetoed"),
-            "differences": d.get("differences"),
-            "construction_risk": (d.get("construction_risk") or {}).get("terms"),
-        }
-    except (ValueError, OSError):
-        reference = None
-
-# `outcome` is the field a caller routes on; `exit_code` is for whoever is
-# debugging rather than routing. They are not the same question: "the model
-# judged nothing here shippable" is a real answer that happens to end the run.
-outcome = {
-    "done": "delivered",
-    "budget_exhausted": "delivered_at_budget",
-    "gave_up": "nothing_shippable",
-    "no_candidates": "no_candidates",
-}.get(status, "error" if rc else "delivered")
-
-rec = {
-    "session": session,
-    "outcome": outcome,
-    "exit_code": rc,
-    "status": status,
-    "summary": summary,
-    "best": best,
-    "images_used": len(attempts),
-    "budget": budget,
-    "attempts": attempts,
-    # `picks` is kept, and is 1 or 0: this pipeline delivers one image now, not a
-    # ranked four. A caller that counted picks still counts something true.
-    "picks": 1 if (out / "best.png").exists() else 0,
-    "images": sorted(p.name for p in out.glob("*.png")),
-    # null when the reference was supplied rather than found - see above.
-    "reference": reference,
-    # Retired with the candidate grader. Held as null rather than dropped so a
-    # downstream parser that reads it keeps working.
-    "grades": None,
-}
-print(json.dumps(rec, indent=2, default=str))
-PY
-
-# The text artefacts are the only way to explain a run that shipped nothing, so
-# they come out even when runs/ is not mounted. Every copy is guarded: three of
-# the files this used to take unconditionally belonged to the reference search
-# and no longer exist, and `cp` of a missing file is a non-zero exit inside a
-# script whose whole job is to report the run's own status.
-mkdir -p "$OUT_DIR/logs"
-for f in steps.log LOG.md run.log transcript.jsonl \
-         reference_selection.json reference_match.jpg \
-         archive/lineage.json archive/prompt_sections.json \
-         archive/notes.json archive/best.json archive/seeds.json; do
-    [ -e "$RUN_DIR/$f" ] && cp -p "$RUN_DIR/$f" "$OUT_DIR/logs/"
-done
-# The two images the run was actually about, so a reviewer never has to guess
-# what the model was looking at.
-# reference.jpg is the pre-rename name; both are listed so a run folder from
-# either era delivers its reference rather than silently omitting it.
-for f in source_clean.jpg reference_greyscale.jpg reference_original.jpg \
-         reference.jpg; do
-    [ -e "$RUN_DIR/archive/$f" ] && cp -p "$RUN_DIR/archive/$f" "$OUT_DIR/logs/"
-done
-
+# looking at, and always leaves the logs that explain what went wrong. Every
+# name the flows read - generated_N.png, used_prompt.txt, result_top_matches.jpg,
+# match_results.json, result.json, pickN_cand_XX.png, archive/metrics.json -
+# is written by tools/deliver.py, so the contract lives in one testable place.
+DELIVER_ARGS=(--run "$RUN_DIR" --out "$OUT_DIR" --session "$LAYDOWN_SESSION"
+              --rc "$RC" --budget "$LAYDOWN_MAX_IMAGES")
+[ -n "${OUTPUT_PATTERN:-}" ] && DELIVER_ARGS+=(--pattern "$OUTPUT_PATTERN")
+[ -n "${OUTPUT_NAME:-}" ]    && DELIVER_ARGS+=(--rank1-name "$OUTPUT_NAME")
+[ -n "${SHIP_CANDIDATES:-}" ] && DELIVER_ARGS+=(--ship-candidates)
 echo
-echo "  delivered ${#DELIVER[@]} file(s) to $OUT_DIR"
-echo "  logs      $OUT_DIR/logs"
+"$PY" /app/tools/deliver.py "${DELIVER_ARGS[@]}"
+DRC=$?
 
-if [ -n "$SHORT" ]; then
+if [ "$DRC" -eq 3 ]; then
     echo "entrypoint: the harness exited 0 but nothing reached $OUT_DIR." >&2
     echo "  See $OUT_DIR/logs/steps.log and result.json for what the run did." >&2
     exit 3

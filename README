@@ -64,6 +64,10 @@ They are advice, never a gate. Nothing is blocked by them. The eye still owns
 construction: a candidate that hit the lay by inventing a seam is not shippable,
 and the pins-and-labels read on each candidate is where that shows.
 
+kestra/ holds the two Kestra flows (intake and command queue) that run this
+container in production. They keep the retired pipeline's contract, and
+docker-entrypoint.sh plus tools/deliver.py translate it - see DOCKER.md.
+
 The deliverable is judged in that order since 2026-09-02. tools/recolour.py can
 scale a candidate's garment to the source garment's lit-fabric colour and take
 its plate to white (cand_10 becomes cand_10c); it is a manual tool and no run
