@@ -96,7 +96,10 @@ What a run leaves behind
         notes.json        the model's own note per candidate
         uploads.json      content hash -> fal URL, so nothing uploads twice
       output/
-        best.png          the delivery
+        best.png          rank 1 of the delivery
+        best_2.png ..     ranks 2-4, alternates
+        picks.json        who chose each rank (the model or the harness) and
+                          its numbers
 
 
 The reference

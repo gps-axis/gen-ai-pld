@@ -678,12 +678,20 @@ TOOL_SPECS = [
           ["candidate", "text"]),
 
     _tool("pick_best",
-          "Name the candidate you would ship, and why. Call it as often as you "
-          "like - the last call wins, and whatever is named when the run ends is "
-          "what gets delivered. Judge the lay first: it tells you when another "
-          "candidate sits closer to the reference than your pick.",
-          {"candidate": _CANDIDATE, "why": {"type": "string"}},
-          ["candidate", "why"]),
+          "Name the candidates you would ship, BEST FIRST, up to four, and why. "
+          "The delivery is four ranked files, so keep the list full. Call it as "
+          "often as you like and re-issue the whole list each time - the last "
+          "call wins, and whatever is named when the run ends is what gets "
+          "delivered, with any empty slot filled by the harness from its lay "
+          "ranking. A candidate and its own segmented or polished form count "
+          "once. Judge the lay first: it tells you when a candidate outside "
+          "your list sits closer to the reference than one inside it.",
+          {"candidates": {"type": "array", "items": _CANDIDATE,
+                          "description": "Ranked, best first. Up to four."},
+           "candidate": dict(_CANDIDATE, description="A single name, if you "
+                                                     "only have one."),
+           "why": {"type": "string"}},
+          ["why"]),
 
     _tool("finish",
           "End the run. status: 'done' when the result is good enough; "
@@ -1150,64 +1158,74 @@ class Tools:
         return (f"noted on {candidate}. This is what stays in the conversation "
                 f"once its image is elided.")
 
-    def _lay_table(self) -> list[tuple[str, float]]:
-        """(name, lay IoU vs the reference) for every candidate on disk, best
-        first. Each file is measured once and cached on its mtime."""
-        import metrics as MET
-        src = self._archive() / "source_clean.jpg"
-        ref = reference_path(self.run_dir)
-        if not src.exists() or not ref.exists():
-            return []
-        cache = self.__dict__.setdefault("_lay_cache", {})
-        rows = []
-        for p in sorted(self._archive().glob("cand_*.png")):
-            if not re.fullmatch(r"cand_\d+[spc]*", p.stem):
-                continue
-            key = (p.stem, p.stat().st_mtime_ns)
-            if key not in cache:
-                try:
-                    m = MET.compare(src, p, reference=ref)
-                    cache[key] = (m.get("lay_iou"), bool(m.get("cue_note")))
-                except Exception:  # noqa: BLE001 - a nudge is not the delivery
-                    cache[key] = (None, True)
-            iou, unreliable = cache[key]
-            if iou is not None and not unreliable:
-                rows.append((p.stem, float(iou)))
-        rows.sort(key=lambda r: -r[1])
-        return rows
+    def pick_best(self, candidates: list | None = None, why: str = "",
+                  candidate: str | None = None) -> str:
+        """Record the ranked delivery list. Up to TOP_N, best first.
 
-    def pick_best(self, candidate: str, why: str) -> str:
-        p = self._image_path(candidate)
-        if p is None:
-            return (f"ERROR: '{candidate}' is not a candidate name. "
-                    f"Known: {self._known()}")
-        if not p.exists():
-            return f"ERROR: {p.name} does not exist. Known: {self._known()}"
+        `candidate` is the old single-name form and still works; it is a list
+        of one. Names are deduplicated by generation - cand_03 and cand_03p
+        are the same buy - keeping the first mention, so a list cannot fill
+        two of the four slots with one image.
+        """
+        names: list[str] = []
+        raw = list(candidates or []) + ([candidate] if candidate else [])
+        if not raw:
+            return ("ERROR: name at least one candidate - `candidates` is a "
+                    f"ranked list, best first, up to {TOP_N}. Known: "
+                    f"{self._known()}")
+        seen_gen: set[str] = set()
+        for n in raw:
+            n = str(n).strip()
+            p = self._image_path(n)
+            if p is None:
+                return (f"ERROR: '{n}' is not a candidate name. "
+                        f"Known: {self._known()}")
+            if not p.exists():
+                return f"ERROR: {p.name} does not exist. Known: {self._known()}"
+            gen = generation_of(n)
+            if gen in seen_gen:
+                continue
+            seen_gen.add(gen)
+            names.append(n)
+        dropped = names[TOP_N:]
+        names = names[:TOP_N]
         f = self._archive() / "best.json"
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(json.dumps(
-            {"candidate": candidate, "why": why.strip(),
+            {"candidate": names[0], "candidates": names, "why": why.strip(),
              "at": datetime.now().isoformat(timespec="seconds")}, indent=2) + "\n")
+
         # A nudge, not a veto. runs/20260902_100812 shipped a candidate at
         # 0.892 against the reference while two sat at 0.96, and nothing in the
         # run said so. Now the pick is told, and asked to name what disqualifies
         # the closer ones if it is passing them over.
         note = ""
-        table = self._lay_table()
-        mine = next((v for n, v in table if n == candidate), None)
-        if mine is not None:
+        table = lay_ranking(self.run_dir, self.__dict__.setdefault("_lay_cache", {}))
+        by_name = dict(table)
+        mine = [by_name[n] for n in names if n in by_name]
+        if mine:
+            floor = min(mine)
+            picked_gens = {generation_of(n) for n in names}
             ahead = [(n, v) for n, v in table
-                     if n != candidate and v >= mine + 0.03]
+                     if generation_of(n) not in picked_gens and v >= floor + 0.03]
             if ahead:
                 top = ", ".join(f"{n} {v:.3f}" for n, v in ahead[:3])
                 note = (f"\n  NOTE: {top} sit closer to the reference's lay "
-                        f"than {candidate} ({mine:.3f}). The lay comes first "
-                        f"and colour second, and a lighter render is not a "
-                        f"different colour. If you are passing those over, say "
-                        f"what disqualifies them - construction, a second "
-                        f"garment, a hanger, a different hue - in a note.")
-        return (f"best is now {candidate}. Call pick_best again to change it; "
-                f"whatever is named when the run ends is what ships." + note)
+                        f"than the weakest of your picks ({floor:.3f}). The lay "
+                        f"comes first and colour second, and a lighter render "
+                        f"is not a different colour. If you are passing those "
+                        f"over, say what disqualifies them - construction, a "
+                        f"second garment, a hanger, a different hue - in a note.")
+        if dropped:
+            note += (f"\n  (only the first {TOP_N} are kept; "
+                     f"{', '.join(dropped)} dropped)")
+        empty = TOP_N - len(names)
+        if empty:
+            note += (f"\n  {empty} of {TOP_N} slot(s) still empty - the harness "
+                     f"fills them from its lay ranking at the end unless you do.")
+        return (f"delivery is now {', '.join(names)}. Call pick_best again with "
+                f"the whole list to change it; what is named when the run ends "
+                f"is what ships." + note)
 
     def generate(self, source: str = "source", num: int = 1,
                  resolution: str = "2K", seed: int | None = None,
@@ -1361,8 +1379,11 @@ the prompt - is free and unlimited.
 - write_file is for short files. Anything long - a report - must be written with
   bash and a quoted heredoc, appending section by section. A big string argument
   gets truncated mid-JSON and the whole call is rejected.
-- Call pick_best as soon as you have a candidate worth shipping, and update it as
-  better ones arrive. It is free, and it means an interrupted run still delivers.
+- Call pick_best with your ranked list, best first, as soon as anything is
+  worth shipping, and re-issue the whole list as better ones arrive. The run
+  delivers four files, so keep the list full; a slot you leave empty is filled
+  by the harness from its lay ranking. It is free, and it means an interrupted
+  run still delivers.
 - When the result is good enough, or the images run out, call finish().
 
 You have a limited context window. Candidate images are dropped from the
@@ -1788,10 +1809,11 @@ class Session:
                         f"left, and nothing is marked as best yet. You have "
                         f"{len(self.candidates())} candidate(s) on disk, all "
                         f"already paid for.\n\n"
-                        f"Call pick_best now with whichever one you would defend, "
-                        f"even if none of them is what you wanted - naming the "
-                        f"least bad one and saying what it carries is a delivery; "
-                        f"leaving it unnamed is not. Then finish() with an honest "
+                        f"Call pick_best now with the ones you would defend, "
+                        f"best first, even if none of them is what you wanted - "
+                        f"ranking the least bad and saying what they carry is a "
+                        f"delivery; leaving them unnamed is not. Then finish() "
+                        f"with an honest "
                         f"status: 'done' if it is good enough, "
                         f"'budget_exhausted' if you simply ran out of images, "
                         f"'gave_up' if nothing here is shippable."),
@@ -2275,8 +2297,11 @@ DEFAULT_TASK = (
     "back, and decide: change a section and try again from the original, or take "
     "the best candidate so far and edit that one further. Segmenting a candidate "
     "to clean up its plate is free and available at any point.\n\n"
-    "Mark your best with pick_best as soon as you have one worth shipping, keep "
-    "it updated, and finish when the result is good enough or the images run out."
+    "The delivery is the best FOUR candidates of the run, ranked. Mark them "
+    "with pick_best as soon as you have any worth shipping, best first, and "
+    "re-issue the list as it changes. Once one lay is right, spend the rest of "
+    "the budget on new seeds to collect alternates rather than refining one "
+    "image. Finish when you have four you would defend, or the images run out."
 )
 
 
@@ -2581,78 +2606,172 @@ def auto_polish(run_dir: Path, pick: Path, python: str) -> tuple[Path, str]:
 # it is 15 cents spent on a second generative hop over a finished flat.
 ALREADY_FLAT = 0.6
 
+# How many ranked candidates a run delivers. The operator asked for the best
+# four of each run, whatever they look like, rather than one winner: an
+# alternate that a person can choose between is worth more than a second
+# opinion from the model about which single image to keep.
+TOP_N = 4
 
-def ship_best(run_dir: Path, python: str,
-              polish: bool = True) -> tuple[str | None, bool, str]:
-    """Write output/best.png. Returns (candidate, chosen_by_harness, note).
+
+def generation_of(name: str) -> str:
+    """cand_03, cand_03s and cand_03p are one purchase: 'cand_03'."""
+    m = re.match(r"(cand_\d+)", name or "")
+    return m.group(1) if m else name
+
+
+def lay_ranking(run_dir: Path, cache: dict | None = None) -> list[tuple[str, float]]:
+    """(name, lay IoU vs the reference) for every candidate on disk, best
+    first. Each file is measured once per mtime when a cache dict is given."""
+    sys.path.insert(0, str(HERE / "tools"))
+    import metrics as MET
+    arch = run_dir / "archive"
+    src = arch / "source_clean.jpg"
+    ref = reference_path(run_dir)
+    if not src.exists() or not ref.exists():
+        return []
+    cache = cache if cache is not None else {}
+    rows = []
+    for p in sorted(arch.glob("cand_*.png")):
+        if not re.fullmatch(r"cand_\d+[spc]*", p.stem):
+            continue
+        key = (p.stem, p.stat().st_mtime_ns)
+        if key not in cache:
+            try:
+                m = MET.compare(src, p, reference=ref)
+                cache[key] = (m.get("lay_iou"), bool(m.get("cue_note")), m)
+            except Exception:  # noqa: BLE001 - a ranking is not the delivery
+                cache[key] = (None, True, {})
+        iou, unreliable, _ = cache[key]
+        if iou is not None and not unreliable:
+            rows.append((p.stem, float(iou)))
+    rows.sort(key=lambda r: -r[1])
+    return rows
+
+
+def ship_best(run_dir: Path, python: str, polish: bool = False,
+              top: int = TOP_N) -> tuple[list[str], list[bool], str]:
+    """Write output/best.png and best_2.png .. best_<top>.png, plus picks.json.
+    Returns (candidates in rank order, chosen_by_harness per rank, note).
 
     Runs only when at least one candidate exists, so a run that generated nothing
     ends with an empty output/ and says so, rather than shipping a placeholder
     that a downstream reader would take for a delivery.
 
-    The polish is automatic and is skipped when the pick is already flatter
-    than the source by ALREADY_FLAT. Both files stay on disk - cand_10,
-    cand_10p - and the note says which one went. An automatic recolour ran
-    here for one run (20260902_104708) and was removed at the operator's
-    request; tools/recolour.py remains as a manual tool and no run calls it.
+    The model's ranked list comes first, one slot per generation. Slots it left
+    empty are filled from the harness's own lay ranking - closest silhouette to
+    the reference first - and marked as the harness's choice; with no reference
+    to rank against, newest first. There is no minimum: the operator asked for
+    the best four of whatever the run produced. Fewer than `top` candidates on
+    disk means fewer files, never a duplicate.
+
+    The polish is OFF by default. With `polish`, rank 1 alone is run through
+    tools/polish.py and the polished file ships in its place if it passes the
+    gate; it is skipped when rank 1 is already flatter than the source by
+    ALREADY_FLAT. An automatic recolour ran here for one run (20260902_104708)
+    and was removed at the operator's request; tools/recolour.py remains as a
+    manual tool and no run calls it.
     """
     arch, outdir = run_dir / "archive", run_dir / "output"
     cands = sorted(p for p in arch.glob("cand_*.png")
                    if re.fullmatch(r"cand_\d+[spc]*", p.stem))
     if not cands:
-        return None, False, ""
+        return [], [], ""
 
-    pick, by_harness = None, False
+    ranked: list[Path] = []
+    by_harness: list[bool] = []
+    used: set[str] = set()
+
+    def take(p: Path, harness: bool) -> None:
+        gen = generation_of(p.stem)
+        if gen in used or len(ranked) >= top:
+            return
+        used.add(gen)
+        ranked.append(p)
+        by_harness.append(harness)
+
     bf = arch / "best.json"
     if bf.exists():
         try:
-            name = json.loads(bf.read_text()).get("candidate")
-            cand = arch / f"{name}.png"
-            if cand.exists():
-                pick = cand
-        except (json.JSONDecodeError, OSError):
-            pick = None
-    if pick is None:
-        # Newest by number, which is the model's last attempt and therefore its
-        # most informed one. Not a judgement - just better than nothing, and it
-        # is recorded as the harness's choice so nobody reads it as the model's.
-        pick, by_harness = cands[-1], True
+            rec = json.loads(bf.read_text())
+            names = rec.get("candidates") or ([rec["candidate"]]
+                                             if rec.get("candidate") else [])
+            for n in names:
+                p = arch / f"{n}.png"
+                if p.exists():
+                    take(p, False)
+        except (json.JSONDecodeError, OSError, KeyError):
+            pass
+
+    if len(ranked) < top:
+        cache: dict = {}
+        order = [arch / f"{n}.png" for n, _ in lay_ranking(run_dir, cache)]
+        # Newest first as the fallback, which is the model's last attempt and
+        # therefore its most informed one. Not a judgement - better than
+        # nothing, and recorded as the harness's choice.
+        for p in order + list(reversed(cands)):
+            if p.exists():
+                take(p, True)
 
     notes = []
-    # Skipped when the pick is already a polish - re-polishing a polish is two
-    # generative hops on a cleanup and there is nothing left for it to smooth -
-    # and when the pick is already flat.
-    if polish and not re.search(r"[pc]", pick.stem[5:]):
+    if polish and ranked and not re.search(r"[pc]", ranked[0].stem[5:]):
         flat = None
         try:
             sys.path.insert(0, str(HERE / "tools"))
             import metrics as MET
             src = arch / "source_clean.jpg"
             if src.exists():
-                flat = MET.compare(src, pick).get("wrinkle_ratio")
+                flat = MET.compare(src, ranked[0]).get("wrinkle_ratio")
         except Exception as e:  # noqa: BLE001 - a check is not the delivery
             TR.warn("polish", f"could not measure flatness: {e}")
         if flat is not None and flat < ALREADY_FLAT:
-            notes.append(f"polish skipped: already flatter than the source "
-                         f"(x{flat:.2f}), nothing left to de-wrinkle")
+            notes.append(f"polish skipped: rank 1 already flatter than the "
+                         f"source (x{flat:.2f}), nothing left to de-wrinkle")
         else:
-            print(c(BOLD, "\nfinal step") + c(DIM, "  de-wrinkling the winner"))
-            pick, pnote = auto_polish(run_dir, pick, python)
+            print(c(BOLD, "\nfinal step") + c(DIM, "  de-wrinkling rank 1"))
+            ranked[0], pnote = auto_polish(run_dir, ranked[0], python)
             notes.append(pnote)
+    filled = sum(by_harness)
+    if filled:
+        notes.append(f"{filled} slot(s) filled by the harness from its lay "
+                     f"ranking, not chosen by the model")
+    if len(ranked) < top:
+        notes.append(f"only {len(ranked)} distinct candidate(s) on disk, so "
+                     f"{top - len(ranked)} slot(s) are empty")
     note = "; ".join(n for n in notes if n)
 
     outdir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(pick, outdir / "best.png")
+    for stale in outdir.glob("best*.png"):
+        stale.unlink()
     sys.path.insert(0, str(HERE / "tools"))
+    import common as C
+    import metrics as MET
+    src = arch / "source_clean.jpg"
+    ref = reference_path(run_dir)
+    picks = []
+    for i, p in enumerate(ranked, 1):
+        out = outdir / ("best.png" if i == 1 else f"best_{i}.png")
+        shutil.copy2(p, out)
+        row = {"rank": i, "candidate": p.stem, "file": out.name,
+               "chosen_by": "harness" if by_harness[i - 1] else "model"}
+        try:
+            if src.exists():
+                m = MET.compare(src, p, reference=ref if ref.exists() else None)
+                row.update({k: m.get(k) for k in
+                            ("lay_iou", "size_vs_ref", "wrinkle_ratio",
+                             "colour_de_lit", "hue_de", "silhouette_iou")})
+        except Exception:  # noqa: BLE001 - the file is written either way
+            pass
+        picks.append(row)
+    (outdir / "picks.json").write_text(json.dumps(
+        {"top": top, "picks": picks, "note": note,
+         "at": datetime.now().isoformat(timespec="seconds")}, indent=2) + "\n")
     try:
-        import common as C
-        C.log(run_dir, f"shipped {pick.stem} as best.png"
-                       + (f" ({note})" if note else "")
-                       + (" (chosen by the harness, not the model)"
-                          if by_harness else ""))
-    except Exception:  # noqa: BLE001 - the file is written either way
+        C.log(run_dir, f"shipped {', '.join(p.stem for p in ranked)} as "
+                       f"best.png .. best_{len(ranked)}.png"
+                       + (f" ({note})" if note else ""))
+    except Exception:  # noqa: BLE001 - the files are written either way
         pass
-    return pick.stem, by_harness, note
+    return [p.stem for p in ranked], by_harness, note
 
 
 def exit_code_for(result: dict, budget: int, best_shipped: bool) -> int:
@@ -2754,10 +2873,13 @@ def main():
     ap.add_argument("--no-pre-clean", action="store_true",
                     help="Skip segmentation and send the raw photo, background "
                          "and all.")
-    ap.add_argument("--no-polish", action="store_true",
-                    help="Skip the final de-wrinkle pass. By default the winner "
-                         "is run through openai/gpt-image-2/edit before it ships, "
-                         "and the unpolished file is kept beside it.")
+    ap.add_argument("--polish", action="store_true",
+                    help="Run rank 1 through openai/gpt-image-2/edit before it "
+                         "ships (about 15c). Off by default; the unpolished "
+                         "file is kept beside it either way.")
+    ap.add_argument("--top", type=int, default=TOP_N, metavar="N",
+                    help=f"How many ranked candidates to deliver (default "
+                         f"{TOP_N}): output/best.png, best_2.png ...")
     ap.add_argument("--allow-dirty-source", action="store_true",
                     help=f"Start the agent even when the segmenter returned an "
                          f"image missing most of the garment. Without this the "
@@ -2949,8 +3071,9 @@ def main():
     # Paid-for images are never abandoned - but only if there are any. A run that
     # generated nothing ends with an empty output/ and says so.
     shipped, by_harness, polish_note = ship_best(run_dir, tools.python,
-                                                polish=not args.no_polish)
-    rc = exit_code_for(result, budget, shipped is not None)
+                                                polish=args.polish,
+                                                top=max(1, args.top))
+    rc = exit_code_for(result, budget, bool(shipped))
 
     colour = {"done": GRN, "budget_exhausted": GRN,
               "gave_up": YEL, "no_candidates": YEL}.get(result["status"], RED)
@@ -2965,26 +3088,29 @@ def main():
     if result.get("summary"):
         print("\n" + textwrap.indent(textwrap.fill(result["summary"], 76), "  "))
     if shipped:
-        print(c(GRN, f"\n  best      {shipped} -> {run_dir / 'output' / 'best.png'}"))
+        print()
+        for i, (name, filled) in enumerate(zip(shipped, by_harness), 1):
+            out = "best.png" if i == 1 else f"best_{i}.png"
+            print(c(GRN if i == 1 else DIM, f"  rank {i}    {name:<10} -> "
+                                              f"{run_dir / 'output' / out}")
+                  + (c(YEL, "   filled by the harness, not the model")
+                     if filled else ""))
         if polish_note:
             print(c(DIM, f"            {polish_note}"))
-        if by_harness:
-            print(c(YEL, "  chosen by the harness, not the model - nothing was "
-                         "marked with pick_best, so this is the newest "
-                         "candidate rather than a judgement."))
     else:
         print(c(DIM, "\n  nothing shipped - no candidates were generated."))
     print(c(DIM, f"\n  transcript: {sess.log_path}"))
     if TR.path:
         print(c(DIM, f"  trace:      {TR.path}"))
 
-    sess.log("end", {"result": result, "seconds": dt, "shipped": shipped,
-                     "shipped_by_harness": by_harness, "polish": polish_note,
-                     "exit_code": rc})
+    sess.log("end", {"result": result, "seconds": dt,
+                     "shipped": shipped[0] if shipped else None,
+                     "shipped_all": shipped, "shipped_by_harness": by_harness,
+                     "polish": polish_note, "exit_code": rc})
     TR.info("harness", f"run finished: {result['status']}",
             body=result.get("summary"), seconds=round(dt, 1),
-            images=len(sess.candidates()), budget=budget, shipped=shipped,
-            exit_code=rc)
+            images=len(sess.candidates()), budget=budget,
+            shipped=", ".join(shipped) or None, exit_code=rc)
     return rc
 
 

@@ -12,7 +12,8 @@ Two images in, one re-laid flat out.
       -e LAYDOWN_MAX_IMAGES=10 \
       pld-harness /in/off_set_image.jpg
 
-`out/best.png` is the delivery. `out/logs/` gets `steps.log`, `LOG.md`,
+`out/best.png` is rank 1 of the delivery, with `best_2.png` to `best_4.png`
+beside it and `picks.json` saying who chose each. `out/logs/` gets `steps.log`, `LOG.md`,
 `run.log`, `transcript.jsonl`, the run's `lineage.json`, `prompt_sections.json`,
 `notes.json`, and the two images the model was actually working from
 (`source_clean.jpg`, `reference_greyscale.jpg` and `reference_original.jpg`).

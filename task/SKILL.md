@@ -1,6 +1,6 @@
 ---
 name: laydown
-description: "Re-lay an off-set product photo into the reference laydown: the same silhouette, ironed flat, the same size in the frame, keeping the garment's real construction and colour. Write the prompt yourself, generate with fal.ai, look at what comes back, and iterate until it is right or the images run out."
+description: "Re-lay an off-set product photo into the reference laydown: the same silhouette, ironed flat, the same size in the frame, keeping the garment's real construction and colour. Deliver the best FOUR candidates, ranked. Write the prompt yourself, generate with fal.ai, look at what comes back, and keep the four best until the images run out."
 ---
 
 # Laydown
@@ -29,6 +29,14 @@ Get image 1 into the lay of image 2. **In this order:**
 Image 2 is a **different product**. Its collar, its trim and its pockets are
 not yours. Take the lay, the flatness and the size, and nothing else.
 
+**The delivery is the best FOUR candidates, ranked**, not one. `pick_best`
+takes a list, best first. Four distinct generations - a candidate and its own
+segmented or polished form count once. Once you have one good lay, do not
+keep refining it: spend the rest of the budget on new seeds and collect
+alternates. Whatever looks best in this run ships; there is no minimum, and
+the harness fills any slot you leave empty from its own lay ranking and says
+so.
+
 Why this order is written down: `runs/20260902_100812` shipped a candidate at
 0.892 against the reference silhouette, with good colour, while two candidates
 at 0.96 - flat, sized like the reference - were passed over for being pale.
@@ -44,8 +52,8 @@ There is no fixed order. Every tool is available every turn.
 3. `generate` one or two images. Look at what comes back.
 4. Decide: fix one prompt section and generate again from `source`, or take the
    best candidate and generate from **that** to fix what is left.
-5. `pick_best` as soon as something is worth shipping. Update it as better ones
-   arrive.
+5. `pick_best` with your ranked list as soon as anything is worth shipping.
+   Re-issue the whole list as better ones arrive - the last call wins.
 6. `finish` when it is good enough, or when the images run out.
 
 `segment` works on candidates too - a candidate that came back on a grey or
@@ -299,9 +307,9 @@ the same object at all.
 
 **Specks** is a good tiebreaker when two candidates look alike.
 
-`pick_best` tells you when another candidate sits closer to the reference's lay
-than your pick. If you are passing it over, say what disqualifies it -
-construction, a second garment, a hanger - in a `note`.
+`pick_best` tells you when a candidate outside your list sits closer to the
+reference's lay than one inside it. If you are passing it over, say what
+disqualifies it - construction, a second garment, a hanger - in a `note`.
 
 ## The lay check - read it, it is the one that catches the pose
 
@@ -394,14 +402,14 @@ independent descriptions, and the gap between two descriptions is not a measured
 difference. For a close look at a seam or a cuff, pass a box in source pixels;
 without one the whole frame is squeezed to 1024px and you see nothing of the kind.
 
-## The polish: automatic, at the very end
+## The polish: off unless the operator asks
 
-**You do not need to call this.** After you `finish`, the harness runs the
-winner through a different model - `openai/gpt-image-2/edit` - with a narrow
+The harness does not polish by default. With `--polish` it runs your rank-1
+pick through a different model - `openai/gpt-image-2/edit` - with a narrow
 instruction: take the wrinkles out, change nothing else. `cand_04` becomes
-`cand_04p`, and that is what ships. It is skipped when the pick is already
+`cand_04p`, and that ships as rank 1. It is skipped when the pick is already
 flatter than the source (flat under 0.6), because there is nothing left to
-de-wrinkle.
+de-wrinkle. The other three ranks ship as generated.
 
 It is automatic because it was optional and got skipped: on
 `runs/20260828_104807` the run went `pick_best` → write the log → `finish`, and
@@ -452,9 +460,12 @@ the reference.
 
 ## Finishing
 
-`pick_best` names what ships. Call it early and update it - it costs nothing, and
-it means a run that gets cut off still delivers something you chose rather than
-whatever happened to be last.
+`pick_best` names what ships: up to four, best first. Call it early and
+re-issue the list as it changes - it costs nothing, and it means a run that gets
+cut off still delivers what you chose rather than whatever happened to be last.
+The four land in `output/` as `best.png`, `best_2.png`, `best_3.png` and
+`best_4.png`, with `picks.json` beside them saying which were yours and which
+the harness filled in.
 
 Then `finish` with an honest status:
 
