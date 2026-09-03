@@ -11,6 +11,16 @@ without redrawing the garment.
              --reference inputs/reference_greyscale.jpg \
              --max-images 6 --yolo      # ...or supplied, which skips the search
 
+    ./run.sh --source inputs/IMG_4281.HEIC --max-images 10 --yolo \
+             --task "..."               # the photo as the phone saved it; the
+                                        # run decodes it to archive/source_original.jpg
+
+    ./run.sh --style 853417012 --source inputs/IMG_4281.HEIC \
+             --max-images 10 --yolo     # the whole job: DAM sign-in if the saved
+                                        # one has lapsed, that style's laydown shots
+                                        # into inputs/reference_library/853417/, HEIC
+                                        # decoded, harness run against those shots
+
     ./run.sh --max-images 0 --yolo      # runs the whole loop, bills nothing
 
 

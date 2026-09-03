@@ -72,6 +72,7 @@ from runlog import trace as TR, stream_subprocess  # noqa: E402
 # each of them is a name that drifts - the harness would pin one file into turn 1
 # while generate.py sent fal a different one.
 from common import (REFERENCE_GREY, REFERENCE_ORIGINAL,  # noqa: E402
+                    SOURCE_ORIGINAL, heif_to_jpeg, is_heif,
                     prepare_reference_image, reference_path)
 
 # ---------------------------------------------------------------------------
@@ -2353,6 +2354,35 @@ def preflight() -> tuple[str, int]:
         )
 
 
+def stage_jpeg(path: Path, out: Path, what: str) -> Path:
+    """The path the run should read `what` from: `path` itself when the tools
+    can already open it, or a JPEG decoded from it into the run folder when it
+    is a HEIC straight off the phone.
+
+    This is what lets one command take the photo as the phone saved it. Before
+    it, the operator ran scripts/heic_to_jpg.py by hand, from the right folder,
+    to the right name, and then ran the harness - two commands whose only
+    coupling was memory. The operator's file is read, never written.
+    """
+    if not is_heif(path):
+        return path
+    try:
+        heif_to_jpeg(path, out)
+    except ImportError:
+        raise SystemExit(f"{path.name} is a HEIC and pillow_heif is not "
+                         f"installed in {sys.executable}. Either "
+                         f"`pip install pillow-heif` there, or convert it "
+                         f"first: scripts/heic_to_jpg.py {path}") from None
+    except Exception as e:  # noqa: BLE001 - nothing to run against otherwise
+        raise SystemExit(f"could not decode {what} {path}: "
+                         f"{type(e).__name__}: {e}") from None
+    print(c(DIM, f"  {what:<9} {path.name} -> archive/{out.name}: HEIC decoded "
+                 f"to JPEG"))
+    TR.info("step0", f"{what} decoded from HEIC", supplied=str(path),
+            jpeg=str(out))
+    return out
+
+
 def prepare_source(run_dir: Path, source: Path, python: str,
                    skip: bool) -> tuple[Path, list[str]]:
     """Segment the off-set photo into archive/source_clean.jpg.
@@ -2431,8 +2461,12 @@ def prepare_reference(run_dir: Path, reference: Path,
     arch = run_dir / "archive"
     arch.mkdir(parents=True, exist_ok=True)
     out = arch / REFERENCE_GREY
+    original = arch / REFERENCE_ORIGINAL
     try:
-        shutil.copy2(reference, arch / REFERENCE_ORIGINAL)
+        # A HEIC reference was decoded straight into this slot by stage_jpeg(),
+        # in which case the colour original is already in place.
+        if reference.resolve() != original.resolve():
+            shutil.copy2(reference, original)
     except OSError as e:
         TR.warn("step0", f"could not keep a colour copy of the reference: {e}")
     try:
@@ -3236,6 +3270,15 @@ def main():
     run_dir = workspace / "runs" / stamp
     (run_dir / "archive").mkdir(parents=True, exist_ok=True)
 
+    # A HEIC off the phone is decoded here, once, into the run folder. From this
+    # line on `source` and `ref_file` are files every tool can open; args.source
+    # stays what the operator typed, for the log.
+    source = stage_jpeg(args.source, run_dir / "archive" / SOURCE_ORIGINAL,
+                        "source")
+    if ref_file is not None:
+        ref_file = stage_jpeg(ref_file, run_dir / "archive" / REFERENCE_ORIGINAL,
+                              "reference")
+
     # Attached before preflight, not after: a run that dies because the server is
     # unreachable is exactly the one someone wants a trace of.
     if TR.enabled:
@@ -3243,7 +3286,8 @@ def main():
             "session": stamp,
             "argv": " ".join(sys.argv[1:]),
             "workspace": workspace,
-            "source": args.source,
+            "source": args.source if source == args.source
+                      else f"{args.source} -> {source}",
             "reference": ref_file or f"(search {ref_library})",
             "budget": budget,
             "skill": skill_path or "(none)",
@@ -3255,12 +3299,12 @@ def main():
     model, n_ctx = preflight()
 
     tools = Tools(workspace, run_dir, args.allow_outside,
-                  source_photo=args.source)
+                  source_photo=source)
     TR.info("harness", "child interpreter for the tools", python=tools.python)
 
     # Step 0, before the Session is built: turn 1 puts both images into the
     # conversation, so they have to exist on disk by then.
-    clean, gate_fails = prepare_source(run_dir, args.source, tools.python,
+    clean, gate_fails = prepare_source(run_dir, source, tools.python,
                                        args.no_pre_clean)
     if gate_fails and not args.allow_dirty_source:
         print(c(RED, "\nsegmentation gate FAILED - the result is not the same "
@@ -3358,7 +3402,8 @@ def main():
     print(c(DIM, f"  run       {run_dir}"))
     print(c(DIM, f"  approval  {'OFF (--yolo)' if args.yolo else 'on'}"))
     sess.log("start", {"task": task, "model": model, "budget": budget,
-                       "source": str(args.source),
+                       "source": str(source),
+                       "source_supplied": str(args.source),
                        "reference": str(ref_file),
                        "reference_selection": selection or None})
 

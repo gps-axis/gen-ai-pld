@@ -46,6 +46,11 @@ REFCACHE = ROOT / ".cache" / "refmatch"
 REFERENCE_GREY = "reference_greyscale.jpg"
 REFERENCE_ORIGINAL = "reference_original.jpg"
 
+# The source photo as it was handed over, in a form the tools can read. Only
+# written when the operator's file needed decoding first (a HEIC straight off
+# the phone); a JPEG source is read in place, as it always was.
+SOURCE_ORIGINAL = "source_original.jpg"
+
 # What this file used to be called. Read-only compatibility: runs/ holds folders
 # from before the rename and make_contact_sheet.py builds its report over all of
 # them, so a reader that only knew the new name would show those runs as having
@@ -66,6 +71,53 @@ def reference_path(run_dir: Path) -> Path:
         return new
     old = arch / REFERENCE_LEGACY
     return old if old.exists() else new
+
+
+# iPhone photos arrive as HEIC, and nothing downstream can read one: segment.py
+# posts the bytes labelled image/jpeg, the tools open images with a bare Pillow
+# that has no HEIF opener, and fal is handed the file as-is. So a HEIC is
+# decoded once, before step 0, into the run folder - never over the operator's
+# file - and everything after that only ever sees JPEGs.
+HEIF_BRANDS = {b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"}
+
+
+def is_heif(path: Path) -> bool:
+    """Is this a HEIC/HEIF file, whatever it happens to be called?
+
+    The name alone is not trusted: docker-entrypoint.sh stages whatever it was
+    handed as off_set_image.jpg, so a phone photo can arrive wearing a .jpg
+    suffix. An ISO-BMFF file opens with a box size, 'ftyp', then the brand.
+    """
+    p = Path(path)
+    if p.suffix.lower() in {".heic", ".heif", ".hif"}:
+        return True
+    try:
+        with open(p, "rb") as f:
+            head = f.read(12)
+    except OSError:
+        return False
+    return len(head) >= 12 and head[4:8] == b"ftyp" and head[8:12] in HEIF_BRANDS
+
+
+def heif_to_jpeg(src: Path, dst: Path, quality: int = 100) -> Path:
+    """Decode a HEIC/HEIF into a JPEG at `dst` and return `dst`.
+
+    EXIF rotation is baked into the pixels (a phone stores the sensor's frame
+    plus a rotate tag, and not every reader honours the tag), the ICC profile
+    travels with it (iPhone shots are Display P3), and chroma subsampling is
+    off, because the segmenter's mask edges and every measurement start here.
+    """
+    import pillow_heif  # imported here so the tools stay free of it
+    from PIL import ImageOps
+    pillow_heif.register_heif_opener()
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(src) as im:
+        im = ImageOps.exif_transpose(im)
+        icc = im.info.get("icc_profile")
+        im.convert("RGB").save(dst, "JPEG", quality=quality, icc_profile=icc,
+                               subsampling=0)
+    return dst
 
 # nano-banana-pro/edit at 4K is $0.30/image; 1K and 2K are both $0.15. Published
 # rates - fal exposes no billing API, so a reported cost is never a receipt.

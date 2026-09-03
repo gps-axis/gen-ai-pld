@@ -5,26 +5,22 @@ Usage:
     python scripts/heic_to_jpg.py inputs/IMG_4249.HEIC out.jpg -q 100
     python scripts/heic_to_jpg.py inputs/            # batch a folder
 
+You do not need this before a run any more: ./run.sh --source photo.HEIC
+decodes the file itself, into the run folder. This stays for making a JPEG
+you want to keep - a library image, or a source to hand to someone else.
+
+The conversion itself lives in tools/common.py (heif_to_jpeg), so the harness
+and this script cannot produce two different JPEGs from the same photo.
+
 Requires: pip install pillow-heif
 """
 
 import argparse
+import sys
 from pathlib import Path
 
-from PIL import Image, ImageOps
-import pillow_heif
-
-# Adds HEIC/HEIF support to Pillow
-pillow_heif.register_heif_opener()
-
-
-def heic_to_jpg(input_path, output_path, quality=95):
-    im = Image.open(input_path)          # open the HEIC
-    im = ImageOps.exif_transpose(im)     # bake EXIF rotation into pixels
-    icc = im.info.get("icc_profile")     # iPhone shots are Display P3, keep the profile
-    im = im.convert("RGB")               # JPEG needs RGB (no alpha, etc.)
-    im.save(output_path, "JPEG", quality=quality, icc_profile=icc, subsampling=0)
-    return output_path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+from common import heif_to_jpeg  # noqa: E402
 
 
 def main():
@@ -42,11 +38,11 @@ def main():
             print(f"no HEIC files in {args.src}")
             return
         for f in files:
-            out = heic_to_jpg(f, f.with_suffix(".jpg"), args.quality)
+            out = heif_to_jpeg(f, f.with_suffix(".jpg"), args.quality)
             print(f"{f.name} -> {out.name}")
     else:
         out = args.dst or args.src.with_suffix(".jpg")
-        heic_to_jpg(args.src, out, args.quality)
+        heif_to_jpeg(args.src, out, args.quality)
         print(f"{args.src.name} -> {Path(out).name}")
 
 

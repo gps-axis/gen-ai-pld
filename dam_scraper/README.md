@@ -8,6 +8,14 @@ From the repository root:
 ./setup.sh
 ```
 
+## One command
+
+From the repository root, `./run.sh --style 853417012 ...` does everything
+below in order - checks the saved sign-in and prompts for one when it has
+lapsed, downloads the style's shots into `inputs/reference_library/853417/`,
+and runs the harness against them. The commands that follow are the same steps
+run one at a time.
+
 ## Sign in
 
 ```bash

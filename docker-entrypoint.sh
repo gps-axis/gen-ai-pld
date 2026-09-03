@@ -79,10 +79,11 @@ else
     # named reference* is the OTHER input rather than a candidate for this one.
     mapfile -t FOUND < <(find "$IN_DIR" -maxdepth 1 -type f \
         \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \
-           -o -iname '*.tif' -o -iname '*.tiff' -o -iname '*.webp' \) \
+           -o -iname '*.tif' -o -iname '*.tiff' -o -iname '*.webp' \
+           -o -iname '*.heic' -o -iname '*.heif' \) \
         ! -name '.*' ! -iname 'reference*' | sort)
     case ${#FOUND[@]} in
-        0) die "no garment image found in $IN_DIR (looked for jpg/png/tif/webp,
+        0) die "no garment image found in $IN_DIR (looked for jpg/png/tif/webp/heic,
   ignoring anything named reference*)." ;;
         1) INPUT="${FOUND[0]}" ;;
         *) printf 'entrypoint: %d images in %s - name the one you want:\n' \
