@@ -20,6 +20,11 @@ service, not object removal. Anything still attached to the garment survives
 into the upload, which is why describe.py lists those items under TO REMOVE and
 generate.py asks for them in the prompt. Background is solved here; attached
 props are solved in words.
+
+The one thing it does repair is the bite a clip hanger leaves: the segmenter
+cuts the clip out with a square of waistband, and the generator draws a tab
+where the notch is. Those notches are closed with fabric from either side
+before the file is written - see common.close_top_bites().
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 import common as C
@@ -156,14 +162,27 @@ def main() -> int:
     im = Image.open(raw).convert("RGB")
     if max(im.size) > a.long_side:
         im.thumbnail((a.long_side, a.long_side), Image.LANCZOS)
+    bites = []
+    try:
+        arr, bites = C.close_top_bites(np.asarray(im))
+        if bites:
+            im = Image.fromarray(arr)
+    except Exception as e:  # noqa: BLE001 - a repair must never cost the cutout
+        print(f"             bite repair skipped: {type(e).__name__}: {e}")
     im.save(out, quality=95, subsampling=0)
     raw.unlink(missing_ok=True)
     print(f"             -> {out.name}  {im.width}x{im.height}  "
           f"{out.stat().st_size/1e6:.1f} MB  ({why})")
+    if bites:
+        sizes = ", ".join(f"{b['width']}x{b['depth']}px" for b in bites)
+        print(f"             closed {len(bites)} clip bite(s) in the top edge "
+              f"({sizes}) with fabric from either side, so the generator "
+              f"sees an unbroken waistband instead of a notch to copy.")
     print("             background dropped to white. A hang tag, ticket, pin "
           "or clip ON the garment is NOT removed by this step - look at the "
           "result, and ask for anything you can still see in the prompt.")
-    C.log(run, f"segmented {a.off_set.name}, background dropped")
+    C.log(run, f"segmented {a.off_set.name}, background dropped"
+               + (f", {len(bites)} clip bite(s) closed" if bites else ""))
     return 0
 
 

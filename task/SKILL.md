@@ -30,8 +30,9 @@ Image 2 is a **different product**. Its collar, its trim and its pockets are
 not yours. Take the lay, the flatness and the size, and nothing else.
 
 **The delivery is the best FOUR candidates, ranked**, not one. `pick_best`
-takes a list, best first. Four distinct generations - a candidate and its own
-segmented or polished form count once. Once you have one good lay, do not
+takes a list, best first, and only UNTOUCHED generations - `cand_NN` exactly
+as fal.ai returned it. A segmented or polished form is refused; generate from
+it and name what comes back. Once you have one good lay, do not
 keep refining it: spend the rest of the budget on new seeds and collect
 alternates. Whatever looks best in this run ships; there is no minimum, and
 the harness fills any slot you leave empty from its own lay ranking and says
@@ -56,9 +57,13 @@ There is no fixed order. Every tool is available every turn.
    Re-issue the whole list as better ones arrive - the last call wins.
 6. `finish` when it is good enough, or when the images run out.
 
-`segment` works on candidates too - a candidate that came back on a grey or
-speckled plate can be cleaned for free, and the cleaned form (`cand_03s`) is a
-name every other tool accepts.
+`segment` works on candidates too, and the result (`cand_03s`) is a name every
+other tool accepts - but it is a CUTOUT: the garment on flat white, the plate
+and its shadow gone. Measure it, or generate from it so a plate comes back. `pick_best`
+refuses it: a cutout shipped as `best.png` on `runs/20260902_233202`, before
+the refusal, and was rejected for exactly that look. A candidate that came back with a hanger
+hook or a dirty plate is a bad draw: name a clean sibling, or generate from
+the cutout.
 
 **What `segment` can and cannot rescue.** It drops the BACKGROUND: a grey plate,
 a soft shadow, specks. It does not choose between things standing on that
@@ -402,61 +407,13 @@ independent descriptions, and the gap between two descriptions is not a measured
 difference. For a close look at a seam or a cuff, pass a box in source pixels;
 without one the whole frame is squeezed to 1024px and you see nothing of the kind.
 
-## The polish: off unless the operator asks
+## What ships: untouched generations only
 
-The harness does not polish by default. With `--polish` it runs your rank-1
-pick through a different model - `openai/gpt-image-2/edit` - with a narrow
-instruction: take the wrinkles out, change nothing else. `cand_04` becomes
-`cand_04p`, and that ships as rank 1. It is skipped when the pick is already
-flatter than the source (flat under 0.6), because there is nothing left to
-de-wrinkle. The other three ranks ship as generated.
-
-It is automatic because it was optional and got skipped: on
-`runs/20260828_104807` the run went `pick_best` → write the log → `finish`, and
-the cleanup never happened. Anything that has to happen every time belongs in the
-harness, not in this page.
-
-**What that means for you: mark the right winner.** `pick_best` decides what gets
-polished, so the pose, the construction and the colour all have to be right
-before you finish. The polish cannot fix a bad pose, cannot remove a second
-garment, and will not rescue a weak candidate.
-
-The `polish` tool is still available if you want to see the result *before*
-finishing, or to pass a different instruction:
-
-```
-polish(candidate="cand_04")
-```
-
-If you do, the harness will not run it a second time on an already-polished pick.
-
-**It is judged against its PARENT, not against the original source** - the only
-place in this project where that is right. Everywhere else the question is "is
-this still the same garment as the photograph". Here the instruction was narrower
-- "identical to `cand_04` except the wrinkles" - so the parent is the contract,
-and measuring against the source would mix up what the generation changed with
-what the polish changed.
-
-It prints that comparison and **refuses to ship the polish** on three
-unambiguous failures, delivering the unpolished parent instead and saying why:
-
-- **knit painted out** - the fine texture fell much faster than the creases, so
-  the pass smoothed the fabric itself rather than the folds in it.
-- **colour shifted** - dE over 3 against the parent.
-- **re-framed** - the garment now covers a very different share of the frame.
-
-A polish that irons the garment completely flat is noted and shipped: flat is
-the job.
-
-Shape and scale are **reported, not enforced**. Three polishes measured so far:
-two at IoU ~0.834 where the sleeves and the framing had visibly moved, and one at
-**IoU 0.994, scale 1.00x, texture 0.90** that changed nothing but the creases.
-So a clean polish holds the outline almost exactly, and a reading in the 0.8s is
-real drift - but three is not a calibration, so it is left to the eye.
-
-The parent is untouched on disk in every case. **Look at the two side by side** -
-a cleanup that also changed the pose reads better on its own and worse against
-the reference.
+The four delivered files are `cand_NN` exactly as fal.ai returned them. There
+is no polish pass and no recolour pass, and `pick_best` refuses a segmented or
+polished name. A cutout (`cand_03s`) is for measuring or for generating from;
+if a candidate needs its plate cleaned, generate from its cutout and deliver
+what comes back.
 
 ## Finishing
 

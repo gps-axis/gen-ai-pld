@@ -922,8 +922,14 @@ def main() -> int:
                          f"(default {DEFAULT_THRESHOLD:.0f}). PROVISIONAL - it "
                          f"is not measured against your library. Run "
                          f"--calibrate and set it from the numbers.")
-    ap.add_argument("--top-k", type=int, default=5,
-                    help="how many survivors go to the model in stage C")
+    # 3 because the endpoint takes at most four images in one request and
+    # stage C sends the query plus one per survivor. Past that the multi call
+    # 400s and the search falls back to the composite sheet, where each
+    # candidate arrives at a fraction of the resolution. harness.py passes its
+    # own --reference-top-k explicitly on every run, and that one wins.
+    ap.add_argument("--top-k", type=int, default=3,
+                    help="how many survivors go to the model in stage C "
+                         "(default 3, the endpoint's limit beside the query)")
     ap.add_argument("--colour-weight", "--color-weight", dest="colour_weight",
                     type=float, default=COLOUR_WEIGHT_DEFAULT,
                     help=f"0 ignores colour entirely (default "

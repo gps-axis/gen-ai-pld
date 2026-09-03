@@ -419,13 +419,20 @@ def wait_for_server() -> bool:
 
 
 def call_model(messages, tools=None, max_tokens=MAX_TOKENS, temperature=TEMPERATURE,
-               retries=2) -> dict:
+               retries=2, think=True) -> dict:
     """One chat completion, with the reasoning-model truncation trap handled.
 
     A reasoning model spends tokens on `reasoning_content` before writing any
     `content`. If the budget runs out mid-thought the reply is
     content="" / finish_reason="length" - not an error, just a starved turn.
     Retry once with a bigger budget rather than surfacing an empty answer.
+
+    `think=False` switches the chain off for this one call. vLLM's Qwen chat
+    template honours `enable_thinking`; a server that does not know the key
+    ignores it and reasons as usual. For a form-filling question with a fixed
+    answer shape the chain is ~8x the latency for the same answer (measured in
+    stage C of tools/select_reference.py); for an open judgement it is what
+    makes the answer worth having, so the agent's own turns keep it on.
     """
     payload = {
         "model": MODEL,
@@ -433,6 +440,8 @@ def call_model(messages, tools=None, max_tokens=MAX_TOKENS, temperature=TEMPERAT
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
+    if not think:
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
@@ -567,12 +576,13 @@ TOOL_SPECS = [
           ["path_a", "path_b", "question"]),
 
     _tool("segment",
-          "Drop the background and stand the garment on a white plate. Works on "
-          "the source AND on any candidate you have generated, so a candidate "
-          "that came back on a grey or dirty plate can be cleaned and then "
-          "generated from. Free. It chooses where the result goes: cand_03 "
-          "becomes cand_03s, which is a name every other tool accepts. It does "
-          "NOT remove tags, pins or clips - only the background.",
+          "Drop the background and stand the garment on flat white. Works on "
+          "the source AND on any candidate you have generated. Free. The result "
+          "is a CUTOUT - no plate, no shadow - so it is a thing to measure or "
+          "to generate from, never a thing to deliver. It chooses where the "
+          "result goes: cand_03 becomes cand_03s, which is a name every other "
+          "tool accepts. It does NOT remove tags, pins or clips - only the "
+          "background.",
           {"image": _CANDIDATE}, ["image"]),
 
     _tool("prompt_show",
@@ -640,26 +650,6 @@ TOOL_SPECS = [
                                     "Recorded."}},
           []),
 
-    _tool("polish",
-          "THE LAST STEP, and it costs money. Runs a DIFFERENT model "
-          "(openai/gpt-image-2/edit) over one finished candidate with a narrow "
-          "instruction: take the wrinkles out and change nothing else. Use it "
-          "once, on the candidate you have already decided to ship, when the lay "
-          "and the construction are right and only creases are left. It is not a "
-          "way to fix a bad candidate - a targeted edit cannot re-lay a garment. "
-          "cand_04 becomes cand_04p. The harness runs it for you at the end "
-          "unless the pick is already flat, so you rarely need to.",
-          {"candidate": dict(_CANDIDATE,
-                             description="The candidate to clean up. Defaults to "
-                                         "whatever pick_best last named."),
-           "instruction": {"type": "string",
-                           "description": "Optional. Overrides the default "
-                                          "de-wrinkle instruction. Whatever you "
-                                          "write, say that the fabric keeps its "
-                                          "real texture, or it comes back "
-                                          "repainted smooth."}},
-          []),
-
     _tool("measure",
           "Re-read the free numbers for a candidate: LAY against the reference "
           "first, then size vs the reference, flatness, colour dE with its hue "
@@ -683,9 +673,11 @@ TOOL_SPECS = [
           "often as you like and re-issue the whole list each time - the last "
           "call wins, and whatever is named when the run ends is what gets "
           "delivered, with any empty slot filled by the harness from its lay "
-          "ranking. A candidate and its own segmented or polished form count "
-          "once. Judge the lay first: it tells you when a candidate outside "
-          "your list sits closer to the reference than one inside it.",
+          "ranking. UNTOUCHED generations only - cand_NN as fal.ai returned "
+          "it; a segmented or polished form is refused, so generate from it "
+          "and name what comes back. Judge the lay first: it tells you when a "
+          "candidate outside your list sits closer to the reference than one "
+          "inside it.",
           {"candidates": {"type": "array", "items": _CANDIDATE,
                           "description": "Ranked, best first. Up to four."},
            "candidate": dict(_CANDIDATE, description="A single name, if you "
@@ -1092,9 +1084,13 @@ class Tools:
                 "created": datetime.now().isoformat(timespec="seconds"),
             })
             text += (f"\n\nSaved as {child} (depth {parent_depth}, same as "
-                     f"{name} - segmentation adds no drift). Use it anywhere a "
-                     f"candidate name is taken: generate(source='{child}'), "
-                     f"measure('{child}'), pick_best('{child}').")
+                     f"{name} - segmentation adds no drift). It is a CUTOUT: "
+                     f"the garment on flat white, the plate and its shadow "
+                     f"gone. Measure it, or generate from it so a plate comes "
+                     f"back - generate(source='{child}'). pick_best refuses "
+                     f"it: a cutout shipped as best.png on runs/20260902_233202 "
+                     f"and was rejected for exactly that look. Name {name}, or "
+                     f"whatever you generate from {child}.")
         return text
 
     def prompt_show(self) -> str:
@@ -1115,15 +1111,6 @@ class Tools:
     def prompt_replace(self, text: str) -> str:
         import promptfile as PF
         return PF.replace_all(self.run_dir, text)
-
-    def polish(self, candidate: str | None = None,
-               instruction: str | None = None) -> str:
-        argv = ["--run", str(self.run_dir)]
-        if candidate:
-            argv += ["--candidate", str(candidate)]
-        if instruction:
-            argv += ["--instruction", str(instruction)]
-        return self._script("polish.py", argv, timeout=900)
 
     def measure(self, candidate: str) -> str:
         import metrics as MET
@@ -1183,6 +1170,13 @@ class Tools:
             if not p.exists():
                 return f"ERROR: {p.name} does not exist. Known: {self._known()}"
             gen = generation_of(n)
+            if n != gen:
+                kind = ("a cutout - the garment on flat white, the plate and "
+                        "its shadow gone" if is_cutout(n)
+                        else "a second model's edit of a generation")
+                return (f"ERROR: {n} is {kind}. Only untouched fal.ai "
+                        f"generations ship. Name {gen}, or generate from {n} "
+                        f"and name what comes back.")
             if gen in seen_gen:
                 continue
             seen_gen.add(gen)
@@ -1225,7 +1219,8 @@ class Tools:
                      f"fills them from its lay ranking at the end unless you do.")
         return (f"delivery is now {', '.join(names)}. Call pick_best again with "
                 f"the whole list to change it; what is named when the run ends "
-                f"is what ships." + note)
+                f"is what ships, after one last pairwise check that rank 1 is "
+                f"the product's own colour." + note)
 
     def generate(self, source: str = "source", num: int = 1,
                  resolution: str = "2K", seed: int | None = None,
@@ -1383,7 +1378,9 @@ the prompt - is free and unlimited.
   worth shipping, and re-issue the whole list as better ones arrive. The run
   delivers four files, so keep the list full; a slot you leave empty is filled
   by the harness from its lay ranking. It is free, and it means an interrupted
-  run still delivers.
+  run still delivers. Before rank 1 ships it is checked once more, pairwise
+  against the product photo with colour first, and a candidate that copied
+  the reference's tone loses there.
 - When the result is good enough, or the images run out, call finish().
 
 You have a limited context window. Candidate images are dropped from the
@@ -2557,54 +2554,11 @@ def resolve_reference(args, workspace: Path) -> tuple[Path | None, Path | None]:
         f"  put one at {fallback}")
 
 
-def auto_polish(run_dir: Path, pick: Path, python: str) -> tuple[Path, str]:
-    """Run the de-wrinkle pass on the chosen candidate. Returns (file, note).
-
-    AUTOMATIC, not left to the model, and that is the whole point. It was a tool
-    the model could call and it simply did not: on runs/20260828_104807 the run
-    went pick_best -> write the log -> finish, with the polish never invoked.
-    That is the same failure as the pins - this project's own record is that
-    instructions in the skill get skipped, so anything that must happen every
-    time belongs in the harness rather than in the prompt.
-
-    The polished file is preferred UNLESS polish.py reports one of its
-    unambiguous failures - ironed flat, colour shifted, re-framed. Those are the
-    cases where the cleanup demonstrably broke its own instruction, and shipping
-    the parent instead is the safe read. Shape and scale differences short of
-    that are reported and NOT acted on here, because two polishes of evidence is
-    not enough to automate that judgement. Both files stay on disk either way.
-    """
-    rc = stream_subprocess(
-        [python, str(HERE / "tools" / "polish.py"),
-         "--run", str(run_dir), "--candidate", pick.stem],
-        cwd=HERE, comp="polish")
-
-    child = run_dir / "archive" / f"{pick.stem}p.png"
-    if rc != 0 or not child.exists():
-        return pick, ("the polish did not run, so this is the unpolished "
-                      "candidate")
-
-    verdict = {}
-    f = run_dir / "archive" / "last_polish.json"
-    if f.exists():
-        try:
-            verdict = json.loads(f.read_text())
-        except (json.JSONDecodeError, OSError):
-            verdict = {}
-
-    if verdict.get("broke_contract"):
-        why = "; ".join(verdict.get("verdicts") or ["it broke its instruction"])
-        TR.warn("polish", "shipping the unpolished candidate", why=why)
-        return pick, (f"the polish was rejected and {pick.stem} shipped instead - "
-                      f"{why}. The polished file is at {child.name} if you "
-                      f"disagree")
-    return child, f"de-wrinkled from {pick.stem}"
-
-
-# A pick already this much flatter than the source has nothing left to
-# de-wrinkle: cand_10 of runs/20260902_100812 measured x0.39, and a polish on
-# it is 15 cents spent on a second generative hop over a finished flat.
-ALREADY_FLAT = 0.6
+# There is no polish step and no recolour step. Both ran here once - the
+# recolour on runs/20260902_104708, the de-wrinkle on request via --polish -
+# and both were taken out at the operator's request: what ships is a fal.ai
+# generation exactly as it came back. tools/polish.py and tools/recolour.py
+# remain on disk as manual tools, and no run calls either.
 
 # How many ranked candidates a run delivers. The operator asked for the best
 # four of each run, whatever they look like, rather than one winner: an
@@ -2617,6 +2571,12 @@ def generation_of(name: str) -> str:
     """cand_03, cand_03s and cand_03p are one purchase: 'cand_03'."""
     m = re.match(r"(cand_\d+)", name or "")
     return m.group(1) if m else name
+
+
+def is_cutout(name: str) -> bool:
+    """cand_03s, and anything made from it, is the garment on flat white with
+    the plate and its shadow gone. Not a deliverable - pick_best refuses it."""
+    return "s" in (name or "")[len(generation_of(name)):]
 
 
 def lay_ranking(run_dir: Path, cache: dict | None = None) -> list[tuple[str, float]]:
@@ -2648,10 +2608,292 @@ def lay_ranking(run_dir: Path, cache: dict | None = None) -> list[tuple[str, flo
     return rows
 
 
-def ship_best(run_dir: Path, python: str, polish: bool = False,
-              top: int = TOP_N) -> tuple[list[str], list[bool], str]:
+# ---------------------------------------------------------------------------
+# The final judge: a pairwise knockout on rank 1
+# ---------------------------------------------------------------------------
+#
+# runs/20260901_222258 shipped cand_08: the best lay of the run at 0.934, and
+# dE 30 from the product. The reference was pale, every candidate that hit the
+# pose copied its tone, and nothing objected. The agent named it knowing the
+# number ("the task is about matching the reference's shape"); the hue part
+# read 2.6, "the same colourway" by the rule the agent is given, because
+# lightness is not hue; and the harness's own fill ranks by lay, which is
+# exactly what a pale candidate wins on. The two candidates that WERE the
+# product's colour, cand_05 and cand_09 at dE 6, had the hood wrong, a lay of
+# 0.78, and sat outside the delivery altogether.
+#
+# So the last word on rank 1 is a different question, put to the same model:
+# "which of these two ships" - two candidates beside the product photo, the
+# product's colour a hard requirement. Measured on that run's pairs on
+# 2026-09-02, each pair in both orders: six for six against the pale one. The
+# retired grader failed at scoring one image 0-100 (it saturated) and at
+# ranking a list of N (a slot bias); a pair with one criterion is neither.
+#
+# A knockout, incumbent first, and a VETO, not a re-ranking. The model's
+# rank 1 is replaced only when both orders agree it is the wrong colour and
+# the challenger is not; a challenger that wins both orders on lay alone
+# changes nothing, and a split on order is a tie. runs/20260902_225122 is why
+# the lay does not count: the judge swapped the run's best silhouette (0.970)
+# for a flatter one at 0.945, and on the way called two dE 2.5 candidates
+# "distinctly paler" - a flag that flipped with image order for four of the
+# ten. Under dE 4 the judge has no reliable opinion; at dE 20 and 30 it has
+# never once been wrong, in either order. The model's shape judgement has the
+# whole run behind it and stays in charge. An unreachable server changes
+# nothing either. The pool is every distinct generation on disk up to
+# JUDGE_POOL, the delivery first, for the reason above: the fill's lay order
+# is the wrong order here. Each duel is a form-filling call with thinking
+# off, like stage C of the reference search. Every verdict is written to
+# archive/judge.json.
+#
+# The pool cap is a safety valve, not a budget. Measured 2026-09-02 on the
+# 27B vision model with thinking off: 1.5-1.9 s per call, so a pool of 16 is
+# fifteen duels and under a minute. It has to be wide enough to reach the
+# BOTTOM of the lay order, because that is where the product-coloured
+# candidates of a pale run sit - at 8, the first test cut off cand_05 of
+# runs/20260901_222258, the best colour in the batch, for having the worst lay.
+JUDGE_POOL = 16
+JUDGE_IMAGE_DIM = 1024
+
+# The eye alone is not enough to throw a pick out. runs/20260902_233202: the
+# model's pick had the reference's pose at lay 0.957 and read 14 dE paler
+# than the product (hue 3.9, the same colourway); the judge called it "washed
+# out" in both orders and shipped a candidate at the product's colour that
+# had never been re-laid - size x1.55, legs splayed, lay 0.893. The operator
+# called it a really bad shot, and it was: the shape is the job, and 14 dE
+# of lightness is not worth it. The hoodie run that the judge exists for was
+# 30 dE. So the veto needs the numbers to agree that the colour is FAR off:
+# lit dE at or past this floor, or the hue part past the skill's own
+# "different colourway" line. Under both, the model's pick holds however
+# paler the judge reads it, and the duel is recorded as `colour_minor`.
+JUDGE_DE_FLOOR = 20.0
+JUDGE_HUE_FLOOR = 8.0
+
+JUDGE_PROMPT = """\
+You are the last check before one of two candidate images ships as this \
+product's laydown photograph.
+
+Image 1 is the PRODUCT, photographed off-set. It is the truth for colour, \
+lightness, fabric and construction.
+Image 2 is the LAYDOWN TO MATCH, in greyscale. It is the truth for pose and \
+shape only. Its tone is not a target, and its construction is not to be copied.
+Image 3 is candidate A. Image 4 is candidate B.
+
+Choose the candidate to ship. Apply these rules in order:
+1. It must be the product in image 1: the same hue AND the same lightness. \
+Compare each candidate's fabric directly against image 1 before anything \
+else. A garment that reads clearly paler, darker or a different colour than \
+image 1 is disqualified, however good its pose.
+2. Construction must be intact: nothing invented (a seam, a label, a tag, a \
+hanger, a second garment) and nothing lost (a logo, a pocket, a drawstring).
+3. Among candidates that pass 1 and 2, the one whose lay is closest to image \
+2 wins: the same pose and arrangement of sleeves, hood, hem and legs, a \
+similar size in the frame, flatter.
+If both fail rule 1, the one closer to image 1's colour wins. If both fail \
+rule 2, the one with less damage wins.
+
+Return ONE JSON object, nothing else:
+{"winner": "A" or "B",
+ "colour_ok": {"A": true or false, "B": true or false},
+ "reason": "<one sentence naming what decided it>"}"""
+
+
+def _json_blob(text: str) -> dict:
+    """The first {...} in a reply, fences and prose stripped."""
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.M)
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError(f"no JSON object in the reply: {text[:200]!r}")
+    return json.loads(text[start:end + 1])
+
+
+def judge_duel(src_b64: str, ref_b64: str, a: tuple[str, str],
+               b: tuple[str, str]) -> dict:
+    """One vision call: `a` shown as candidate A, `b` as candidate B, each a
+    (name, base64) pair. Returns the verdict with `winner` as a candidate
+    NAME, or None with `error` set. Never raises - the judge is not the
+    delivery, and a run that reaches this point has already paid for its
+    images."""
+    def txt(s: str) -> dict:
+        return {"type": "text", "text": s}
+    content = [txt("Image 1 - the PRODUCT, photographed off-set:"),
+               image_block(src_b64),
+               txt("Image 2 - the LAYDOWN TO MATCH, greyscale:"),
+               image_block(ref_b64),
+               txt("Image 3 - candidate A:"), image_block(a[1]),
+               txt("Image 4 - candidate B:"), image_block(b[1]),
+               txt(JUDGE_PROMPT)]
+    out = {"A": a[0], "B": b[0], "winner": None, "colour_ok": None,
+           "reason": None, "error": None, "seconds": 0.0}
+    t0 = time.time()
+    try:
+        data = call_model([{"role": "user", "content": content}], tools=None,
+                          max_tokens=600, temperature=0.0, retries=1,
+                          think=False)
+        text = (data["choices"][0]["message"].get("content") or "").strip()
+        rec = _json_blob(text)
+        label = str(rec.get("winner", "")).strip().upper()
+        if label not in ("A", "B"):
+            raise ValueError(f"winner is {rec.get('winner')!r}, not A or B")
+        out["winner"] = a[0] if label == "A" else b[0]
+        ok = rec.get("colour_ok")
+        if isinstance(ok, dict):
+            out["colour_ok"] = {a[0]: ok.get("A"), b[0]: ok.get("B")}
+        out["reason"] = str(rec.get("reason") or "").strip()
+    except Exception as e:  # noqa: BLE001 - recorded, never raised
+        out["error"] = f"{type(e).__name__}: {e}"
+    out["seconds"] = round(time.time() - t0, 1)
+    return out
+
+
+def judge_final(run_dir: Path, pool: list[Path],
+                numbers: dict[str, tuple] | None = None) -> dict:
+    """Run the knockout over `pool`, pool[0] the incumbent. Returns the record
+    that lands in archive/judge.json: the pool, every duel with both calls,
+    the winner, and `skipped` with the reason when nothing was asked.
+
+    A challenger takes the title only when it wins both orders AND both
+    orders flag the incumbent's colour as wrong and its own as right AND the
+    incumbent's measured colour is far off - `numbers` maps a candidate name
+    to (lit dE, hue dE) against the product, and one of them has to clear
+    its floor. A candidate with no numbers is judged by eye alone. A win on
+    lay alone is recorded as `lay_only`, a colour call the numbers do not
+    back as `colour_minor`, and the incumbent holds in both; a split on order
+    is a tie. The first duel that errors ends the judging - a server that has
+    gone away would otherwise be waited on once per remaining challenger, at
+    the end of a run that is otherwise complete.
+    """
+    numbers = numbers or {}
+    rec = {"pool": [p.stem for p in pool],
+           "incumbent": pool[0].stem if pool else None,
+           "winner": None, "overrode": False, "duels": [], "skipped": None,
+           "floors": {"de_lit": JUDGE_DE_FLOOR, "hue": JUDGE_HUE_FLOOR},
+           "seconds": 0.0, "at": datetime.now().isoformat(timespec="seconds")}
+    if len(pool) < 2:
+        rec["skipped"] = "fewer than two distinct candidates"
+        return rec
+    arch = run_dir / "archive"
+    src, ref = arch / "source_clean.jpg", reference_path(run_dir)
+    if not src.exists():
+        rec["skipped"] = "no archive/source_clean.jpg to hold the colour against"
+        return rec
+    if not ref.exists():
+        rec["skipped"] = f"no {ref.name} to hold the lay against"
+        return rec
+
+    t0 = time.time()
+    b64: dict[Path, str | None] = {}
+
+    def enc(p: Path) -> str | None:
+        if p not in b64:
+            b64[p] = encode_image(p, JUDGE_IMAGE_DIM)
+        return b64[p]
+
+    if enc(src) is None or enc(ref) is None:
+        rec["skipped"] = "could not encode the source or the reference"
+        return rec
+
+    champion = pool[0]
+    for challenger in pool[1:]:
+        if enc(champion) is None or enc(challenger) is None:
+            rec["duels"].append({"incumbent": champion.stem,
+                                 "challenger": challenger.stem,
+                                 "outcome": "error",
+                                 "error": "could not encode an image"})
+            continue
+        first = judge_duel(enc(src), enc(ref), (champion.stem, enc(champion)),
+                           (challenger.stem, enc(challenger)))
+        second = judge_duel(enc(src), enc(ref),
+                            (challenger.stem, enc(challenger)),
+                            (champion.stem, enc(champion)))
+        wins = [first["winner"], second["winner"]]
+
+        def wrong_in_both(name: str) -> bool:
+            # Explicitly False in both orders. The flag flips with image order
+            # at small differences, so one order's "wrong" is not a finding.
+            return all((d["colour_ok"] or {}).get(name) is False
+                       for d in (first, second))
+
+        inc_wrong = wrong_in_both(champion.stem)
+        ch_wrong = wrong_in_both(challenger.stem)
+        inc_de, inc_hue = numbers.get(champion.stem, (None, None))
+        far_off = ((inc_de is None and inc_hue is None)
+                   or (inc_de is not None and inc_de >= JUDGE_DE_FLOOR)
+                   or (inc_hue is not None and inc_hue >= JUDGE_HUE_FLOOR))
+        if None in wins:
+            outcome = "error"
+        elif (wins == [challenger.stem] * 2 and inc_wrong and not ch_wrong
+              and far_off):
+            outcome = "challenger"
+        elif wins == [challenger.stem] * 2 and inc_wrong and not ch_wrong:
+            outcome = "colour_minor"
+        elif wins == [challenger.stem] * 2:
+            outcome = "lay_only"
+        elif wins == [champion.stem] * 2:
+            outcome = "holds"
+        else:
+            outcome = "split"
+        duel = {"incumbent": champion.stem, "challenger": challenger.stem,
+                "outcome": outcome, "incumbent_colour_wrong": inc_wrong,
+                "challenger_colour_wrong": ch_wrong,
+                "incumbent_de_lit": inc_de, "incumbent_hue_de": inc_hue,
+                "calls": [first, second]}
+        rec["duels"].append(duel)
+        TR.info("judge", f"{champion.stem} vs {challenger.stem}: {outcome}",
+                first=first["winner"], second=second["winner"],
+                incumbent_colour_wrong=inc_wrong,
+                challenger_colour_wrong=ch_wrong,
+                reasons=[first["reason"], second["reason"]],
+                errors=[first["error"], second["error"]],
+                seconds=first["seconds"] + second["seconds"])
+        head = f"    {champion.stem} vs {challenger.stem}: "
+        if outcome == "error":
+            err = first["error"] or second["error"]
+            print(c(YEL, head + f"the call failed ({err}); {champion.stem} "
+                                f"holds and the judging stops here"))
+            rec["skipped"] = (f"stopped after an error on {challenger.stem}: "
+                              f"{err}")
+            break
+        if outcome == "challenger":
+            why = first["reason"] or second["reason"] or ""
+            measured = (f"dE {inc_de:.0f}, hue {inc_hue:.1f}"
+                        if inc_de is not None else "unmeasured")
+            print(c(YEL, head + f"{challenger.stem} takes rank 1 - both "
+                                f"orders read {champion.stem} as the wrong "
+                                f"colour ({measured}): {why}"))
+            champion = challenger
+        elif outcome == "colour_minor":
+            print(c(DIM, head + f"{champion.stem} holds - read as the wrong "
+                                f"colour in both orders, but it measures dE "
+                                f"{inc_de:.0f}, hue {inc_hue:.1f}, under the "
+                                f"{JUDGE_DE_FLOOR:.0f} / {JUDGE_HUE_FLOOR:.0f} "
+                                f"floors, and the shape is the job"))
+        elif outcome == "lay_only":
+            print(c(DIM, head + f"{challenger.stem} won on lay alone; lay is "
+                                f"the model's call, {champion.stem} holds"))
+        elif outcome == "holds" and ch_wrong:
+            print(c(DIM, head + f"{champion.stem} holds - both orders read "
+                                f"{challenger.stem} as the wrong colour"))
+        elif outcome == "holds":
+            print(c(DIM, head + f"{champion.stem} holds"))
+        else:
+            print(c(DIM, head + f"split on order, {champion.stem} holds"))
+    rec["winner"] = champion.stem
+    rec["overrode"] = champion.stem != pool[0].stem
+    rec["seconds"] = round(time.time() - t0, 1)
+    return rec
+
+
+def ship_best(run_dir: Path, top: int = TOP_N,
+              judge: bool = True) -> tuple[list[str], list[str], str]:
     """Write output/best.png and best_2.png .. best_<top>.png, plus picks.json.
-    Returns (candidates in rank order, chosen_by_harness per rank, note).
+    Returns (candidates in rank order, who chose each rank, note); the chooser
+    is "model", "harness" or "judge".
+
+    UNTOUCHED GENERATIONS ONLY: cand_NN as fal.ai returned it. The segmented
+    form (cand_NNs) is a cutout with the plate and its shadow gone, and the
+    polished and recoloured forms are a second model's edit; none of them
+    ships, whoever names them. pick_best refuses the names, and a legacy
+    best.json that carries one is read past it here.
 
     Runs only when at least one candidate exists, so a run that generated nothing
     ends with an empty output/ and says so, rather than shipping a placeholder
@@ -2664,30 +2906,32 @@ def ship_best(run_dir: Path, python: str, polish: bool = False,
     the best four of whatever the run produced. Fewer than `top` candidates on
     disk means fewer files, never a duplicate.
 
-    The polish is OFF by default. With `polish`, rank 1 alone is run through
-    tools/polish.py and the polished file ships in its place if it passes the
-    gate; it is skipped when rank 1 is already flatter than the source by
-    ALREADY_FLAT. An automatic recolour ran here for one run (20260902_104708)
-    and was removed at the operator's request; tools/recolour.py remains as a
-    manual tool and no run calls it.
+    Then, with `judge`, rank 1 defends its place pairwise against every other
+    candidate - see judge_final(). It loses only to a challenger both orders
+    agree is the product's colour when it is not, and only when its own
+    measured colour is far off (JUDGE_DE_FLOOR / JUDGE_HUE_FLOOR): a paler
+    render with the right shape stays. A winner from outside the delivery
+    displaces the last slot; one from inside it moves up. Ranks 2 onward keep
+    their order either way: the judge answers "is best.png the right colour",
+    not "sort these four".
     """
     arch, outdir = run_dir / "archive", run_dir / "output"
     cands = sorted(p for p in arch.glob("cand_*.png")
-                   if re.fullmatch(r"cand_\d+[spc]*", p.stem))
+                   if re.fullmatch(r"cand_\d+", p.stem))
     if not cands:
         return [], [], ""
 
     ranked: list[Path] = []
-    by_harness: list[bool] = []
+    chosen_by: list[str] = []
     used: set[str] = set()
 
-    def take(p: Path, harness: bool) -> None:
+    def take(p: Path, who: str) -> None:
         gen = generation_of(p.stem)
         if gen in used or len(ranked) >= top:
             return
         used.add(gen)
         ranked.append(p)
-        by_harness.append(harness)
+        chosen_by.append(who)
 
     bf = arch / "best.json"
     if bf.exists():
@@ -2697,40 +2941,86 @@ def ship_best(run_dir: Path, python: str, polish: bool = False,
                                              if rec.get("candidate") else [])
             for n in names:
                 p = arch / f"{n}.png"
-                if p.exists():
-                    take(p, False)
+                if p.exists() and re.fullmatch(r"cand_\d+", str(n)):
+                    take(p, "model")
         except (json.JSONDecodeError, OSError, KeyError):
             pass
 
+    # Lay order first, then newest first: the model's last attempt is its
+    # most informed one. Not a judgement - better than nothing, and recorded
+    # as the harness's choice. Computed even when the delivery is already
+    # full, because the judge's pool is drawn from the same order.
+    cache: dict = {}
+    fallback = [arch / f"{n}.png" for n, _ in lay_ranking(run_dir, cache)
+                if re.fullmatch(r"cand_\d+", n)]
+    fallback += list(reversed(cands))
+    # The same measurements, for the judge's colour floors.
+    numbers = {stem: (m.get("colour_de_lit"), m.get("hue_de"))
+               for (stem, _), (_, _, m) in cache.items() if m}
     if len(ranked) < top:
-        cache: dict = {}
-        order = [arch / f"{n}.png" for n, _ in lay_ranking(run_dir, cache)]
-        # Newest first as the fallback, which is the model's last attempt and
-        # therefore its most informed one. Not a judgement - better than
-        # nothing, and recorded as the harness's choice.
-        for p in order + list(reversed(cands)):
+        for p in fallback:
             if p.exists():
-                take(p, True)
+                take(p, "harness")
 
     notes = []
-    if polish and ranked and not re.search(r"[pc]", ranked[0].stem[5:]):
-        flat = None
+    if judge and len({generation_of(p.stem) for p in cands}) > 1:
+        pool = list(ranked)
+        gens = {generation_of(p.stem) for p in pool}
+        for p in fallback:
+            if len(pool) >= JUDGE_POOL:
+                break
+            g = generation_of(p.stem)
+            if p.exists() and g not in gens:
+                pool.append(p)
+                gens.add(g)
+        print(c(BOLD, "\nfinal step") + c(DIM, f"  is {ranked[0].stem} the "
+                                            f"product's colour? pairwise "
+                                            f"against {len(pool) - 1} other(s)"))
         try:
-            sys.path.insert(0, str(HERE / "tools"))
-            import metrics as MET
-            src = arch / "source_clean.jpg"
-            if src.exists():
-                flat = MET.compare(src, ranked[0]).get("wrinkle_ratio")
-        except Exception as e:  # noqa: BLE001 - a check is not the delivery
-            TR.warn("polish", f"could not measure flatness: {e}")
-        if flat is not None and flat < ALREADY_FLAT:
-            notes.append(f"polish skipped: rank 1 already flatter than the "
-                         f"source (x{flat:.2f}), nothing left to de-wrinkle")
+            jrec = judge_final(run_dir, pool, numbers)
+        except Exception as e:  # noqa: BLE001 - the judge is not the delivery
+            TR.exception("judge", f"the judge crashed: {e}")
+            jrec = {"pool": [p.stem for p in pool], "incumbent": pool[0].stem,
+                    "winner": None, "overrode": False, "duels": [],
+                    "skipped": f"crashed: {type(e).__name__}: {e}"}
+        try:
+            (arch / "judge.json").write_text(json.dumps(jrec, indent=2) + "\n")
+        except OSError as e:
+            TR.warn("judge", f"could not write judge.json: {e}")
+        winner = jrec.get("winner")
+        if winner and winner != ranked[0].stem:
+            wp = arch / f"{winner}.png"
+            if wp in ranked:
+                i = ranked.index(wp)
+                ranked.pop(i)
+                chosen_by.pop(i)
+            elif len(ranked) >= top:
+                ranked.pop()
+                chosen_by.pop()
+            ranked.insert(0, wp)
+            chosen_by.insert(0, "judge")
+            notes.append(f"the judge replaced {jrec['incumbent']} with "
+                         f"{winner} at rank 1: both orders read "
+                         f"{jrec['incumbent']} as the wrong colour - see "
+                         f"archive/judge.json")
+            print(c(YEL, f"    verdict: {winner} ships, not "
+                         f"{jrec['incumbent']} - the wrong colour"))
+        elif jrec.get("skipped") and not jrec["duels"]:
+            notes.append(f"judge skipped: {jrec['skipped']}")
+            print(c(DIM, f"    judge skipped: {jrec['skipped']}"))
         else:
-            print(c(BOLD, "\nfinal step") + c(DIM, "  de-wrinkling rank 1"))
-            ranked[0], pnote = auto_polish(run_dir, ranked[0], python)
-            notes.append(pnote)
-    filled = sum(by_harness)
+            fought = len(jrec["duels"])
+            notes.append(f"the judge upheld {ranked[0].stem} as the product's "
+                         f"colour against {fought} challenger(s)"
+                         + (f" ({jrec['skipped']})" if jrec.get("skipped")
+                            else ""))
+            print(c(DIM, f"    verdict: {ranked[0].stem} holds - the "
+                         f"product's colour"
+                         f"{' (' + jrec['skipped'] + ')' if jrec.get('skipped') else ''}"))
+    else:
+        jrec = None
+
+    filled = chosen_by.count("harness")
     if filled:
         notes.append(f"{filled} slot(s) filled by the harness from its lay "
                      f"ranking, not chosen by the model")
@@ -2752,7 +3042,7 @@ def ship_best(run_dir: Path, python: str, polish: bool = False,
         out = outdir / ("best.png" if i == 1 else f"best_{i}.png")
         shutil.copy2(p, out)
         row = {"rank": i, "candidate": p.stem, "file": out.name,
-               "chosen_by": "harness" if by_harness[i - 1] else "model"}
+               "chosen_by": chosen_by[i - 1]}
         try:
             if src.exists():
                 m = MET.compare(src, p, reference=ref if ref.exists() else None)
@@ -2764,6 +3054,10 @@ def ship_best(run_dir: Path, python: str, polish: bool = False,
         picks.append(row)
     (outdir / "picks.json").write_text(json.dumps(
         {"top": top, "picks": picks, "note": note,
+         "judge": (None if jrec is None else
+                   {k: jrec.get(k) for k in ("incumbent", "winner", "overrode",
+                                             "skipped", "seconds")}
+                   | {"duels": len(jrec.get("duels") or [])}),
          "at": datetime.now().isoformat(timespec="seconds")}, indent=2) + "\n")
     try:
         C.log(run_dir, f"shipped {', '.join(p.stem for p in ranked)} as "
@@ -2771,7 +3065,7 @@ def ship_best(run_dir: Path, python: str, polish: bool = False,
                        + (f" ({note})" if note else ""))
     except Exception:  # noqa: BLE001 - the files are written either way
         pass
-    return [p.stem for p in ranked], by_harness, note
+    return [p.stem for p in ranked], chosen_by, note
 
 
 def exit_code_for(result: dict, budget: int, best_shipped: bool) -> int:
@@ -2832,9 +3126,17 @@ def main():
                          "(default 78). PROVISIONAL - measured on nine assets, "
                          "not on your library. Run tools/select_reference.py "
                          "--calibrate and set this from the numbers.")
-    ap.add_argument("--reference-top-k", type=int, default=5, metavar="N",
+    # 3 is the endpoint's cap, not a taste: it takes at most FOUR images in
+    # one request, and stage C sends the garment plus one per survivor. At the
+    # old default of 5 every run with a library big enough to qualify four
+    # was a guaranteed 400, and the search fell back - silently - to a contact
+    # sheet where each candidate arrives at a fraction of the resolution.
+    # Measured 2026-09-02: six images fails, four is accepted.
+    ap.add_argument("--reference-top-k", type=int, default=3, metavar="N",
                     help="How many survivors the model sees before it confirms "
-                         "or vetoes the pick.")
+                         "or vetoes the pick (default 3, the most the endpoint "
+                         "takes beside the garment in one request; more falls "
+                         "back to a low-resolution contact sheet).")
     ap.add_argument("--no-reference-veto", action="store_true",
                     help="Install the top-scoring library image even when the "
                          "model rejects it on sight. Trusts the score alone.")
@@ -2873,13 +3175,17 @@ def main():
     ap.add_argument("--no-pre-clean", action="store_true",
                     help="Skip segmentation and send the raw photo, background "
                          "and all.")
-    ap.add_argument("--polish", action="store_true",
-                    help="Run rank 1 through openai/gpt-image-2/edit before it "
-                         "ships (about 15c). Off by default; the unpolished "
-                         "file is kept beside it either way.")
     ap.add_argument("--top", type=int, default=TOP_N, metavar="N",
                     help=f"How many ranked candidates to deliver (default "
                          f"{TOP_N}): output/best.png, best_2.png ...")
+    ap.add_argument("--no-judge", action="store_true",
+                    help="Skip the final colour check on rank 1. By default "
+                         "the model is shown the product beside rank 1 and "
+                         "each other candidate in turn, both orders, and rank "
+                         "1 is replaced only when both orders agree it is the "
+                         "wrong colour and the other is not. Lay stays the "
+                         "model's call. A few vision calls at the end of the "
+                         "run, nothing billed.")
     ap.add_argument("--allow-dirty-source", action="store_true",
                     help=f"Start the agent even when the segmenter returned an "
                          f"image missing most of the garment. Without this the "
@@ -3070,9 +3376,8 @@ def main():
 
     # Paid-for images are never abandoned - but only if there are any. A run that
     # generated nothing ends with an empty output/ and says so.
-    shipped, by_harness, polish_note = ship_best(run_dir, tools.python,
-                                                polish=args.polish,
-                                                top=max(1, args.top))
+    shipped, chosen_by, ship_note = ship_best(run_dir, top=max(1, args.top),
+                                              judge=not args.no_judge)
     rc = exit_code_for(result, budget, bool(shipped))
 
     colour = {"done": GRN, "budget_exhausted": GRN,
@@ -3089,14 +3394,16 @@ def main():
         print("\n" + textwrap.indent(textwrap.fill(result["summary"], 76), "  "))
     if shipped:
         print()
-        for i, (name, filled) in enumerate(zip(shipped, by_harness), 1):
+        tags = {"harness": "   filled by the harness, not the model",
+                "judge": "   put here by the judge: the model's pick was "
+                         "the wrong colour"}
+        for i, (name, who) in enumerate(zip(shipped, chosen_by), 1):
             out = "best.png" if i == 1 else f"best_{i}.png"
             print(c(GRN if i == 1 else DIM, f"  rank {i}    {name:<10} -> "
                                               f"{run_dir / 'output' / out}")
-                  + (c(YEL, "   filled by the harness, not the model")
-                     if filled else ""))
-        if polish_note:
-            print(c(DIM, f"            {polish_note}"))
+                  + (c(YEL, tags[who]) if who in tags else ""))
+        if ship_note:
+            print(c(DIM, f"            {ship_note}"))
     else:
         print(c(DIM, "\n  nothing shipped - no candidates were generated."))
     print(c(DIM, f"\n  transcript: {sess.log_path}"))
@@ -3105,8 +3412,8 @@ def main():
 
     sess.log("end", {"result": result, "seconds": dt,
                      "shipped": shipped[0] if shipped else None,
-                     "shipped_all": shipped, "shipped_by_harness": by_harness,
-                     "polish": polish_note, "exit_code": rc})
+                     "shipped_all": shipped, "shipped_by": chosen_by,
+                     "note": ship_note, "exit_code": rc})
     TR.info("harness", f"run finished: {result['status']}",
             body=result.get("summary"), seconds=round(dt, 1),
             images=len(sess.candidates()), budget=budget,

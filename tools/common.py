@@ -2077,3 +2077,117 @@ def format_findings(problems: list[str], warnings: list[str]) -> str:
     if not lines:
         lines.append("no problems, no warnings.")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Clip bites: closing the notches a clip hanger leaves in a cutout
+# ---------------------------------------------------------------------------
+#
+# A garment photographed on a clip hanger has the clips ON the waistband, and
+# the segmenter cuts them out with a rectangle of waistband each. The cutout
+# then has two square notches in its top edge, and the generator reads them as
+# construction: runs/20260903_001911 came back with a fabric tab drawn at each
+# corner on two of the first four candidates. Words do not fix it - the
+# picture says "notch" louder than the prompt says "unbroken".
+#
+# So the notches are closed before anything downstream sees the cutout. The
+# top edge of the garment is read column by column, and any dip narrower than
+# BITE_MAX_WIDTH of the garment's width and shallower than BITE_MAX_DEPTH of
+# its height is filled: a clip bite on that run was 67 px wide and 60 px deep
+# on a 1858 px garment, 3.6% and 1.6%; a leg gap, a neckline or the space
+# under a sleeve is many times wider. The fill copies the same rows of fabric
+# in from either side of the bite, blended by distance, because a waistband's
+# ribbing runs ACROSS - the first cut reflected fabric up from below and left
+# a visibly paler block, the anti-aliased rim of the bite included. It only
+# has to be plausible: the generator re-renders every pixel of it.
+#
+# A bite is roughly square. The cargo shorts of runs/20260902_231556 carry
+# two at 91x92 and 93x107 px, and beside them a slit 27 px wide and 332 px
+# deep where the waistband end folds - a real gap, and BITE_MAX_ASPECT keeps
+# it. The fill also overwrites BITE_RIM px of fabric around the notch: the
+# segmenter's edge is anti-aliased toward white, and left alone that rim
+# outlines the patch in pale pixels.
+BITE_MAX_WIDTH = 0.08
+BITE_MAX_DEPTH = 0.12
+BITE_MIN_DEPTH = 0.01
+BITE_MIN_WIDTH = 0.01
+BITE_MAX_ASPECT = 2.0    # depth over width; a slit is deeper than that
+BITE_RIM = 5             # px of the notch's own edge repainted with the fill
+BITE_MARGIN = 6          # px skipped beyond that before fabric is copied
+BITE_PLATE = 245         # min channel at or above this is the white plate
+
+
+def close_top_bites(rgb: np.ndarray) -> tuple[np.ndarray, list[dict]]:
+    """Fill clip bites along the top edge of a cutout on a white plate.
+
+    Takes and returns an HxWx3 uint8 array. The second value lists each bite
+    closed as {"x0", "x1", "width", "depth"} in pixels; empty means the image
+    was returned untouched. Works on the segmenter's output, where the plate
+    is pure white; on anything else the mask is the whole frame and nothing
+    qualifies, which is the right answer.
+    """
+    im = np.asarray(rgb)
+    H, W = im.shape[:2]
+    mask = im.min(axis=2) < BITE_PLATE
+    mask = ndimage.binary_opening(mask, iterations=2)
+    if not mask.any():
+        return im, []
+    ys, xs = np.where(mask)
+    gh, gw = int(ys.max() - ys.min()), int(xs.max() - xs.min())
+    if gh < 50 or gw < 50:
+        return im, []
+
+    # First garment row per column; H where the column holds none.
+    prof = np.where(mask.any(axis=0), mask.argmax(axis=0), H).astype(int)
+    win = max(3, int(gw * BITE_MAX_WIDTH)) | 1
+    # A 1-D opening of the profile: dips narrower than `win` are removed.
+    hull = ndimage.maximum_filter1d(ndimage.minimum_filter1d(prof, win), win)
+    depth = prof - hull
+    cols = ((depth >= max(4, gh * BITE_MIN_DEPTH)) & (depth < gh * BITE_MAX_DEPTH)
+            & (prof < H))
+    labels, n = ndimage.label(cols)
+    if not n:
+        return im, []
+
+    out = im.astype(np.float64)
+    filled = np.zeros_like(mask)
+    bites: list[dict] = []
+    for i in range(1, n + 1):
+        bx = np.where(labels == i)[0]
+        x0, x1 = int(bx.min()), int(bx.max())
+        w = x1 - x0 + 1
+        d = int(prof[bx].max() - hull[bx].min())
+        if w < gw * BITE_MIN_WIDTH or d > w * BITE_MAX_ASPECT:
+            continue
+        floor = int(prof[bx].max())
+        # The notch plus BITE_RIM px of its own anti-aliased edge; fabric is
+        # copied in from beyond a further BITE_MARGIN on each side.
+        xl = x0 - BITE_RIM - BITE_MARGIN
+        xr = x1 + BITE_RIM + BITE_MARGIN
+        for x in range(max(0, x0 - BITE_RIM), min(W, x1 + BITE_RIM + 1)):
+            r0 = int(hull[x]) if x0 <= x <= x1 else int(prof[x])
+            for r in range(r0, min(H, floor + BITE_RIM)):
+                sl, sr = max(0, 2 * xl - x), min(W - 1, 2 * xr - x)
+                okl = bool(mask[r, sl]) and r >= prof[sl]
+                okr = bool(mask[r, sr]) and r >= prof[sr]
+                wl, wr = (xr - x) / (xr - xl), (x - xl) / (xr - xl)
+                if okl and okr:
+                    px = im[r, sl] * wl + im[r, sr] * wr
+                elif okl:
+                    px = im[r, sl]
+                elif okr:
+                    px = im[r, sr]
+                else:   # nothing clean either side: reflect up from below
+                    src = floor + BITE_RIM + BITE_MARGIN + (floor - r)
+                    px = im[min(H - 1, src), x]
+                out[r, x] = px
+                filled[r, x] = True
+        bites.append({"x0": x0, "x1": x1, "width": w, "depth": d})
+    if not bites:
+        return im, []
+    # Soften only the seam of each fill, not the fabric inside it.
+    blur = ndimage.gaussian_filter(out, sigma=(1.2, 1.2, 0))
+    seam = (ndimage.binary_dilation(filled, iterations=3)
+            & ~ndimage.binary_erosion(filled, iterations=3) & (mask | filled))
+    out[seam] = blur[seam]
+    return out.clip(0, 255).astype(np.uint8), bites
