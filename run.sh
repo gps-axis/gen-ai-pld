@@ -67,21 +67,23 @@ echo "  session   $LAYDOWN_SESSION  (ceiling $LAYDOWN_MAX_IMAGES images)"
 #
 # Same rules as dam_scraper/dam_scrape.py: 6 digits is the style, 9 is style
 # plus colour, and the DAM is searched on the first six either way. The shots
-# land in inputs/reference_library/<style>/ - their own folder, so the harness
-# searches this garment's shots and nothing else, and a library search without
-# --style still sees them (it walks subfolders).
+# land flat in inputs/reference_library/ next to every other style's shots -
+# no per-style folder - and the harness picks its reference from the whole
+# library. Which files belong to which style is recorded in the manifest under
+# dam_scraper/downloads/<style>/, not in the folder layout.
 if [ -n "$STYLE" ]; then
   [ "$HAS_REFERENCE" = 0 ] || die "--style chooses the reference from the DAM; drop --reference / --reference-library, or drop --style."
   [[ "$STYLE" =~ ^[0-9]{6}([0-9]{3})?$ ]] || die "--style must be 6 or 9 digits, got '$STYLE'"
   command -v uv >/dev/null 2>&1 || die "uv is required for the DAM steps - run ./setup.sh first."
   DAM="$HERE/dam_scraper"
-  LIB="$HERE/inputs/reference_library/${STYLE:0:6}"
+  LIB="$HERE/inputs/reference_library"
+  MANIFEST="$DAM/downloads/${STYLE:0:6}/manifest.json"
   # VIRTUAL_ENV is unset for these so uv uses the scraper's own environment
   # (playwright lives there, not in the harness venv) instead of warning about
   # the one that happens to be activated in the shell.
   dam() { env -u VIRTUAL_ENV uv run --locked --project "$DAM" python "$DAM/$1" "${@:2}"; }
 
-  echo "  style     $STYLE  -> ${LIB#"$HERE/"}/"
+  echo "  style     $STYLE  -> ${LIB#"$HERE/"}/  (flat, alongside every other style)"
 
   # check exits 0 when the saved session still reaches the DAM, 2 when there is
   # no saved session, 3 when there is one and the DAM sent it back to login.
@@ -102,8 +104,21 @@ if [ -n "$STYLE" ]; then
   # the working directory, and this command is run from anywhere.
   dam dam_scrape.py "$STYLE" --image-root "$LIB" --output-root "$DAM/downloads" \
     || die "DAM download failed (exit $?)"
-  [ -n "$(find "$LIB" -maxdepth 1 -type f -iname '*.jpg' 2>/dev/null | head -1)" ] \
-    || die "dam_scrape.py reported success but ${LIB#"$HERE/"}/ holds no JPG"
+  # The library is shared by every style, so "holds a JPG" proves nothing about
+  # this one. Check the files the manifest says this style produced, by name,
+  # directly under the library root.
+  "$PY" - "$MANIFEST" "$LIB" <<'PYCHECK' || die "dam_scrape.py reported success but ${LIB#"$HERE/"}/ is missing this style's JPGs (see above)"
+import json, sys
+from pathlib import Path
+manifest, lib = Path(sys.argv[1]), Path(sys.argv[2])
+names = [f["filename"] for f in json.loads(manifest.read_text()).get("files", [])]
+missing = [n for n in names if not (lib / n).is_file()]
+if not names:
+    print(f"  {manifest} lists no files", file=sys.stderr); sys.exit(1)
+if missing:
+    print("  missing: " + ", ".join(missing), file=sys.stderr); sys.exit(1)
+print(f"  library   {len(names)} JPG(s) for this style, flat in {lib.name}/")
+PYCHECK
   set -- --reference-library "$LIB" "$@"
 fi
 

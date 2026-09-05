@@ -12,9 +12,9 @@ From the repository root:
 
 From the repository root, `./run.sh --style 853417012 ...` does everything
 below in order - checks the saved sign-in and prompts for one when it has
-lapsed, downloads the style's shots into `inputs/reference_library/853417/`,
-and runs the harness against them. The commands that follow are the same steps
-run one at a time.
+lapsed, downloads the style's shots flat into `inputs/reference_library/` (no
+per-style folder), and runs the harness against the whole library. The commands
+that follow are the same steps run one at a time.
 
 ## Sign in
 
@@ -37,8 +37,10 @@ The scraper searches with the first six digits and requires `FINAL` assets. It
 takes up to three `P01` images, then falls back to `AV5`. If neither exists, it
 takes up to three images from each available Shot Request ID.
 
-The JPGs land in `inputs/reference_library/`. The source ZIP and the manifest
-stay in `downloads/<first-six-digits>/`.
+The JPGs land directly in `inputs/reference_library/`, flat: no per-style
+folder, and any folder inside the DAM's ZIP is dropped rather than recreated.
+The source ZIP and the manifest stay in `downloads/<first-six-digits>/`; the
+manifest is what records which files belong to which style.
 
 Override either location with `--image-root` and `--output-root`, or with the
 `DAM_IMAGE_ROOT` and `DAM_OUTPUT_ROOT` environment variables.

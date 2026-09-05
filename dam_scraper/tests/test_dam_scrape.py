@@ -18,6 +18,7 @@ from dam_scrape import (
     ShotBatch,
     apply_exclusive_facet,
     choose_shot_batches,
+    extract_archive,
     find_facet_containers,
     inspect_jpg_archive,
     is_complete_manifest_reusable,
@@ -482,6 +483,49 @@ class ArchiveTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ScrapeError, "Expected 2"):
                 inspect_jpg_archive(archive_path, expected_count=2)
+
+    def test_archive_members_are_named_by_bare_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            archive_path = Path(temporary_directory) / "assets.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("853417/first.jpg", b"one")
+                archive.writestr("853417/nested/second.jpg", b"two")
+
+            self.assertEqual(
+                inspect_jpg_archive(archive_path, expected_count=2),
+                [
+                    {"filename": "first.jpg", "bytes": 3},
+                    {"filename": "second.jpg", "bytes": 3},
+                ],
+            )
+
+    def test_archive_rejects_two_members_with_the_same_bare_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            archive_path = Path(temporary_directory) / "assets.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("a/same.jpg", b"one")
+                archive.writestr("b/same.jpg", b"two")
+
+            with self.assertRaisesRegex(ScrapeError, "two files named same.jpg"):
+                inspect_jpg_archive(archive_path, expected_count=2)
+
+    def test_extract_archive_writes_members_flat(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            archive_path = Path(temporary_directory) / "assets.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("853417/", b"")
+                archive.writestr("853417/first.jpg", b"one")
+                archive.writestr("853417/nested/second.jpg", b"two")
+            destination = Path(temporary_directory) / "library"
+
+            extract_archive(archive_path, destination)
+
+            self.assertEqual(
+                sorted(p.relative_to(destination).as_posix() for p in destination.rglob("*")),
+                ["first.jpg", "second.jpg"],
+            )
+            self.assertEqual((destination / "first.jpg").read_bytes(), b"one")
+            self.assertEqual((destination / "second.jpg").read_bytes(), b"two")
 
     def test_archive_rejects_unsafe_member(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

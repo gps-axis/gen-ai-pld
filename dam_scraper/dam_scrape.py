@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -115,9 +116,14 @@ def sha256_file(path: Path) -> str:
 
 
 def inspect_jpg_archive(path: Path, expected_count: int) -> list[dict[str, object]]:
+    """The JPGs the archive holds, named as they will sit in the reference
+    library: by bare filename, whatever folder the DAM wrapped them in. The
+    library is one flat folder - the harness picks a reference from everything
+    in it - so a folder inside the ZIP is dropped, not reproduced."""
     try:
         with zipfile.ZipFile(path) as archive:
             members = []
+            seen: set[str] = set()
             for info in archive.infolist():
                 member_path = Path(info.filename)
                 if info.is_dir():
@@ -128,7 +134,13 @@ def inspect_jpg_archive(path: Path, expected_count: int) -> list[dict[str, objec
                     raise ScrapeError(
                         f"DAM archive contained a non-JPG file: {info.filename}"
                     )
-                members.append({"filename": info.filename, "bytes": info.file_size})
+                if member_path.name in seen:
+                    raise ScrapeError(
+                        f"DAM archive holds two files named {member_path.name}; "
+                        "they cannot both land in the flat reference library."
+                    )
+                seen.add(member_path.name)
+                members.append({"filename": member_path.name, "bytes": info.file_size})
     except zipfile.BadZipFile as exc:
         raise ScrapeError("The DAM response was not a valid ZIP archive.") from exc
 
@@ -140,9 +152,16 @@ def inspect_jpg_archive(path: Path, expected_count: int) -> list[dict[str, objec
 
 
 def extract_archive(path: Path, destination: Path) -> None:
+    """Write every file in the archive straight into destination, flat. Folders
+    inside the ZIP are not recreated; see inspect_jpg_archive."""
     destination.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path) as archive:
-        archive.extractall(destination)
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            target = destination / Path(info.filename).name
+            with archive.open(info) as source, target.open("wb") as sink:
+                shutil.copyfileobj(source, sink)
 
 
 def write_json_atomic(path: Path, value: dict[str, object]) -> None:
@@ -605,7 +624,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--image-root",
         type=Path,
         default=Path(os.environ.get("DAM_IMAGE_ROOT", DEFAULT_IMAGE_ROOT)),
-        help="Where the extracted JPGs are written; defaults to the reference library.",
+        help=(
+            "Where the extracted JPGs are written, flat, with no per-style folder; "
+            "defaults to the reference library."
+        ),
     )
     parser.add_argument("--url", default=DEFAULT_SEARCH_URL)
     parser.add_argument("--headed", action="store_true")
