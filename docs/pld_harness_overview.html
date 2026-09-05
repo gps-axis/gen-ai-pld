@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- How the PLD harness works, as one page. Also published at
+     https://claude.ai/code/artifact/55a65eb5-57c9-4bb8-bae9-92962f7be135
+     Open this file directly in a browser; fonts load from Google Fonts, everything else is inline. -->
+<title>PLD Harness</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+</head>
+<body>
+<style>
+  :root {
+    --paper: #f2f3f0;
+    --plate: #ffffff;
+    --ink: #1b1f24;
+    --ink-2: #4b5563;
+    --ink-3: #7b8494;
+    --rule: #d4d8d2;
+    --rule-soft: #e4e7e2;
+    --source: #6b7a3d;
+    --source-soft: #e5e9d4;
+    --target: #2f4b7c;
+    --target-soft: #dde4f1;
+    --gate: #a24c2c;
+    --gate-soft: #f1e0d8;
+    --shadow: rgba(27, 31, 36, 0.10);
+    --display: "Bricolage Grotesque", "Archivo", "Helvetica Neue", Arial, sans-serif;
+    --body: "IBM Plex Sans", "Segoe UI", Helvetica, Arial, sans-serif;
+    --mono: "IBM Plex Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #15181d;
+      --plate: #1d2127;
+      --ink: #e7e9ec;
+      --ink-2: #b4bac4;
+      --ink-3: #8a919d;
+      --rule: #343a43;
+      --rule-soft: #262b33;
+      --source: #b3c273;
+      --source-soft: #2b3122;
+      --target: #93aadb;
+      --target-soft: #222b3d;
+      --gate: #e08a6a;
+      --gate-soft: #3a2822;
+      --shadow: rgba(0, 0, 0, 0.35);
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #15181d;
+    --plate: #1d2127;
+    --ink: #e7e9ec;
+    --ink-2: #b4bac4;
+    --ink-3: #8a919d;
+    --rule: #343a43;
+    --rule-soft: #262b33;
+    --source: #b3c273;
+    --source-soft: #2b3122;
+    --target: #93aadb;
+    --target-soft: #222b3d;
+    --gate: #e08a6a;
+    --gate-soft: #3a2822;
+    --shadow: rgba(0, 0, 0, 0.35);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 16px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--target); }
+  h1, h2, h3 { font-family: var(--display); text-wrap: balance; margin: 0; }
+  h1 { font-size: clamp(2.4rem, 5vw, 3.6rem); line-height: 1.02; font-weight: 800; letter-spacing: -0.02em; }
+  h2 { font-size: 1.75rem; font-weight: 700; letter-spacing: -0.01em; line-height: 1.15; }
+  h3 { font-size: 1.1rem; font-weight: 700; }
+  p { margin: 0; max-width: 66ch; }
+  code, .mono { font-family: var(--mono); font-size: 0.92em; }
+  code { background: var(--rule-soft); padding: 0.05em 0.35em; border-radius: 3px; }
+
+  .wrap { width: min(1120px, 100% - 48px); margin: 0 auto; }
+  .col { width: min(760px, 100%); }
+  section { padding: 56px 0; border-top: 1px solid var(--rule-soft); }
+  section:first-of-type { border-top: 0; }
+  .eyebrow {
+    font-family: var(--mono); font-size: 0.75rem; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--ink-3); margin-bottom: 14px; display: flex; gap: 12px; align-items: center;
+  }
+  .eyebrow::after { content: ""; flex: 0 0 40px; height: 1px; background: var(--rule); }
+  .stack { display: grid; gap: 18px; }
+  .lede { font-size: 1.15rem; color: var(--ink-2); }
+
+  /* hero */
+  .hero { padding: 64px 0 40px; display: grid; gap: 28px; }
+  .hero-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr); gap: 40px; align-items: center; }
+  @media (max-width: 860px) { .hero-grid { grid-template-columns: 1fr; } }
+  .command {
+    font-family: var(--mono); font-size: 0.86rem; line-height: 1.6; color: var(--ink);
+    background: var(--plate); border: 1px solid var(--rule); border-radius: 6px; padding: 14px 18px;
+    overflow-x: auto; white-space: pre; box-shadow: 0 1px 0 var(--shadow);
+  }
+  .command .dim { color: var(--ink-3); }
+  .command .flag { color: var(--target); }
+
+  /* figures */
+  figure { margin: 0; display: grid; gap: 12px; }
+  figure svg { width: 100%; height: auto; display: block; color: var(--ink); }
+  figcaption { font-size: 0.9rem; color: var(--ink-2); max-width: 78ch; }
+  .band { background: var(--plate); border: 1px solid var(--rule); border-radius: 8px; padding: 22px 22px 18px; overflow-x: auto; }
+  .band svg { min-width: 640px; }
+  svg text { font-family: var(--body); font-size: 12.5px; fill: currentColor; }
+  svg text.mono { font-family: var(--mono); font-size: 11.5px; }
+  svg text.small { font-size: 11px; fill: var(--ink-2); }
+  svg text.label { font-size: 11px; fill: var(--ink-2); }
+  svg .box { fill: var(--paper); stroke: currentColor; stroke-width: 1.2; }
+  svg .box-target { fill: var(--target-soft); stroke: var(--target); stroke-width: 1.2; }
+  svg .box-source { fill: var(--source-soft); stroke: var(--source); stroke-width: 1.2; }
+  svg .box-gate { fill: var(--gate-soft); stroke: var(--gate); stroke-width: 1.2; }
+  svg .box-service { fill: none; stroke: var(--ink-3); stroke-width: 1.2; stroke-dasharray: 4 3; }
+  svg .flow { stroke: currentColor; stroke-width: 1.3; fill: none; }
+  svg .flow-soft { stroke: var(--ink-3); stroke-width: 1.2; fill: none; stroke-dasharray: 5 4; }
+  svg .flow-gate { stroke: var(--gate); stroke-width: 1.2; fill: none; stroke-dasharray: 5 4; }
+  svg .plate { fill: var(--plate); stroke: var(--rule); stroke-width: 1; }
+  svg .garment-source { fill: var(--source); }
+  svg .garment-target { fill: var(--target); }
+  svg .crease { stroke: var(--source-soft); stroke-width: 1.4; fill: none; opacity: 0.9; }
+  svg .pin { fill: var(--paper); stroke: var(--ink); stroke-width: 1.2; }
+  svg .tick { stroke: var(--rule); stroke-width: 1; }
+
+  /* lists and tables */
+  .steps { display: grid; gap: 0; counter-reset: step; border-top: 1px solid var(--rule); }
+  .step { display: grid; grid-template-columns: 56px minmax(0, 1fr); gap: 18px; padding: 18px 0; border-bottom: 1px solid var(--rule-soft); }
+  .step .n { font-family: var(--mono); color: var(--ink-3); font-size: 0.9rem; padding-top: 3px; }
+  .step h3 { margin-bottom: 4px; }
+  .step p { color: var(--ink-2); }
+  table { border-collapse: collapse; width: 100%; font-size: 0.95rem; }
+  .tablewrap { overflow-x: auto; }
+  th, td { text-align: left; padding: 10px 12px 10px 0; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
+  th { font-family: var(--mono); font-size: 0.74rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-3); font-weight: 500; }
+  td.k { font-family: var(--mono); white-space: nowrap; color: var(--ink); }
+  td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .want { color: var(--target); font-weight: 500; }
+  .sample {
+    font-family: var(--mono); font-size: 0.86rem; background: var(--plate); border: 1px solid var(--rule);
+    border-radius: 6px; padding: 12px 16px; overflow-x: auto; white-space: pre;
+  }
+  .sample b { font-weight: 500; color: var(--target); }
+  .two { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 28px; }
+  @media (max-width: 760px) { .two { grid-template-columns: 1fr; } }
+  .kv { display: grid; grid-template-columns: minmax(0, 11rem) minmax(0, 1fr); gap: 10px 18px; font-size: 0.95rem; align-items: start; }
+  .kv dt { font-family: var(--mono); color: var(--ink); font-size: 0.86rem; line-height: 1.5; overflow-wrap: anywhere; }
+  .kv dd { margin: 0; color: var(--ink-2); }
+  .exit { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 14px; align-items: baseline; padding: 12px 0; border-bottom: 1px solid var(--rule-soft); }
+  .exit .code { font-family: var(--mono); font-size: 1.3rem; font-weight: 500; }
+  .exit .code.gate { color: var(--gate); }
+  .exit p { color: var(--ink-2); }
+  footer { padding: 36px 0 56px; color: var(--ink-3); font-size: 0.85rem; border-top: 1px solid var(--rule-soft); }
+  footer .mono { color: var(--ink-2); }
+  @media (prefers-reduced-motion: no-preference) {
+    .hero-grid svg .garment-target { transition: transform 300ms ease; }
+  }
+</style>
+
+<main class="wrap">
+
+  <section class="hero">
+    <div class="hero-grid">
+      <div class="stack">
+        <div class="eyebrow">PLD Harness</div>
+        <h1>A garment off the wall, laid flat, in one command.</h1>
+        <p class="lede">The harness takes a phone photo of a pinned, creased garment and a real laydown shot of a similar product, then lets a model iterate with an image editor until the garment sits in the reference's lay. It measures every attempt, refuses to ship anything it did not generate untouched, and stops before spending money when the inputs are not good enough.</p>
+      </div>
+      <figure>
+        <svg viewBox="0 0 760 320" role="img" aria-label="A pinned, tilted, creased garment on the left becomes a square, flat garment on a white plate on the right.">
+          <defs>
+            <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+            </marker>
+          </defs>
+          <!-- left: the off-set photo -->
+          <rect x="20" y="20" width="300" height="280" rx="4" class="plate" fill="var(--rule-soft)"/>
+          <text x="32" y="42" class="mono">image 1  off-set, pinned to the wall</text>
+          <g transform="translate(170 178) rotate(-9)">
+            <path class="garment-source" d="M -62 -78 L -22 -90 Q 0 -100 22 -90 L 62 -78 L 112 -34 L 96 -8 L 66 -22 L 78 92 L 56 96 L 52 -6 L 52 88 L -52 88 L -52 -10 L -66 90 L -88 86 L -70 -22 L -96 -8 L -112 -34 Z"/>
+            <path class="crease" d="M -40 -20 Q -10 10 -44 60 M 10 -40 Q 30 20 6 70 M -20 20 Q 20 40 40 20"/>
+            <circle cx="-56" cy="-84" r="4.5" class="pin"/>
+            <circle cx="56" cy="-84" r="4.5" class="pin"/>
+          </g>
+          <ellipse cx="180" cy="284" rx="96" ry="6" fill="var(--rule)" opacity="0.7"/>
+          <!-- arrow -->
+          <line x1="336" y1="160" x2="420" y2="160" class="flow" marker-end="url(#arr)"/>
+          <text x="378" y="146" text-anchor="middle" class="label">re-laid</text>
+          <text x="378" y="184" text-anchor="middle" class="label">not redrawn</text>
+          <!-- right: the laydown -->
+          <rect x="440" y="20" width="300" height="280" rx="4" class="plate"/>
+          <text x="452" y="42" class="mono">image 2  the reference lay</text>
+          <g transform="translate(590 176)">
+            <path class="garment-target" d="M -62 -78 L -22 -90 Q 0 -100 22 -90 L 62 -78 L 118 -26 L 104 4 L 60 -14 L 60 92 L -60 92 L -60 -14 L -104 4 L -118 -26 Z"/>
+          </g>
+          <line x1="452" y1="290" x2="728" y2="290" class="tick"/>
+          <line x1="452" y1="286" x2="452" y2="294" class="tick"/>
+          <line x1="728" y1="286" x2="728" y2="294" class="tick"/>
+          <text x="590" y="283" text-anchor="middle" class="small">same size in the frame, same margins</text>
+        </svg>
+        <figcaption>The job, in the order the skill file states it: the silhouette first, then flat, then the size in the frame. Colour is judged last, on hue only. The construction stays image 1's.</figcaption>
+      </figure>
+    </div>
+    <div class="command"><span class="dim">$</span> ./run.sh <span class="flag">--style</span> 671304002 <span class="flag">--item-details</span> "GAP MENS MENS KNITS L/S KNITS" \
+         <span class="flag">--source</span> inputs/off_set_image.jpg <span class="flag">--max-images</span> 10 <span class="flag">--yolo</span> \
+         <span class="flag">--task</span> "make the off_set_image.jpg look like the reference_greyscale shape"</div>
+  </section>
+
+  <section>
+    <div class="col stack">
+      <div class="eyebrow">The whole run</div>
+      <h2>One command, four stages, two places it may stop for free.</h2>
+      <p class="lede">run.sh signs in to the DAM, pulls the reference candidates, then hands everything to the harness. The harness cleans the source, chooses the reference, and only then lets the model start spending images.</p>
+    </div>
+    <figure style="margin-top: 28px">
+      <div class="band">
+        <svg viewBox="0 0 1040 470" role="img" aria-label="Pipeline map: the Gap DAM fills the reference library; the source photo is segmented by the SAM3 service; the reference search scores the library against the segmented source; the agent loop generates candidates through fal.ai and measures them; the best four land in the output folder. Two gates can end the run early with exit codes 21 and 20.">
+          <defs>
+            <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+            </marker>
+            <marker id="arr-soft" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--ink-3)"/>
+            </marker>
+            <marker id="arr-gate" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--gate)"/>
+            </marker>
+          </defs>
+
+          <!-- lane labels -->
+          <text x="12" y="30" class="mono">outside the repo</text>
+          <text x="12" y="176" class="mono">the harness run   runs/&lt;session&gt;/</text>
+          <text x="12" y="372" class="mono">on disk</text>
+          <line x1="12" y1="150" x2="1028" y2="150" class="tick"/>
+          <line x1="12" y1="356" x2="1028" y2="356" class="tick"/>
+
+          <!-- services row -->
+          <rect x="230" y="48" width="180" height="60" rx="5" class="box-service"/>
+          <text x="320" y="73" text-anchor="middle">SAM3 segmenter</text>
+          <text x="320" y="92" text-anchor="middle" class="small">local service, free</text>
+
+          <rect x="660" y="48" width="180" height="60" rx="5" class="box-service"/>
+          <text x="750" y="73" text-anchor="middle">fal.ai image editor</text>
+          <text x="750" y="92" text-anchor="middle" class="small">the only billed step</text>
+
+          <rect x="12" y="380" width="200" height="60" rx="5" class="box-service"/>
+          <text x="112" y="405" text-anchor="middle">Gap DAM (OrangeLogic)</text>
+          <text x="112" y="424" text-anchor="middle" class="small">Photo Studio view, FINAL laydowns</text>
+
+          <!-- harness row -->
+          <rect x="12" y="200" width="176" height="70" rx="5" class="box-source"/>
+          <text x="100" y="226" text-anchor="middle">source photo</text>
+          <text x="100" y="245" text-anchor="middle" class="small">off-set, HEIC or JPG</text>
+
+          <rect x="232" y="200" width="176" height="70" rx="5" class="box"/>
+          <text x="320" y="222" text-anchor="middle">step 0</text>
+          <text x="320" y="240" text-anchor="middle" class="small">cutout on a white plate,</text>
+          <text x="320" y="255" text-anchor="middle" class="small">clip bites closed</text>
+
+          <rect x="452" y="200" width="176" height="70" rx="5" class="box"/>
+          <text x="540" y="222" text-anchor="middle">reference search</text>
+          <text x="540" y="240" text-anchor="middle" class="small">vision model describes,</text>
+          <text x="540" y="255" text-anchor="middle" class="small">scores; needs 78</text>
+
+          <rect x="672" y="200" width="176" height="70" rx="5" class="box-target"/>
+          <text x="760" y="222" text-anchor="middle">agent loop</text>
+          <text x="760" y="240" text-anchor="middle" class="small">prompt, generate, measure,</text>
+          <text x="760" y="255" text-anchor="middle" class="small">look, repeat; 10-image ceiling</text>
+
+          <rect x="892" y="200" width="136" height="70" rx="5" class="box"/>
+          <text x="960" y="222" text-anchor="middle">output/</text>
+          <text x="960" y="240" text-anchor="middle" class="small mono">best.png x4</text>
+          <text x="960" y="255" text-anchor="middle" class="small mono">picks.json LOG.md</text>
+
+          <!-- disk row -->
+          <rect x="452" y="380" width="176" height="60" rx="5" class="box"/>
+          <text x="540" y="403" text-anchor="middle" class="mono">inputs/reference_library/</text>
+          <text x="540" y="422" text-anchor="middle" class="small">flat JPGs; each described once, cached</text>
+
+          <!-- flows: harness row -->
+          <line x1="188" y1="235" x2="230" y2="235" class="flow" marker-end="url(#arr2)"/>
+          <line x1="408" y1="235" x2="450" y2="235" class="flow" marker-end="url(#arr2)"/>
+          <text x="429" y="226" text-anchor="middle" class="label">clean</text>
+          <line x1="628" y1="235" x2="670" y2="235" class="flow" marker-end="url(#arr2)"/>
+          <text x="649" y="226" text-anchor="middle" class="label">grey</text>
+          <line x1="848" y1="235" x2="890" y2="235" class="flow" marker-end="url(#arr2)"/>
+
+          <!-- source to SAM3 and back -->
+          <path d="M 300 200 L 300 110" class="flow" marker-end="url(#arr2)"/>
+          <path d="M 340 108 L 340 198" class="flow" marker-end="url(#arr2)"/>
+          <text x="352" y="150" class="label">segment</text>
+
+          <!-- loop to fal and back -->
+          <path d="M 740 200 L 740 110" class="flow" marker-end="url(#arr2)"/>
+          <text x="600" y="160" class="label" text-anchor="end">generate, one call per image</text>
+          <path d="M 780 108 L 780 198" class="flow" marker-end="url(#arr2)"/>
+          <text x="792" y="160" class="label">cand_NN, measured on arrival</text>
+
+          <!-- loop can segment a candidate too -->
+          <path d="M 672 214 L 650 214 L 650 136 L 390 136 L 390 110" class="flow-soft" marker-end="url(#arr-soft)"/>
+          <text x="520" y="128" text-anchor="middle" class="label">a candidate may be segmented and generated from</text>
+
+          <!-- library to search -->
+          <path d="M 540 380 L 540 272" class="flow" marker-end="url(#arr2)"/>
+          <text x="552" y="300" class="label">candidates</text>
+
+          <!-- DAM to library -->
+          <line x1="212" y1="400" x2="450" y2="400" class="flow" marker-end="url(#arr2)"/>
+          <text x="331" y="392" text-anchor="middle" class="label">--style: up to 10 laydowns per shot code</text>
+          <line x1="212" y1="424" x2="450" y2="424" class="flow-soft" marker-end="url(#arr-soft)"/>
+          <text x="331" y="438" text-anchor="middle" class="label">--item-details: the first 50 for the text</text>
+
+          <!-- gates -->
+          <path d="M 320 270 L 320 294" class="flow-gate" marker-end="url(#arr-gate)"/>
+          <text x="320" y="310" text-anchor="middle" class="label" fill="var(--gate)">exit 21: the gate rejected the source</text>
+          <path d="M 500 270 L 500 334 L 60 334 L 60 378" class="flow-gate" marker-end="url(#arr-gate)"/>
+          <text x="280" y="348" text-anchor="middle" class="label" fill="var(--gate)">nothing reached 78: last resort, pull the text's first page, then search once more</text>
+          <text x="552" y="322" class="label" fill="var(--gate)">still nothing: exit 20, nothing billed</text>
+        </svg>
+      </div>
+      <figcaption>Solid arrows are the path every successful run takes. Dashed grey arrows are moves the model or the operator may add. Dashed rust arrows are the two gates: a source the segmenter proves is damaged, and a library with nothing close enough to this garment. Both stop the run before the first billed image.</figcaption>
+    </figure>
+
+    <div class="col" style="margin-top: 36px">
+      <div class="steps">
+        <div class="step"><div class="n">run.sh</div><div><h3>Sign in, then pull the references</h3><p>Checks the saved DAM session and signs in from the terminal when it has expired. Downloads the style's laydown shots into the shared library, verifies by filename that every JPG the manifest lists is there, then starts the harness under one session stamp so the whole run lives in one folder.</p></div></div>
+        <div class="step"><div class="n">step 0</div><div><h3>Segment the source, never judge the raw photo</h3><p>The segmenter drops the wall and its shadow and stands the garment on a white plate. Notches left by hanger clips in the top edge are closed with fabric from either side, so the generator sees an unbroken waistband instead of a bite to copy. A damaged result stops the run with exit 21.</p></div></div>
+        <div class="step"><div class="n">search</div><div><h3>Choose the reference from the library</h3><p>A vision model describes the segmented source and every library image, then scores each candidate on garment type, lay, and tone. Colour weighs half, tone four times more. The best candidate must reach 78; the winner is desaturated into <code>reference_greyscale.jpg</code>, because it is a shape reference and never a colour target.</p></div></div>
+        <div class="step"><div class="n">loop</div><div><h3>Let the model work towards the reference</h3><p>Turn 1 pins both images into the conversation. From there every tool is available on every turn: edit the prompt section by section, generate one or two images, segment a candidate, measure, compare, take notes. Each new candidate arrives with its numbers underneath, so the model sees what it bought without spending a turn asking.</p></div></div>
+        <div class="step"><div class="n">ship</div><div><h3>Deliver the best four, untouched</h3><p><code>pick_best</code> names up to four candidates exactly as fal.ai returned them. A segmented or polished file is refused. Empty slots are filled by the harness from its own lay ranking, and <code>picks.json</code> says which were the model's and which were filled. <code>finish</code> closes with an honest status.</p></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="col stack">
+      <div class="eyebrow">Where the reference comes from</div>
+      <h2>A style number first, free text when the number has nothing.</h2>
+      <p class="lede">The DAM is searched inside the Gap folder with the view's standing filters: laydown shot type and FINAL production status. Every pull is recorded in its own manifest, so a repeat run comes back from the zip without touching the network.</p>
+    </div>
+    <figure style="margin-top: 28px">
+      <div class="band">
+        <svg viewBox="0 0 1040 250" role="img" aria-label="Decision flow for the reference pull: a nine-digit style is searched on its first six digits; if laydown assets exist, up to ten are taken per shot code, preferring P01 then AV5; if none exist, the item-details text is searched and the first fifty results are taken; both land in the same flat library with a manifest.">
+          <defs>
+            <marker id="arr3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+            </marker>
+            <marker id="arr3-soft" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--ink-3)"/>
+            </marker>
+          </defs>
+          <rect x="12" y="40" width="176" height="64" rx="5" class="box"/>
+          <text x="100" y="64" text-anchor="middle" class="mono">--style 671304002</text>
+          <text x="100" y="84" text-anchor="middle" class="small">searched as 671304</text>
+
+          <rect x="248" y="40" width="200" height="64" rx="5" class="box"/>
+          <text x="348" y="64" text-anchor="middle">any laydown assets?</text>
+          <text x="348" y="84" text-anchor="middle" class="small">Gap folder, Shot Type L, FINAL</text>
+
+          <rect x="508" y="20" width="240" height="104" rx="5" class="box-target"/>
+          <text x="628" y="44" text-anchor="middle">shot request policy</text>
+          <text x="628" y="64" text-anchor="middle" class="small">P01 if it exists, else AV5,</text>
+          <text x="628" y="79" text-anchor="middle" class="small">else every code that has shots</text>
+          <text x="628" y="102" text-anchor="middle" class="mono">up to 10 per code</text>
+
+          <rect x="508" y="160" width="240" height="70" rx="5" class="box"/>
+          <text x="628" y="184" text-anchor="middle" class="mono">--item-details "GAP MENS ... SHORTS"</text>
+          <text x="628" y="204" text-anchor="middle" class="small">the DAM's own order, any shot code,</text>
+          <text x="628" y="219" text-anchor="middle" class="small mono">first 50 (one results page)</text>
+
+          <rect x="808" y="72" width="220" height="104" rx="5" class="box"/>
+          <text x="918" y="98" text-anchor="middle">one zip, unpacked flat</text>
+          <text x="918" y="118" text-anchor="middle" class="small mono">inputs/reference_library/</text>
+          <text x="918" y="140" text-anchor="middle" class="small">manifest under</text>
+          <text x="918" y="156" text-anchor="middle" class="small mono">dam_scraper/downloads/</text>
+
+          <line x1="188" y1="72" x2="246" y2="72" class="flow" marker-end="url(#arr3)"/>
+          <line x1="448" y1="60" x2="506" y2="60" class="flow" marker-end="url(#arr3)"/>
+          <text x="477" y="51" text-anchor="middle" class="label">yes</text>
+          <path d="M 448 90 L 478 90 L 478 195 L 506 195" class="flow" marker-end="url(#arr3)"/>
+          <text x="462" y="150" text-anchor="middle" class="label">no</text>
+          <line x1="748" y1="72" x2="806" y2="100" class="flow" marker-end="url(#arr3)"/>
+          <line x1="748" y1="195" x2="806" y2="150" class="flow" marker-end="url(#arr3)"/>
+
+          <path d="M 12 160 L 12 195 L 506 195" class="flow-soft"/>
+          <text x="20" y="150" class="label">--item-details alone, or the harness's last resort after a failed search</text>
+        </svg>
+      </div>
+      <figcaption>The two searches share one download method: select the cards, Download, JPG Original Resolution, Standard download. The text search is also the harness's last resort. When the style's shots are in the library but none matches the garment, the harness pulls the text's first page and searches once more before it returns exit 20.</figcaption>
+    </figure>
+    <div class="col two" style="margin-top: 32px">
+      <dl class="kv">
+        <dt>P01, AV5, AV2</dt><dd>Shot request codes. P01 and AV5 are the laydown angles worth having; a style with neither yields every code it does have, capped per code.</dd>
+        <dt>Already complete</dt><dd>A manifest written under the current cap is reused. One written under a smaller cap is fetched again, unless it already took every shot the DAM had.</dd>
+        <dt>Restored N JPG files</dt><dd>The library was emptied since the last pull; the JPGs come back from the saved zip, no network.</dd>
+      </dl>
+      <dl class="kv">
+        <dt>no laydown assets</dt><dd>The style search came back empty. The DAM search is case-sensitive: <code>Hoodie</code> returned 313 laydowns, <code>hoodie</code> none.</dd>
+        <dt>Applied Filters popup</dt><dd>Opens over the first asset card when the filter panel is pinned open. The scraper closes it before selecting, or every click is intercepted.</dd>
+        <dt>bundle time</dt><dd>The DAM builds the zip before the download starts. Fifty originals came to 206 MB and about five minutes.</dd>
+      </dl>
+    </div>
+  </section>
+
+  <section>
+    <div class="col stack">
+      <div class="eyebrow">The numbers under every candidate</div>
+      <h2>Five readings, printed in the order they matter.</h2>
+      <p class="lede">All of them are measured against the original source and the run's reference, never a candidate's parent. The source's own lay score is printed beside each candidate so movement is visible at a glance.</p>
+    </div>
+    <div class="col stack" style="margin-top: 28px">
+      <div class="sample">cand_10  <b>LAY 0.969</b> vs ref (source starts 0.867)  size x0.99  flat x0.39  colour dE 24.1 (hue 4.2)  same-garment IoU 0.863</div>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>reading</th><th>what it measures</th><th>wanted</th><th>read it as</th></tr></thead>
+          <tbody>
+            <tr><td class="k">LAY</td><td>The candidate's silhouette against the reference, normalised to the bounding box. The primary number.</td><td class="num want">above 0.90</td><td>Below about 0.90 the pose is still the source's. The prompt's pose section, or <code>match_pose</code>, is what moves it.</td></tr>
+            <tr><td class="k">size</td><td>The garment's share of the frame over the reference's.</td><td class="num want">1.0</td><td>1.4 means the candidate kept the source's framing. A redraw usually lands near 1.0.</td></tr>
+            <tr><td class="k">flat</td><td>Surface energy over the source's own.</td><td class="num want">below 1</td><td>A flat redraw sits at 0.4 to 0.5. Near or above 1 the creases survived. Far below 1 only matters if the construction went with them.</td></tr>
+            <tr><td class="k">colour dE (hue)</td><td>Colour difference read off the lit fabric of both garments. Judged on the hue part.</td><td class="num want">hue under 4</td><td>Under 4 is the same colourway. Over about 8 is a different one and disqualifies. Between the two, the lay decides.</td></tr>
+            <tr><td class="k">same-garment IoU</td><td>The candidate against the source's silhouette.</td><td class="num want">falls</td><td>It drops when the lay changes, which is the job. High here with a low LAY means nothing moved. Below about 0.58 it is not the same object.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p style="color: var(--ink-2)">Two more checks arrive as text, not numbers: a lay check that compares the pose only, and a pins-and-labels read that says whether a sewn-in label, a logo or a seam went missing. A line marked <code>!</code> means the numbers are not evidence for that candidate.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="col two">
+      <div class="stack">
+        <div class="eyebrow">What the model can do</div>
+        <h2>Sixteen tools, every one available every turn.</h2>
+        <dl class="kv">
+          <dt>prompt_set, prompt_show</dt><dd>Write and check the prompt as named sections. Free.</dd>
+          <dt>generate</dt><dd>One fal.ai call per image, from the source or from any candidate. The only billed step, about 15 cents at 2K.</dd>
+          <dt>segment</dt><dd>Cut out a candidate too. The result is a cutout for measuring or generating from, never for shipping.</dd>
+          <dt>measure, compare_images, view_image</dt><dd>The numbers above, a side-by-side, a look. Free.</dd>
+          <dt>pick_best</dt><dd>The ranked list of what ships. Re-issue it as better ones arrive; the last call wins.</dd>
+          <dt>finish</dt><dd>Close the run with one of four honest statuses.</dd>
+        </dl>
+      </div>
+      <div class="stack">
+        <div class="eyebrow">How a run ends</div>
+        <h2>Exit codes say what to fix.</h2>
+        <div>
+          <div class="exit"><div class="code">0</div><div><h3>done, or budget exhausted</h3><p>The best four are in <code>output/</code> with <code>picks.json</code> and the model's <code>LOG.md</code> beside them.</p></div></div>
+          <div class="exit"><div class="code">1</div><div><h3>something broke</h3><p>A tool, the model server, or the search itself. Look at <code>run.log</code> in the run folder before looking at the garment.</p></div></div>
+          <div class="exit"><div class="code gate">20</div><div><h3>no reference</h3><p>The library holds nothing close enough, even after the text pull. Fix: add a suitable laydown, pass <code>--reference</code>, or give better <code>--item-details</code> text. Nothing was billed.</p></div></div>
+          <div class="exit"><div class="code gate">21</div><div><h3>unclean source</h3><p>The segmentation gate rejected the photo. Fix the input, not the model.</p></div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <div class="col">
+      One run, one folder: <span class="mono">runs/&lt;session&gt;/</span> holds the segmented source, the greyscale reference, every candidate with its measurements, the transcript, and <span class="mono">run.log</span>. References live flat in <span class="mono">inputs/reference_library/</span>; which files belong to which pull is in the manifests under <span class="mono">dam_scraper/downloads/</span>, not in the folder layout.
+    </div>
+  </footer>
+
+</main>
+
+</body>
+</html>
