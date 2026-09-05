@@ -2557,6 +2557,36 @@ def select_reference(run_dir: Path, library: Path, python: str,
     return rc, record
 
 
+def pull_item_details(text: str, library: Path) -> tuple[bool, str]:
+    """Ask the DAM scraper for the first page of laydown shots matching `text`
+    and put them in the library. (gained, note): whether the library holds any
+    file it did not hold before, and one line saying what happened.
+
+    Runs dam_scraper/dam_scrape.py under its own uv environment - playwright
+    lives there, not in the harness venv - the way run.sh does for the style
+    pull. A text already pulled comes back from the scraper's manifest without
+    touching the network, and then the library gains nothing, which is the
+    signal that searching it again would only repeat the miss.
+    """
+    dam = HERE / "dam_scraper"
+    if shutil.which("uv") is None:
+        return False, "uv is not installed, so the DAM cannot be searched from here"
+    before = {p.name for p in library.iterdir() if p.is_file()} if library.is_dir() else set()
+    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+    rc = stream_subprocess(
+        ["uv", "run", "--locked", "--project", str(dam), "python",
+         str(dam / "dam_scrape.py"), "--item-details", text,
+         "--image-root", str(library), "--output-root", str(dam / "downloads")],
+        cwd=dam, env=env, comp="item-details")
+    if rc != 0:
+        return False, f"the DAM pull failed (exit {rc})"
+    after = {p.name for p in library.iterdir() if p.is_file()}
+    gained = after - before
+    if not gained:
+        return False, "the library already held every shot that text returns"
+    return True, f"{len(gained)} new JPG(s) in the library"
+
+
 def resolve_reference(args, workspace: Path) -> tuple[Path | None, Path | None]:
     """What to use as the reference: (explicit file, library to search).
 
@@ -3150,6 +3180,13 @@ def main():
                          "given. tools/select_reference.py does the choosing; "
                          "run it with --index after adding images so a live run "
                          "does not pay to describe them.")
+    ap.add_argument("--item-details", metavar="TEXT", default=None,
+                    help="Last resort when the library search finds no match: "
+                         "the Gap DAM is searched with this text, the first "
+                         "page of laydown shots is pulled into the library, and "
+                         "the search runs once more before the run gives up. "
+                         "Needs the dam_scraper environment (uv) and a valid "
+                         "DAM sign-in; run.sh checks both.")
     # Kept in step with select_reference.DEFAULT_THRESHOLD by hand rather than
     # imported, because harness.py builds its parser before it has put tools/ on
     # the path. If they drift, this one wins - it is passed explicitly on every
@@ -3329,6 +3366,24 @@ def main():
     if ref_library is not None:
         rc, selection = select_reference(run_dir, ref_library, tools.python,
                                          args)
+        if rc == 2 and args.item_details:
+            # Before the run gives up: widen the library with the DAM's first
+            # page for the text and look once more. Only a library that
+            # actually grew is worth searching again.
+            print(c(YEL, "\n  no match in the library - last resort: pulling "
+                         "the DAM's first page of laydown shots for "
+                         f"\"{args.item_details}\""))
+            TR.info("step0", "no reference; pulling --item-details",
+                    text=args.item_details)
+            gained, note = pull_item_details(args.item_details, ref_library)
+            if gained:
+                print(c(DIM, f"    {note}; searching the library again"))
+                TR.info("step0", "library grew; searching again", note=note)
+                rc, selection = select_reference(run_dir, ref_library,
+                                                 tools.python, args)
+            else:
+                print(c(DIM, f"    {note}; the search result stands"))
+                TR.warn("step0", "item-details added nothing", note=note)
         if rc == 2:
             print(c(RED, "\nNO REFERENCE - the library holds nothing that can "
                          "serve as this garment's laydown."))
@@ -3344,8 +3399,10 @@ def main():
             if selection.get("contact_sheet"):
                 print(c(DIM, f"    near misses: {selection['contact_sheet']}"))
             print(c(DIM, "  Nothing was generated and nothing was billed. Add "
-                         "a suitable laydown to the library, or pass "
-                         "--reference to supply one directly."))
+                         "a suitable laydown to the library, pass --reference "
+                         "to supply one directly"
+                         + (", or give --item-details text for the DAM to "
+                            "search." if not args.item_details else ".")))
             TR.error("step0", "no reference found in the library",
                      closest=closest.get("score"),
                      vetoed=selection.get("model_vetoed"),

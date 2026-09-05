@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import io
 import json
 import tempfile
 import unittest
 import zipfile
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,19 +14,26 @@ from dam_scrape import (
     FINAL_ASSET_VALUE,
     FacetOption,
     FacetUnavailableError,
+    ITEM_DETAILS_LIMIT,
+    MAX_PER_CODE,
+    NoLaydownAssetsError,
+    REQUIRED_FILTERS,
     ScrapeError,
     SHOT_REQUEST_ID,
     ShotBatch,
     apply_exclusive_facet,
     choose_shot_batches,
+    dismiss_popups,
     extract_archive,
     find_facet_containers,
     inspect_jpg_archive,
     is_complete_manifest_reusable,
+    main,
     normalize_style_number,
     open_search_page,
     parse_selected_asset_count,
     parse_total_result_count,
+    read_result_total,
     safe_query_directory,
     select_asset_limit,
     toggle_facet_checkbox,
@@ -63,10 +71,13 @@ class SearchResultTests(unittest.TestCase):
 
 
 class ShotSelectionPolicyTests(unittest.TestCase):
-    def test_p01_takes_priority_and_is_capped_at_three(self) -> None:
+    def test_cap_is_ten_per_code(self) -> None:
+        self.assertEqual(MAX_PER_CODE, 10)
+
+    def test_p01_takes_priority_and_is_capped(self) -> None:
         self.assertEqual(
-            choose_shot_batches({"AV5": 8, "P01": 5, "P02": 4}),
-            (ShotBatch("P01", 3),),
+            choose_shot_batches({"AV5": 12, "P01": 15, "P02": 4}),
+            (ShotBatch("P01", 10),),
         )
 
     def test_p01_uses_every_available_asset_below_the_cap(self) -> None:
@@ -83,8 +94,8 @@ class ShotSelectionPolicyTests(unittest.TestCase):
 
     def test_every_available_code_is_used_when_preferred_codes_are_absent(self) -> None:
         self.assertEqual(
-            choose_shot_batches({"AV2": 5, "P02": 2, "AV1": 0}),
-            (ShotBatch("AV2", 3), ShotBatch("P02", 2)),
+            choose_shot_batches({"AV2": 12, "P02": 2, "AV1": 0}),
+            (ShotBatch("AV2", 10), ShotBatch("P02", 2)),
         )
 
     def test_no_available_shots_is_rejected(self) -> None:
@@ -132,6 +143,7 @@ class FacetSelectionTests(unittest.TestCase):
                     ("clear", title, None)
                 ),
             ),
+            patch("dam_scrape.read_result_total", return_value=12),
             patch(
                 "dam_scrape.apply_exclusive_facet",
                 side_effect=lambda _, title, value, __: facet_events.append(
@@ -234,6 +246,63 @@ class FacetSelectionTests(unittest.TestCase):
                     object(), ASSET_PRODUCTION_TYPE, FINAL_ASSET_VALUE, 100
                 )
 
+    def test_final_read_straight_after_the_click_may_lag_the_sidebar(self) -> None:
+        # The first read after the click still shows the old state; the next one
+        # has caught up. One click, no retry.
+        unchecked = (FacetOption(FINAL_ASSET_VALUE, 4, False),)
+        checked = (FacetOption(FINAL_ASSET_VALUE, 4, True),)
+        with (
+            patch(
+                "dam_scrape.read_facet_options",
+                side_effect=(unchecked, unchecked, unchecked, (), checked),
+            ),
+            patch("dam_scrape.toggle_facet_checkbox") as toggle,
+        ):
+            settled = apply_exclusive_facet(
+                _SettlePage(), ASSET_PRODUCTION_TYPE, FINAL_ASSET_VALUE, 10_000
+            )
+        self.assertEqual(settled, checked)
+        self.assertEqual(
+            [call.args[2] for call in toggle.call_args_list], [FINAL_ASSET_VALUE]
+        )
+
+    def test_final_click_the_dam_dropped_is_clicked_again(self) -> None:
+        unchecked = (FacetOption(FINAL_ASSET_VALUE, 4, False),)
+        checked = (FacetOption(FINAL_ASSET_VALUE, 4, True),)
+        with (
+            patch("dam_scrape.FACET_SETTLE_MS", 0),
+            patch(
+                "dam_scrape.read_facet_options",
+                # initial, pre-click, settle (still unchecked: click lost),
+                # pre-click again, settle (checked)
+                side_effect=(unchecked, unchecked, unchecked, unchecked, checked),
+            ),
+            patch("dam_scrape.toggle_facet_checkbox") as toggle,
+        ):
+            settled = apply_exclusive_facet(
+                _SettlePage(), ASSET_PRODUCTION_TYPE, FINAL_ASSET_VALUE, 10_000
+            )
+        self.assertEqual(settled, checked)
+        self.assertEqual(
+            [call.args[2] for call in toggle.call_args_list],
+            [FINAL_ASSET_VALUE, FINAL_ASSET_VALUE],
+        )
+
+    def test_final_that_never_sticks_fails_after_the_last_attempt(self) -> None:
+        unchecked = (FacetOption(FINAL_ASSET_VALUE, 4, False),)
+        with (
+            patch("dam_scrape.FACET_SETTLE_MS", 0),
+            patch("dam_scrape.read_facet_options", return_value=unchecked),
+            patch("dam_scrape.toggle_facet_checkbox") as toggle,
+        ):
+            with self.assertRaisesRegex(
+                ScrapeError, r"^Asset Production Type FINAL did not update\.$"
+            ):
+                apply_exclusive_facet(
+                    _SettlePage(), ASSET_PRODUCTION_TYPE, FINAL_ASSET_VALUE, 10_000
+                )
+        self.assertEqual(toggle.call_count, 3)
+
     def test_checkbox_lookup_is_scoped_to_the_named_facet(self) -> None:
         containers = _FacetContainers()
         page = _FacetPage()
@@ -255,6 +324,11 @@ class FacetSelectionTests(unittest.TestCase):
             'input[type=\'checkbox\'][aria-label="FINAL"]',
         )
         self.assertEqual(containers.checkbox.clicks, 1)
+
+
+class _SettlePage:
+    def wait_for_timeout(self, _: int) -> None:
+        pass
 
 
 class _SearchControl:
@@ -389,6 +463,133 @@ class _VirtualFacetSidebar:
         raise AssertionError(selector)
 
 
+NO_LAYDOWN_ASSETS = r"^The Gap DAM has no laydown assets for style 440760\.$"
+
+
+class EmptySearchTests(unittest.TestCase):
+    """An empty search must read as "no laydown assets for this style", not as
+    the Shot Request ID facet going missing - which is what the sidebar does
+    when there is nothing left to facet."""
+
+    def _patched_search(
+        self, *, clear_side_effect: object, total: int
+    ) -> tuple[ExitStack, _SearchContext, list[tuple[str, str]]]:
+        page = _SearchPage()
+        applied: list[tuple[str, str]] = []
+        stack = ExitStack()
+        stack.enter_context(
+            patch("dam_scrape._find_authenticated_page", return_value=page)
+        )
+        stack.enter_context(patch("dam_scrape.find_visible", return_value=page.search))
+        stack.enter_context(
+            patch("dam_scrape.wait_for_post", side_effect=lambda _, action, __: action())
+        )
+        stack.enter_context(
+            patch("dam_scrape.clear_facet_filters", side_effect=clear_side_effect)
+        )
+        stack.enter_context(patch("dam_scrape.read_result_total", return_value=total))
+        stack.enter_context(
+            patch(
+                "dam_scrape.apply_exclusive_facet",
+                side_effect=lambda _, title, value, __: applied.append((title, value)),
+            )
+        )
+        return stack, _SearchContext(page), applied
+
+    def test_empty_search_with_missing_facet_names_the_style(self) -> None:
+        # Nothing was left checked from the previous run, so the sidebar never
+        # shows a Shot Request ID section for an empty search.
+        missing_facet = FacetUnavailableError(
+            "The Shot Request ID filter was not available."
+        )
+        stack, context, applied = self._patched_search(
+            clear_side_effect=missing_facet, total=0
+        )
+        with stack, self.assertRaisesRegex(ScrapeError, NO_LAYDOWN_ASSETS) as caught:
+            open_search_page(context, "https://dam.test", "440760", 100)
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.assertEqual(applied, [])
+
+    def test_empty_search_after_clearing_leftover_filter_names_the_style(self) -> None:
+        # The leftover P01 came off cleanly and the facet stayed rendered, yet
+        # the style still has nothing.
+        stack, context, applied = self._patched_search(
+            clear_side_effect=lambda *_: (), total=0
+        )
+        with stack, self.assertRaisesRegex(ScrapeError, NO_LAYDOWN_ASSETS):
+            open_search_page(context, "https://dam.test", "440760", 100)
+        self.assertEqual(applied, [])
+
+    def test_empty_text_search_is_named_by_its_subject(self) -> None:
+        stack, context, applied = self._patched_search(
+            clear_side_effect=lambda *_: (), total=0
+        )
+        with stack, self.assertRaisesRegex(
+            NoLaydownAssetsError,
+            r"^The Gap DAM has no laydown assets for the search 'blue hoodie'\.$",
+        ):
+            open_search_page(
+                context, "https://dam.test", "blue hoodie", 100,
+                subject="the search 'blue hoodie'",
+            )
+        self.assertEqual(applied, [])
+
+    def test_missing_facet_with_results_remains_operational_error(self) -> None:
+        missing_facet = FacetUnavailableError(
+            "The Shot Request ID filter was not available."
+        )
+        stack, context, applied = self._patched_search(
+            clear_side_effect=missing_facet, total=7
+        )
+        with stack, self.assertRaisesRegex(
+            FacetUnavailableError, r"^The Shot Request ID filter was not available\.$"
+        ):
+            open_search_page(context, "https://dam.test", "440760", 100)
+        self.assertEqual(applied, [])
+
+
+class _CountBody:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def inner_text(self, timeout: int) -> str:
+        return self.text
+
+
+class _CountFrame:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def locator(self, selector: str) -> _CountBody:
+        if selector != "body":
+            raise AssertionError(selector)
+        return _CountBody(self.text)
+
+
+class _CountPage:
+    def __init__(self, *texts: str) -> None:
+        self.frames = [_CountFrame(text) for text in texts]
+
+
+class ResultTotalTests(unittest.TestCase):
+    def test_empty_search_reads_as_zero(self) -> None:
+        page = _CountPage(
+            "Photo Studio Filters",
+            'Gap Standard Folder 0 - 0 of 0 No matches found in "Gap"',
+        )
+        self.assertEqual(read_result_total(page, 100), 0)
+
+    def test_count_is_taken_from_whichever_frame_renders_it(self) -> None:
+        page = _CountPage("File import date", "Gap Standard Folder 1 - 50 of 14507")
+        self.assertEqual(read_result_total(page, 100), 14507)
+
+    def test_missing_count_times_out(self) -> None:
+        page = _CountPage("Photo Studio Filters", "Loading")
+        with self.assertRaisesRegex(ScrapeError, r"did not finish loading"):
+            read_result_total(page, 100)
+
+
 class AssetCardSelectionTests(unittest.TestCase):
     def test_duplicate_filenames_select_distinct_asset_cards(self) -> None:
         filename = "PB_gp_4401137_1_RAV5_56288657.psd"
@@ -457,6 +658,172 @@ class _AssetPage:
 
     def wait_for_timeout(self, _: int) -> None:
         pass
+
+
+class _PopupCount:
+    def __init__(self, page: "_PopupPage") -> None:
+        self.page = page
+
+    def count(self) -> int:
+        return self.page.open_popups
+
+
+class _PopupFrame:
+    def __init__(self, page: "_PopupPage") -> None:
+        self.page = page
+
+    def locator(self, selector: str) -> _PopupCount:
+        if selector != "#PopupLayer *:visible":
+            raise AssertionError(selector)
+        return _PopupCount(self.page)
+
+
+class _Keyboard:
+    def __init__(self, page: "_PopupPage") -> None:
+        self.page = page
+        self.presses: list[str] = []
+
+    def press(self, key: str) -> None:
+        self.presses.append(key)
+        self.page.open_popups = max(self.page.open_popups - 1, 0)
+
+
+class _PopupPage:
+    def __init__(self, open_popups: int) -> None:
+        self.open_popups = open_popups
+        self.frames = [_PopupFrame(self)]
+        self.keyboard = _Keyboard(self)
+
+    def wait_for_timeout(self, _: int) -> None:
+        pass
+
+
+class PopupDismissalTests(unittest.TestCase):
+    def test_nothing_is_pressed_when_nothing_floats_over_the_results(self) -> None:
+        page = _PopupPage(open_popups=0)
+        dismiss_popups(page)
+        self.assertEqual(page.keyboard.presses, [])
+
+    def test_escape_is_pressed_until_the_popup_layer_is_empty(self) -> None:
+        page = _PopupPage(open_popups=2)
+        dismiss_popups(page)
+        self.assertEqual(page.keyboard.presses, ["Escape", "Escape"])
+        self.assertEqual(page.open_popups, 0)
+
+
+class ItemDetailsTests(unittest.TestCase):
+    """--item-details on its own searches the text; next to a style it is the
+    fallback for the one failure a style search can have, no laydown assets."""
+
+    def _run_main(self, argv: list[str], **patches: object) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with ExitStack() as stack:
+            stack.enter_context(patch("dam_scrape.load_storage_state"))
+            for name, value in patches.items():
+                stack.enter_context(patch(f"dam_scrape.{name}", **value))
+            stack.enter_context(redirect_stdout(out))
+            stack.enter_context(redirect_stderr(err))
+            code = main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_neither_search_is_a_usage_error(self) -> None:
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+            main([])
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_text_alone_downloads_first_results_and_names_its_manifest(self) -> None:
+        manifest = Path("/tmp/downloads/item-details/blue-hoodie/manifest.json")
+        style = {"side_effect": AssertionError("the style search must not run")}
+        details = {"return_value": manifest}
+        code, out, _ = self._run_main(
+            ["--item-details", "blue hoodie"],
+            download_style=style, download_item_details=details,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out.splitlines()[-1], f"manifest {manifest}")
+
+    def test_style_with_no_assets_falls_back_to_the_text(self) -> None:
+        manifest = Path("/tmp/downloads/item-details/blue-hoodie/manifest.json")
+        style = {
+            "side_effect": NoLaydownAssetsError(
+                "The Gap DAM has no laydown assets for style 440760."
+            )
+        }
+        details = {"return_value": manifest}
+        code, out, err = self._run_main(
+            ["440760022", "--item-details", "blue hoodie"],
+            download_style=style, download_item_details=details,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("no laydown assets for style 440760. Falling back to --item-details 'blue hoodie'.", err)
+        self.assertEqual(out.splitlines()[-1], f"manifest {manifest}")
+
+    def test_style_that_works_never_touches_the_text(self) -> None:
+        manifest = Path("/tmp/downloads/440760/manifest.json")
+        style = {"return_value": manifest}
+        details = {"side_effect": AssertionError("the text search must not run")}
+        code, out, _ = self._run_main(
+            ["440760022", "--item-details", "blue hoodie"],
+            download_style=style, download_item_details=details,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out.splitlines()[-1], f"manifest {manifest}")
+
+    def test_style_with_no_assets_and_no_text_still_fails_plainly(self) -> None:
+        style = {
+            "side_effect": NoLaydownAssetsError(
+                "The Gap DAM has no laydown assets for style 440760."
+            )
+        }
+        details = {"side_effect": AssertionError("there is no text to fall back to")}
+        code, out, err = self._run_main(
+            ["440760022"], download_style=style, download_item_details=details
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(
+            err.strip(),
+            "DAM download failed: The Gap DAM has no laydown assets for style 440760.",
+        )
+        self.assertEqual(out, "")
+
+    def test_other_style_failures_do_not_fall_back(self) -> None:
+        style = {"side_effect": ScrapeError("No FINAL image is available for this style.")}
+        details = {"side_effect": AssertionError("only an empty search falls back")}
+        code, _, err = self._run_main(
+            ["440760022", "--item-details", "blue hoodie"],
+            download_style=style, download_item_details=details,
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("No FINAL image is available for this style.", err)
+
+    def test_text_manifest_is_reused_only_under_the_current_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_directory = Path(temporary_directory)
+            (output_directory / "assets.zip").touch()
+            manifest = {
+                "status": "complete",
+                "filters": dict(REQUIRED_FILTERS),
+                "archives": [{"filename": "assets.zip"}],
+                "shot_request_policy": {
+                    "mode": "first_results",
+                    "first_results_limit": ITEM_DETAILS_LIMIT,
+                    "selected_batches": [
+                        {"shot_request_id": None, "available": 900, "selected": 50}
+                    ],
+                },
+            }
+            self.assertTrue(is_complete_manifest_reusable(manifest, output_directory))
+
+            # Written under a smaller page size, with more left to take: refetch.
+            manifest["shot_request_policy"]["first_results_limit"] = 20
+            manifest["shot_request_policy"]["selected_batches"][0]["selected"] = 20
+            self.assertFalse(is_complete_manifest_reusable(manifest, output_directory))
+
+            # Smaller page size, but the search only ever had 12: nothing to gain.
+            manifest["shot_request_policy"]["selected_batches"] = [
+                {"shot_request_id": None, "available": 12, "selected": 12}
+            ]
+            self.assertTrue(is_complete_manifest_reusable(manifest, output_directory))
 
 
 class ArchiveTests(unittest.TestCase):
@@ -546,6 +913,7 @@ class ManifestTests(unittest.TestCase):
                 "status": "complete",
                 "filters": {"Shot Type": "L"},
                 "archives": [{"filename": "assets.zip"}],
+                "shot_request_policy": {"maximum_per_code": MAX_PER_CODE},
             }
 
             self.assertFalse(
@@ -554,6 +922,42 @@ class ManifestTests(unittest.TestCase):
 
             manifest["filters"][ASSET_PRODUCTION_TYPE] = FINAL_ASSET_VALUE
             self.assertTrue(
+                is_complete_manifest_reusable(manifest, output_directory)
+            )
+
+    def test_manifest_from_a_smaller_cap_is_refetched_unless_it_took_everything(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_directory = Path(temporary_directory)
+            (output_directory / "assets.zip").touch()
+            manifest = {
+                "status": "complete",
+                "filters": dict(REQUIRED_FILTERS),
+                "archives": [{"filename": "assets.zip"}],
+                "shot_request_policy": {
+                    "maximum_per_code": 3,
+                    "selected_batches": [
+                        {"shot_request_id": "AV5", "available": 35, "selected": 3}
+                    ],
+                },
+            }
+            # 3 of 35 under the old cap: a rerun would now take 10, so refetch.
+            self.assertFalse(
+                is_complete_manifest_reusable(manifest, output_directory)
+            )
+
+            # 2 of 2: no cap would change the selection, so keep it.
+            manifest["shot_request_policy"]["selected_batches"] = [
+                {"shot_request_id": "AV5", "available": 2, "selected": 2}
+            ]
+            self.assertTrue(
+                is_complete_manifest_reusable(manifest, output_directory)
+            )
+
+            # A manifest with no policy record cannot be judged; refetch.
+            del manifest["shot_request_policy"]
+            self.assertFalse(
                 is_complete_manifest_reusable(manifest, output_directory)
             )
 

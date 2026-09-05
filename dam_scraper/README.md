@@ -34,8 +34,28 @@ uv run --locked python dam_scrape.py 853417012
 ```
 
 The scraper searches with the first six digits and requires `FINAL` assets. It
-takes up to three `P01` images, then falls back to `AV5`. If neither exists, it
-takes up to three images from each available Shot Request ID.
+takes up to ten `P01` images, then falls back to `AV5`. If neither exists, it
+takes up to ten images from each available Shot Request ID. The cap is
+`MAX_PER_CODE` in `dam_scrape.py`. A style downloaded under a smaller cap is
+fetched again on its next run, unless it had already taken every shot the DAM
+had for that code.
+
+When the style number has nothing in the DAM, free text can stand in for it:
+
+```bash
+uv run --locked python dam_scrape.py --item-details "vintage soft hoodie"
+uv run --locked python dam_scrape.py 440760022 --item-details "vintage soft hoodie"
+```
+
+`--item-details` searches the DAM with the text and takes the first 50 laydown
+results (`ITEM_DETAILS_LIMIT`, one DAM results page) in the DAM's own order,
+whatever their Shot Request ID. On its own it is the whole job; next to a style
+number it runs only when the style has no laydown assets. Any other failure of
+the style search still stops the run. Its ZIP and manifest live under
+`downloads/item-details/<text>/`.
+
+The scraper's last line of output is `manifest <path>`, naming whichever
+manifest the run produced; `run.sh` reads it from there.
 
 The JPGs land directly in `inputs/reference_library/`, flat: no per-style
 folder, and any folder inside the DAM's ZIP is dropped rather than recreated.
