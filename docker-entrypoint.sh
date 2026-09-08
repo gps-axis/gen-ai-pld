@@ -33,6 +33,21 @@
 #                               name the ranked picks that way in $OUT_DIR
 #                               instead of best.png, best_2.png ..
 #
+# And two that hand the run to run.sh, the operator's own command line:
+#
+#   --style 671304002           pull this style's laydown shots from the Gap
+#                               DAM into the library first, then search it
+#   --item-details "GAP MENS MENS KNITS L/S KNITS"
+#                               the text the DAM is searched with when the
+#                               style has no shots, and the harness's last
+#                               resort when none of the style's shots match
+#
+# The DAM sign-in comes from DAM_LOGIN_ID/DAM_PASSWORD (or the files their
+# _FILE forms name); the saved session and the scraper's manifests live at
+# DAM_AUTH_STATE and DAM_OUTPUT_ROOT, both under /app and worth mounting so
+# they outlive the container. An explicit reference still wins over both
+# flags: the DAM is not searched when the operator has supplied the answer.
+#
 # tools/deliver.py writes everything the flows read after the run: the picks,
 # used_prompt.txt, result_top_matches.jpg, match_results.json, result.json, the
 # pickN_cand_XX.png names in the run's output/ and archive/metrics.json.
@@ -98,6 +113,8 @@ CATEGORY=""
 NO_SELECT=""
 TASK=""
 HAS_TASK=""
+STYLE=""
+ITEM_DETAILS=""
 ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -106,6 +123,10 @@ while [ $# -gt 0 ]; do
         --no-reference-select)  NO_SELECT=1; shift ;;
         --task)                 TASK="${2:-}"; HAS_TASK=1; shift 2 ;;
         --task=*)               TASK="${1#*=}"; HAS_TASK=1; shift ;;
+        --style)                STYLE="${2:-}"; shift 2 ;;
+        --style=*)              STYLE="${1#*=}"; shift ;;
+        --item-details)         ITEM_DETAILS="${2:-}"; shift 2 ;;
+        --item-details=*)       ITEM_DETAILS="${1#*=}"; shift ;;
         *)                      ARGS+=("$1"); shift ;;
     esac
 done
@@ -142,6 +163,26 @@ if [ -z "$REFERENCE" ]; then
     [ ${#REFS[@]} -gt 0 ] && REFERENCE="${REFS[0]}"
 fi
 
+# --- the Gap DAM: this style's own laydown shots, pulled in first ----------
+#
+# --style / --item-details hand the run to run.sh, which signs in to the DAM,
+# downloads the style's laydown shots flat into the library, and runs the
+# harness against the whole library - the command an operator runs on a
+# laptop, with the library at DAM_IMAGE_ROOT instead of inputs/. The category
+# folder is not narrowed on this path: the style's own shots are the most
+# specific references there are, they land at the library root, and the
+# search recurses into every category folder as well. An explicit reference
+# wins over both flags, as it does over the library.
+DAM_PULL=""
+if [ -n "$STYLE" ] || [ -n "$ITEM_DETAILS" ]; then
+    if [ -n "$REFERENCE" ]; then
+        echo "  dam       --style/--item-details ignored: an explicit reference was supplied"
+        STYLE=""; ITEM_DETAILS=""
+    else
+        DAM_PULL=1
+    fi
+fi
+
 # The library: -e REFERENCE_LIBRARY, else /in/reference_library, else the path
 # the Kestra flows mount the shared library at.
 if [ -z "${REFERENCE_LIBRARY:-}" ]; then
@@ -151,7 +192,9 @@ if [ -z "${REFERENCE_LIBRARY:-}" ]; then
         REFERENCE_LIBRARY="/app/library_reference"
     fi
 fi
-if [ -n "$CATEGORY" ] && [ -z "$REFERENCE" ]; then
+if [ -n "$CATEGORY" ] && [ -n "$DAM_PULL" ]; then
+    echo "  category  $CATEGORY not narrowed: the DAM pull searches the whole library"
+elif [ -n "$CATEGORY" ] && [ -z "$REFERENCE" ]; then
     # Axis already knows the category; searching only its folder is what the
     # retired matcher did with the same flag. A folder that does not exist or
     # holds nothing falls back to the whole library rather than to exit 20.
@@ -175,6 +218,14 @@ fi
 
 if [ -n "$REFERENCE" ]; then
     [ -f "$REFERENCE" ] || die "no such reference: $REFERENCE"
+elif [ -n "$DAM_PULL" ]; then
+    # The pull creates the library if it has to; an empty one is not an error
+    # yet. run.sh checks the login before anything else and says what it
+    # needs when none is stored.
+    mkdir -p "$REFERENCE_LIBRARY" || die "cannot create the library at $REFERENCE_LIBRARY"
+    [ -w "$REFERENCE_LIBRARY" ] || die "the library at $REFERENCE_LIBRARY is read-only, and the DAM pull writes into it.
+  Mount it writable (-v .../reference_library:/app/library_reference), or point
+  -e REFERENCE_LIBRARY at a folder that is."
 elif [ "$LIB_COUNT" -eq 0 ]; then
     die "no reference laydown and no library to find one in.
   Either mount a library at $IN_DIR/reference_library (or point
@@ -230,6 +281,9 @@ fi
 echo "  input     $INPUT"
 if [ -n "$REFERENCE" ]; then
     echo "  reference $REFERENCE"
+elif [ -n "$DAM_PULL" ]; then
+    echo "  reference the Gap DAM${STYLE:+, style $STYLE}${ITEM_DETAILS:+, text \"$ITEM_DETAILS\"}; then $REFERENCE_LIBRARY ($LIB_COUNT images before the pull)"
+    echo "  dam       session ${DAM_AUTH_STATE:-dam_scraper/secrets/dam-auth.json}, manifests ${DAM_OUTPUT_ROOT:-dam_scraper/downloads}"
 else
     echo "  reference searching $REFERENCE_LIBRARY ($LIB_COUNT images)"
 fi
@@ -241,11 +295,25 @@ echo
 # --yolo is required, not a preference: Approver.ok() refuses every mutating tool
 # when stdin is not a TTY, so without it the model is denied on its first real
 # step and burns the run arguing with itself.
-"$PY" /app/harness.py \
-    --skill-file /app/task/SKILL.md \
-    --source /app/inputs/off_set_image.jpg \
-    "${REF_ARGS[@]}" \
-    --yolo "$@"
+if [ -n "$DAM_PULL" ]; then
+    # run.sh adds --reference-library itself (and refuses one passed in), and
+    # exits 1 before the harness when the DAM cannot be reached or signed in
+    # to. A DAM that merely holds nothing for the style is a warning there,
+    # and the harness goes on with the library as it stands.
+    DAM_ARGS=()
+    [ -z "$STYLE" ] || DAM_ARGS+=(--style "$STYLE")
+    [ -z "$ITEM_DETAILS" ] || DAM_ARGS+=(--item-details "$ITEM_DETAILS")
+    DAM_IMAGE_ROOT="$REFERENCE_LIBRARY" /app/run.sh "${DAM_ARGS[@]}" \
+        --skill-file /app/task/SKILL.md \
+        --source /app/inputs/off_set_image.jpg \
+        --yolo "$@"
+else
+    "$PY" /app/harness.py \
+        --skill-file /app/task/SKILL.md \
+        --source /app/inputs/off_set_image.jpg \
+        "${REF_ARGS[@]}" \
+        --yolo "$@"
+fi
 RC=$?
 
 # --- deliver ----------------------------------------------------------------

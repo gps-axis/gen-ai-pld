@@ -60,6 +60,31 @@ is billed by any of that. See "Choosing the reference" below.
 `/in/reference*`, or name it explicitly with `-e REFERENCE=/in/my_reference.jpg`.
 An explicit reference always wins over the library.
 
+**Or pull it from the Gap DAM.** `--style 671304002` downloads that style's
+laydown shots into the library before the search, and `--item-details "GAP
+MENS MENS KNITS L/S KNITS"` is the text the DAM is searched with when the style
+has no shots (and the harness's last resort when none of them match). The two
+flags hand the run to `run.sh` inside the container, the command an operator
+runs on a laptop:
+
+    docker run --rm \
+      -v "$PWD/inputs:/in:ro" -v "$PWD/out:/out" \
+      -v "$PWD/inputs/reference_library:/app/library_reference" \
+      -v pld-dam-auth:/app/dam_auth -v pld-dam-downloads:/app/dam_downloads \
+      -e FAL_KEY -e QWEN_API_KEY -e DAM_LOGIN_ID -e DAM_PASSWORD \
+      pld-harness /in/photo.jpg --style 671304002 --item-details "GAP MENS MENS KNITS L/S KNITS"
+
+The library is mounted writable at `/app/library_reference` because the pull
+writes into it, and the whole of it is searched, category folders included.
+The sign-in is `DAM_LOGIN_ID`/`DAM_PASSWORD`, or `DAM_LOGIN_ID_FILE`/
+`DAM_PASSWORD_FILE` naming mounted secret files; the saved session lives at
+`DAM_AUTH_STATE` (`/app/dam_auth/state.json`) and the scraper's manifests at
+`DAM_OUTPUT_ROOT` (`/app/dam_downloads`), so with the two volumes a sign-in
+and a pull outlive the container. An explicit reference still wins, and the
+DAM is not searched. A DAM that holds nothing for the style is a warning and
+the harness goes on with the library; a DAM that cannot be reached or signed in
+to exits 1 before anything is billed.
+
 The garment photo is either the path you pass as the first argument, or - if you
 pass none - the single image in `/in` that is *not* named `reference*` and is not
 inside the library folder. It refuses to guess between several: choosing the

@@ -9,8 +9,11 @@ from contextlib import ExitStack, nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+import dam_auth
+from auth_session import AuthStateError, AuthenticationExpired
 from dam_scrape import (
     ASSET_PRODUCTION_TYPE,
+    EXIT_NOTHING_TO_DOWNLOAD,
     FINAL_ASSET_VALUE,
     FacetOption,
     FacetUnavailableError,
@@ -19,6 +22,7 @@ from dam_scrape import (
     NoLaydownAssetsError,
     REQUIRED_FILTERS,
     ScrapeError,
+    SessionRejectedError,
     SHOT_REQUEST_ID,
     ShotBatch,
     apply_exclusive_facet,
@@ -711,6 +715,102 @@ class PopupDismissalTests(unittest.TestCase):
         self.assertEqual(page.open_popups, 0)
 
 
+class StoredLoginRetryTests(unittest.TestCase):
+    """A missing or dead session is not the operator's problem when a login is
+    stored: the scraper signs in once and carries on. Without one it stops and
+    names both fixes, and a fresh session the DAM rejects is not retried."""
+
+    STORED = (
+        dam_auth.Credentials("person@example.com", "secret-value"),
+        "DAM_LOGIN_ID and DAM_PASSWORD",
+    )
+    REJECTED = SessionRejectedError("The saved DAM session was rejected.")
+
+    def _run(
+        self,
+        *,
+        state: object = None,
+        style: list[object],
+        stored: object = None,
+        sign_in: object = None,
+    ) -> tuple[int, str, str, object, object]:
+        out, err = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as temporary_directory, ExitStack() as stack:
+            auth_state = Path(temporary_directory) / "state.json"
+            stack.enter_context(patch("dam_scrape.load_storage_state", side_effect=state))
+            download_style = stack.enter_context(
+                patch("dam_scrape.download_style", side_effect=style)
+            )
+            stack.enter_context(patch("dam_scrape.stored_credentials", return_value=stored))
+            signed_in = stack.enter_context(patch("dam_scrape.sign_in", side_effect=sign_in))
+            stack.enter_context(redirect_stdout(out))
+            stack.enter_context(redirect_stderr(err))
+            code = main(["440760022", "--auth-state", str(auth_state)])
+            self.auth_state = auth_state.resolve()
+        return code, out.getvalue(), err.getvalue(), download_style, signed_in
+
+    def test_rejected_session_signs_in_once_and_tries_again(self) -> None:
+        manifest = Path("/tmp/downloads/440760/manifest.json")
+        code, out, err, download_style, signed_in = self._run(
+            style=[self.REJECTED, manifest], stored=self.STORED
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(download_style.call_count, 2)
+        signed_in.assert_called_once()
+        self.assertEqual(signed_in.call_args.args, (self.auth_state,))
+        self.assertEqual(signed_in.call_args.kwargs["credentials"], self.STORED[0])
+        self.assertIn(
+            "The saved DAM session was rejected. Signing in with the login from "
+            "DAM_LOGIN_ID and DAM_PASSWORD.",
+            err,
+        )
+        self.assertEqual(out.splitlines()[-1], f"manifest {manifest}")
+
+    def test_missing_state_signs_in_before_the_first_search(self) -> None:
+        manifest = Path("/tmp/downloads/440760/manifest.json")
+        code, out, err, download_style, signed_in = self._run(
+            state=AuthStateError("Authentication state does not exist: /x/state.json"),
+            style=[manifest],
+            stored=self.STORED,
+        )
+        self.assertEqual(code, 0)
+        signed_in.assert_called_once()
+        self.assertEqual(download_style.call_count, 1)
+        self.assertIn("does not exist: /x/state.json Signing in with the login from", err)
+        self.assertEqual(out.splitlines()[-1], f"manifest {manifest}")
+
+    def test_no_stored_login_stops_and_names_both_fixes(self) -> None:
+        code, _, err, download_style, signed_in = self._run(style=[self.REJECTED], stored=None)
+        self.assertEqual(code, 2)
+        signed_in.assert_not_called()
+        self.assertEqual(download_style.call_count, 1)
+        self.assertIn("The saved DAM session was rejected. No stored login to sign in with", err)
+        self.assertIn("dam_auth.py capture", err)
+        self.assertIn("DAM_LOGIN_ID and DAM_PASSWORD", err)
+
+    def test_a_fresh_session_rejected_again_is_not_retried(self) -> None:
+        code, _, err, download_style, signed_in = self._run(
+            style=[self.REJECTED, self.REJECTED], stored=self.STORED
+        )
+        self.assertEqual(code, 2)
+        signed_in.assert_called_once()
+        self.assertEqual(download_style.call_count, 2)
+        self.assertIn("DAM download failed: The saved DAM session was rejected.", err)
+
+    def test_a_refused_login_is_reported(self) -> None:
+        code, _, err, download_style, signed_in = self._run(
+            style=[self.REJECTED],
+            stored=self.STORED,
+            sign_in=AuthenticationExpired(
+                "Gap SSO rejected the credentials or restarted sign-in."
+            ),
+        )
+        self.assertEqual(code, 2)
+        signed_in.assert_called_once()
+        self.assertEqual(download_style.call_count, 1)
+        self.assertIn("DAM download failed: Gap SSO rejected the credentials", err)
+
+
 class ItemDetailsTests(unittest.TestCase):
     """--item-details on its own searches the text; next to a style it is the
     fallback for the one failure a style search can have, no laydown assets."""
@@ -741,6 +841,21 @@ class ItemDetailsTests(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertEqual(out.splitlines()[-1], f"manifest {manifest}")
+
+    def test_nothing_to_download_is_its_own_exit_status(self) -> None:
+        miss = NoLaydownAssetsError("The Gap DAM has no laydown assets for style 440760.")
+        code, _, err = self._run_main(["440760022"], download_style={"side_effect": miss})
+        self.assertEqual(code, EXIT_NOTHING_TO_DOWNLOAD)
+        self.assertIn("DAM has nothing to download: The Gap DAM has no laydown assets", err)
+
+        text_miss = NoLaydownAssetsError('The Gap DAM has no laydown assets for "blue hoodie".')
+        code, _, err = self._run_main(
+            ["440760022", "--item-details", "blue hoodie"],
+            download_style={"side_effect": miss}, download_item_details={"side_effect": text_miss},
+        )
+        self.assertEqual(code, EXIT_NOTHING_TO_DOWNLOAD)
+        self.assertIn("Falling back to --item-details", err)
+        self.assertIn('no laydown assets for "blue hoodie"', err)
 
     def test_style_with_no_assets_falls_back_to_the_text(self) -> None:
         manifest = Path("/tmp/downloads/item-details/blue-hoodie/manifest.json")
@@ -779,10 +894,10 @@ class ItemDetailsTests(unittest.TestCase):
         code, out, err = self._run_main(
             ["440760022"], download_style=style, download_item_details=details
         )
-        self.assertEqual(code, 2)
+        self.assertEqual(code, EXIT_NOTHING_TO_DOWNLOAD)
         self.assertEqual(
             err.strip(),
-            "DAM download failed: The Gap DAM has no laydown assets for style 440760.",
+            "DAM has nothing to download: The Gap DAM has no laydown assets for style 440760.",
         )
         self.assertEqual(out, "")
 

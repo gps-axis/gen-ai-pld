@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -256,11 +257,282 @@ def idp_page(
     )
 
 
+class StoredLoginIsolation(unittest.TestCase):
+    """Keep every test off the developer's own environment and Keychain.
+
+    A real DAM_LOGIN_ID or a real 'gap-dam-sso' Keychain item would otherwise
+    be picked up in place of the fake prompts these tests set up.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        environment = {
+            key: value
+            for key, value in dam_auth.os.environ.items()
+            if key not in (dam_auth.LOGIN_ID_ENV, dam_auth.PASSWORD_ENV)
+        }
+        self.enterContext(patch.dict(dam_auth.os.environ, environment, clear=True))
+        self.enterContext(patch("dam_auth._keychain_available", return_value=False))
+
+
+def security_result(
+    *, returncode: int = 0, stdout: str = "", stderr: str = ""
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(
+        [dam_auth.SECURITY_TOOL], returncode, stdout=stdout, stderr=stderr
+    )
+
+
+KEYCHAIN_ATTRIBUTES = (
+    'keychain: "/Users/person/Library/Keychains/login.keychain-db"\n'
+    "attributes:\n"
+    '    "acct"<blob>="person@example.com"\n'
+    '    "svce"<blob>="gap-dam-sso"\n'
+)
+
+
 class CaptureParserTests(unittest.TestCase):
     def test_capture_is_headless_by_default_and_accepts_headed(self) -> None:
         parser = dam_auth.build_parser()
         self.assertFalse(parser.parse_args(["capture"]).headed)
         self.assertTrue(parser.parse_args(["capture", "--headed"]).headed)
+
+
+    def test_parser_offers_store_and_forget(self) -> None:
+        self.assertIs(dam_auth.build_parser().parse_args(["store"]).handler, dam_auth.store)
+        self.assertIs(dam_auth.build_parser().parse_args(["forget"]).handler, dam_auth.forget)
+
+
+class StoredLoginTests(StoredLoginIsolation):
+    def test_environment_login_is_used_without_prompting(self) -> None:
+        with patch.dict(
+            dam_auth.os.environ,
+            {dam_auth.LOGIN_ID_ENV: " person@example.com ", dam_auth.PASSWORD_ENV: "secret-value"},
+        ), patch("builtins.input") as login, patch("dam_auth.getpass.getpass") as password:
+            credentials = dam_auth._resolve_credentials()
+        self.assertEqual(credentials, dam_auth.Credentials("person@example.com", "secret-value"))
+        login.assert_not_called()
+        password.assert_not_called()
+
+    def test_file_backed_login_drops_one_trailing_line_break(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            login_file = Path(temporary_directory) / "login"
+            password_file = Path(temporary_directory) / "password"
+            login_file.write_text("person@example.com\n", encoding="utf-8")
+            password_file.write_text("secret value \n", encoding="utf-8")
+            with patch.dict(
+                dam_auth.os.environ,
+                {
+                    dam_auth.LOGIN_ID_FILE_ENV: str(login_file),
+                    dam_auth.PASSWORD_FILE_ENV: str(password_file),
+                },
+            ), patch("builtins.input") as login:
+                stored = dam_auth.stored_credentials()
+        self.assertEqual(
+            stored,
+            (
+                dam_auth.Credentials("person@example.com", "secret value "),
+                "DAM_LOGIN_ID_FILE and DAM_PASSWORD_FILE",
+            ),
+        )
+        login.assert_not_called()
+
+    def test_value_and_file_for_one_setting_is_an_error(self) -> None:
+        with patch.dict(
+            dam_auth.os.environ,
+            {
+                dam_auth.LOGIN_ID_ENV: "person@example.com",
+                dam_auth.PASSWORD_ENV: "secret-value",
+                dam_auth.PASSWORD_FILE_ENV: "/run/secrets/dam_password",
+            },
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Both DAM_PASSWORD and DAM_PASSWORD_FILE"):
+                dam_auth.stored_credentials()
+
+    def test_unreadable_secret_file_names_the_variable_and_the_path(self) -> None:
+        with patch.dict(
+            dam_auth.os.environ,
+            {
+                dam_auth.LOGIN_ID_ENV: "person@example.com",
+                dam_auth.PASSWORD_FILE_ENV: "/run/secrets/does-not-exist",
+            },
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "DAM_PASSWORD_FILE names a file that could not be read: /run/secrets/does-not-exist"
+            ):
+                dam_auth.stored_credentials()
+
+    def test_nothing_stored_is_none_and_never_prompts(self) -> None:
+        with patch("builtins.input") as login, patch("dam_auth.getpass.getpass") as password:
+            self.assertIsNone(dam_auth.stored_credentials())
+        login.assert_not_called()
+        password.assert_not_called()
+
+    def test_explicit_credentials_reach_the_form_without_resolving(self) -> None:
+        username = FakeControl()
+        password = FakeControl()
+        page = idp_page(username=[username], password=[password])
+        with patch("dam_auth.stored_credentials") as stored, patch("builtins.input") as login:
+            dam_auth._sign_in(page, dam_auth.Credentials("person@example.com", "secret-value"))
+        stored.assert_not_called()
+        login.assert_not_called()
+        self.assertEqual(username.filled, ["person@example.com"])
+        self.assertEqual(password.filled, ["secret-value"])
+
+    def test_half_set_environment_names_the_missing_half(self) -> None:
+        with patch.dict(dam_auth.os.environ, {dam_auth.LOGIN_ID_ENV: "person@example.com"}):
+            with self.assertRaisesRegex(RuntimeError, "DAM_PASSWORD is not"):
+                dam_auth._resolve_credentials()
+        with patch.dict(dam_auth.os.environ, {dam_auth.PASSWORD_ENV: "secret-value"}):
+            with self.assertRaisesRegex(RuntimeError, "DAM_LOGIN_ID is not"):
+                dam_auth._resolve_credentials()
+
+    def test_keychain_login_is_used_without_prompting(self) -> None:
+        result = security_result(stdout=KEYCHAIN_ATTRIBUTES, stderr='password: "p@ss wo"rd "\n')
+        with patch("dam_auth._keychain_available", return_value=True), patch(
+            "dam_auth._security", return_value=result
+        ) as security, patch("builtins.input") as login, patch(
+            "dam_auth.getpass.getpass"
+        ) as password:
+            credentials = dam_auth._resolve_credentials()
+        self.assertEqual(credentials, dam_auth.Credentials("person@example.com", 'p@ss wo"rd '))
+        security.assert_called_once_with("find-generic-password", "-s", "gap-dam-sso", "-g")
+        login.assert_not_called()
+        password.assert_not_called()
+
+    def test_keychain_hex_password_is_decoded(self) -> None:
+        result = security_result(
+            stdout=KEYCHAIN_ATTRIBUTES,
+            stderr='password: 0xC3BC6EC3AF63C3B664C3A9212325262A2829  "\\303\\274n"\n',
+        )
+        with patch("dam_auth._keychain_available", return_value=True), patch(
+            "dam_auth._security", return_value=result
+        ):
+            credentials = dam_auth._resolve_credentials()
+        self.assertEqual(credentials.password, "ünïcödé!#%&*()")
+
+    def test_missing_keychain_entry_falls_back_to_the_terminal(self) -> None:
+        with patch("dam_auth._keychain_available", return_value=True), patch(
+            "dam_auth._security", return_value=security_result(returncode=44)
+        ), patch("dam_auth.sys.stdin.isatty", return_value=True), patch(
+            "builtins.input", return_value="person@example.com"
+        ), patch("dam_auth.getpass.getpass", return_value="secret-value"):
+            credentials = dam_auth._resolve_credentials()
+        self.assertEqual(credentials, dam_auth.Credentials("person@example.com", "secret-value"))
+
+    def test_unreadable_keychain_warns_and_falls_back_to_the_terminal(self) -> None:
+        with patch("dam_auth._keychain_available", return_value=True), patch(
+            "dam_auth._security",
+            return_value=security_result(returncode=36, stderr="security: locked"),
+        ), patch("dam_auth.sys.stdin.isatty", return_value=True), patch(
+            "builtins.input", return_value="person@example.com"
+        ), patch("dam_auth.getpass.getpass", return_value="secret-value"), patch(
+            "dam_auth.sys.stderr"
+        ) as stderr:
+            credentials = dam_auth._resolve_credentials()
+        self.assertEqual(credentials.login_id, "person@example.com")
+        printed = "".join(str(call) for call in stderr.write.call_args_list)
+        self.assertIn("could not be read", printed)
+
+    def test_unusable_keychain_entry_says_to_store_again(self) -> None:
+        for stdout, stderr in (
+            (KEYCHAIN_ATTRIBUTES, "password: \n"),
+            ('    "svce"<blob>="gap-dam-sso"\n', 'password: "secret-value"\n'),
+            (KEYCHAIN_ATTRIBUTES, "password: 0xFF  \"\\377\"\n"),
+        ):
+            with self.subTest(stdout=stdout, stderr=stderr):
+                with patch("dam_auth._keychain_available", return_value=True), patch(
+                    "dam_auth._security",
+                    return_value=security_result(stdout=stdout, stderr=stderr),
+                ), patch("builtins.input") as login:
+                    with self.assertRaisesRegex(RuntimeError, "dam_auth.py store"):
+                        dam_auth._resolve_credentials()
+                login.assert_not_called()
+
+    def test_noninteractive_without_stored_login_names_both_fixes(self) -> None:
+        with patch("dam_auth.sys.stdin.isatty", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "interactive terminal") as raised:
+                dam_auth._resolve_credentials()
+        self.assertIn("dam_auth.py store", str(raised.exception))
+        self.assertIn("DAM_LOGIN_ID", str(raised.exception))
+
+    def test_store_sends_the_password_on_stdin_quoted(self) -> None:
+        stored = dam_auth.Credentials("per son", 'p@ss "wo\\rd')
+        calls: list[tuple[tuple[str, ...], str | None]] = []
+
+        def security(*arguments: str, stdin: str | None = None):
+            calls.append((arguments, stdin))
+            if arguments[0] == "-i":
+                return security_result()
+            return security_result(
+                stdout='    "acct"<blob>="per son"\n',
+                stderr='password: 0x704073732022776F5C7264  "x"\n',
+            )
+
+        with patch("dam_auth._keychain_available", return_value=True), patch(
+            "dam_auth._security", side_effect=security
+        ), patch("dam_auth.sys.stdin.isatty", return_value=True), patch(
+            "builtins.input", return_value="per son"
+        ), patch("dam_auth.getpass.getpass", return_value='p@ss "wo\\rd'):
+            self.assertEqual(dam_auth.store(argparse.Namespace()), 0)
+
+        (write_arguments, write_stdin), (read_arguments, _) = calls
+        self.assertEqual(write_arguments, ("-i",))
+        self.assertNotIn(stored.password, " ".join(write_arguments))
+        self.assertEqual(
+            write_stdin,
+            'add-generic-password -U -s "gap-dam-sso" -a "per son" '
+            '-l "Gap DAM sign-in (PLD harness)" -T /usr/bin/security '
+            '-w "p@ss \\"wo\\\\rd"\n',
+        )
+        self.assertEqual(read_arguments, ("find-generic-password", "-s", "gap-dam-sso", "-g"))
+
+    def test_store_fails_when_the_read_back_differs(self) -> None:
+        def security(*arguments: str, stdin: str | None = None):
+            if arguments[0] == "-i":
+                return security_result()
+            return security_result(returncode=44)
+
+        with patch("dam_auth._keychain_available", return_value=True), patch(
+            "dam_auth._security", side_effect=security
+        ), patch("dam_auth.sys.stdin.isatty", return_value=True), patch(
+            "builtins.input", return_value="person@example.com"
+        ), patch("dam_auth.getpass.getpass", return_value="secret-value"):
+            with self.assertRaisesRegex(RuntimeError, "did not keep the login"):
+                dam_auth.store(argparse.Namespace())
+
+    def test_store_refuses_line_breaks(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "line break"):
+            dam_auth._keychain_quote("a\nb")
+
+    def test_store_and_forget_need_the_macos_keychain(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "DAM_LOGIN_ID"):
+            dam_auth.store(argparse.Namespace())
+        with self.assertRaisesRegex(RuntimeError, "nothing to forget"):
+            dam_auth.forget(argparse.Namespace())
+
+    def test_store_needs_a_terminal(self) -> None:
+        with patch("dam_auth._keychain_available", return_value=True), patch(
+            "dam_auth.sys.stdin.isatty", return_value=False
+        ), patch("dam_auth._security") as security:
+            with self.assertRaisesRegex(RuntimeError, "interactive terminal"):
+                dam_auth.store(argparse.Namespace())
+        security.assert_not_called()
+
+    def test_forget_removes_or_reports_nothing_stored(self) -> None:
+        for returncode, expected in ((0, "Removed"), (44, "No stored")):
+            with self.subTest(returncode=returncode):
+                with patch("dam_auth._keychain_available", return_value=True), patch(
+                    "dam_auth._security", return_value=security_result(returncode=returncode)
+                ) as security, patch("builtins.print") as printed:
+                    self.assertEqual(dam_auth.forget(argparse.Namespace()), 0)
+                security.assert_called_once_with("delete-generic-password", "-s", "gap-dam-sso")
+                self.assertIn(expected, printed.call_args[0][0])
+        with patch("dam_auth._keychain_available", return_value=True), patch(
+            "dam_auth._security", return_value=security_result(returncode=1, stderr="boom")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "could not be removed"):
+                dam_auth.forget(argparse.Namespace())
 
 
 class SsoGatewayTests(unittest.TestCase):
@@ -314,7 +586,7 @@ class SsoGatewayTests(unittest.TestCase):
                 prompt.assert_not_called()
 
 
-class IdpLoginTests(unittest.TestCase):
+class IdpLoginTests(StoredLoginIsolation):
     def test_exact_idp_form_accepts_terminal_credentials(self) -> None:
         username = FakeControl()
         password = FakeControl()
@@ -327,7 +599,7 @@ class IdpLoginTests(unittest.TestCase):
         with patch("dam_auth.sys.stdin.isatty", return_value=True), patch(
             "builtins.input", return_value="person@example.com"
         ), patch("dam_auth.getpass.getpass", return_value="secret-value"):
-            dam_auth._login_from_terminal(page)
+            dam_auth._sign_in(page)
 
         self.assertEqual(username.filled, ["person@example.com"])
         self.assertEqual(password.filled, ["secret-value"])
@@ -348,7 +620,7 @@ class IdpLoginTests(unittest.TestCase):
                 "dam_auth.getpass.getpass"
             ) as password:
                 with self.assertRaises(AuthenticationExpired):
-                    dam_auth._login_from_terminal(page)
+                    dam_auth._sign_in(page)
                 login.assert_not_called()
                 password.assert_not_called()
 
@@ -379,7 +651,7 @@ class IdpLoginTests(unittest.TestCase):
             "builtins.input", return_value="person@example.com"
         ), patch("dam_auth.getpass.getpass", return_value="secret-value"):
             with self.assertRaises(AuthenticationExpired) as raised:
-                dam_auth._login_from_terminal(page)
+                dam_auth._sign_in(page)
         self.assertNotIn("person@example.com", str(raised.exception))
         self.assertNotIn("secret-value", str(raised.exception))
 
@@ -390,18 +662,18 @@ class IdpLoginTests(unittest.TestCase):
             "builtins.input"
         ) as login:
             with self.assertRaisesRegex(RuntimeError, "interactive terminal"):
-                dam_auth._login_from_terminal(page)
+                dam_auth._sign_in(page)
             login.assert_not_called()
 
         with patch("dam_auth.sys.stdin.isatty", return_value=True), patch(
             "builtins.input", return_value=""
         ), patch("dam_auth.getpass.getpass") as password:
             with self.assertRaisesRegex(RuntimeError, "cannot be blank"):
-                dam_auth._login_from_terminal(page)
+                dam_auth._sign_in(page)
             password.assert_not_called()
 
 
-class CaptureFlowTests(unittest.TestCase):
+class CaptureFlowTests(StoredLoginIsolation):
     def _args(self, auth_state: Path, *, url: str = DAM_URL) -> argparse.Namespace:
         return argparse.Namespace(
             auth_state=auth_state,
@@ -422,13 +694,13 @@ class CaptureFlowTests(unittest.TestCase):
             start_playwright, playwright = fake_playwright(browser)
             form_page = idp_page()
 
-            def complete_login(_: FakePage) -> None:
+            def complete_login(_: FakePage, __: object = None) -> None:
                 form_page.url = DAM_URL
 
             with patch("dam_auth._playwright", return_value=start_playwright), patch(
                 "dam_auth._click_sso_gateway"
             ), patch("dam_auth._find_idp_page", return_value=form_page), patch(
-                "dam_auth._login_from_terminal", side_effect=complete_login
+                "dam_auth._sign_in", side_effect=complete_login
             ), patch("dam_auth._find_authenticated_page", return_value=gateway):
                 result = dam_auth.capture(self._args(auth_state))
 
@@ -452,7 +724,7 @@ class CaptureFlowTests(unittest.TestCase):
             with patch("dam_auth._playwright", return_value=start_playwright), patch(
                 "dam_auth._click_sso_gateway"
             ), patch("dam_auth._find_idp_page", return_value=idp_page()), patch(
-                "dam_auth._login_from_terminal"
+                "dam_auth._sign_in"
             ), patch("dam_auth._find_authenticated_page", return_value=None):
                 with self.assertRaises(AuthenticationExpired):
                     dam_auth.capture(self._args(auth_state))
@@ -469,7 +741,7 @@ class CaptureFlowTests(unittest.TestCase):
             start_playwright, _ = fake_playwright(browser)
 
             with patch("dam_auth._playwright", return_value=start_playwright), patch(
-                "dam_auth._login_from_terminal"
+                "dam_auth._sign_in"
             ), patch(
                 "dam_auth._find_authenticated_page",
                 side_effect=AssertionError("waited for timeout"),

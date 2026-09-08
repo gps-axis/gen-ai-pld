@@ -11,21 +11,49 @@ From the repository root:
 ## One command
 
 From the repository root, `./run.sh --style 853417012 ...` does everything
-below in order - checks the saved sign-in and prompts for one when it has
+below in order - checks the saved sign-in and signs in again when it has
 lapsed, downloads the style's shots flat into `inputs/reference_library/` (no
 per-style folder), and runs the harness against the whole library. The commands
 that follow are the same steps run one at a time.
 
-## Sign in
+## The sign-in
+
+The scraper needs a Gap SSO login. Give it one in any of these ways and it
+signs in by itself whenever the saved session is missing or has lapsed -
+nothing to type, in a container or on a laptop:
+
+- **`DAM_LOGIN_ID` and `DAM_PASSWORD`** in the environment. In a container,
+  feed them from the orchestrator's secret store (a Kestra secret, or
+  `docker run -e`), never from a file in the repository.
+- **`DAM_LOGIN_ID_FILE` and `DAM_PASSWORD_FILE`**, each naming a file that
+  holds the value - the Docker and Compose secrets convention, where the
+  secret is mounted read-only under `/run/secrets/` and only its path is in
+  the environment. Prefer this over the plain variables when the environment
+  is visible to more than this one process (`docker inspect` shows it). Set
+  the value or the file for each setting, not both.
+- **The macOS Keychain**, for local runs on a Mac: `uv run --locked python
+  dam_auth.py store` asks once and keeps the login as item `gap-dam-sso`.
+  `dam_auth.py forget` removes it. The environment wins over the Keychain.
+
+The saved session lives at `DAM_AUTH_STATE` (default
+`dam_scraper/secrets/dam-auth.json`; a volume in the container) and is reused
+until the DAM rejects it, so a sign-in happens only when it has to. The scraper
+never asks at the terminal; with no login stored it stops and says so.
+
+Do not put the login in the repository's `.env`: the harness hands that file
+to the agent's shell, and `run.sh` scrubs `DAM_LOGIN_ID` and `DAM_PASSWORD`
+from the harness's environment for the same reason.
+
+## Sign in by hand
 
 ```bash
 cd dam_scraper
 uv run --locked python dam_auth.py capture
 ```
 
-Enter your Gap SSO login ID and password at the prompts. The command runs
-Chromium headlessly and stores only the authenticated browser state. To inspect
-a login failure in a browser window, add `--headed`.
+Uses the stored login above when there is one, else asks at the terminal - and
+says which. It runs Chromium headlessly and stores only the authenticated
+browser state. To inspect a login failure in a browser window, add `--headed`.
 
 ## Download
 
@@ -65,7 +93,8 @@ manifest is what records which files belong to which style.
 Override either location with `--image-root` and `--output-root`, or with the
 `DAM_IMAGE_ROOT` and `DAM_OUTPUT_ROOT` environment variables.
 
-If the DAM session expires, run the sign-in command again.
+If the DAM session expires, the scraper signs in again with the stored login;
+without one, run `dam_auth.py capture` by hand.
 
 ## Docker
 
@@ -76,18 +105,24 @@ docker build -t gap-dam-scraper dam_scraper
 
 docker volume create gap-dam-auth
 
-docker run --rm -it --init --ipc=host \
-  -v gap-dam-auth:/home/pwuser/.dam-auth \
-  --entrypoint python \
-  gap-dam-scraper dam_auth.py capture
-
 docker run --rm --init --ipc=host \
-  -e DAM_OUTPUT_ROOT=/downloads \
-  -v gap-dam-auth:/home/pwuser/.dam-auth:ro \
+  -e DAM_LOGIN_ID -e DAM_PASSWORD \
+  -v gap-dam-auth:/home/pwuser/.dam-auth \
   -v "$PWD/dam_scraper/downloads:/downloads" \
   -v "$PWD/inputs/reference_library:/images" \
   gap-dam-scraper 853417012
 ```
 
-The first command captures authentication from an interactive terminal without
-a GUI. Later scraper runs reuse the state in the Docker volume.
+No separate sign-in step: with the login in the environment (or in files named
+by `DAM_LOGIN_ID_FILE`/`DAM_PASSWORD_FILE`, mounted from the orchestrator's
+secrets), the scraper signs in on its first run and whenever the DAM rejects
+the saved session. The volume keeps the session between runs so that happens
+only when it has to, and it must be writable for the same reason. The
+interactive form still works for a one-off:
+
+```bash
+docker run --rm -it --init --ipc=host \
+  -v gap-dam-auth:/home/pwuser/.dam-auth \
+  --entrypoint python \
+  gap-dam-scraper dam_auth.py capture
+```

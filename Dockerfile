@@ -1,9 +1,10 @@
 # PLD laydown harness.
 #
-# The container is a CLIENT, not a self-contained system. Three things stay
+# The container is a CLIENT, not a self-contained system. Four things stay
 # outside it and are supplied at run time: the model (QWEN_BASE_URL), the
-# segmentation service (SEGMENT_URL), and fal.ai (FAL_KEY). Nothing here
-# downloads a model or holds a credential.
+# segmentation service (SEGMENT_URL), fal.ai (FAL_KEY), and the Gap DAM
+# sign-in (DAM_LOGIN_ID/DAM_PASSWORD, only when --style or --item-details is
+# used). Nothing here downloads a model or holds a credential.
 #
 # Build:  docker build -t pld-harness .
 # Run:    see docker-entrypoint.sh, or DOCKER.md
@@ -86,6 +87,32 @@ COPY tools/ tools/
 COPY task/ task/
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# --- the Gap DAM scraper, so --style / --item-details work in here ---------
+#
+# run.sh signs in to the DAM and pulls a style's laydown shots before the
+# harness starts, and the harness pulls --item-details itself as a last
+# resort. Both go through dam_scraper/ under its own uv environment -
+# Playwright lives there, pinned by uv.lock, and never in the harness venv.
+# The environment is built on the image's own interpreter so nothing is
+# downloaded at run time, and the browsers go to a fixed path so they are
+# found whoever the container runs as.
+COPY --from=ghcr.io/astral-sh/uv:0.12.5 /uv /uvx /bin/
+ENV UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+COPY dam_scraper/pyproject.toml dam_scraper/uv.lock dam_scraper/
+RUN uv sync --locked --no-dev --project dam_scraper --python /usr/local/bin/python3 \
+    && dam_scraper/.venv/bin/playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
+COPY dam_scraper/auth_session.py dam_scraper/dam_auth.py dam_scraper/dam_scrape.py dam_scraper/
+COPY run.sh ./
+# The saved DAM session and the scraper's manifests. Mount volumes here so a
+# sign-in and a style pull outlive the container; without the mounts each run
+# signs in and pulls again, which works and only costs time.
+ENV DAM_AUTH_STATE=/app/dam_auth/state.json \
+    DAM_OUTPUT_ROOT=/app/dam_downloads
+RUN mkdir -p /app/dam_auth /app/dam_downloads
 
 # The path the Kestra flows mount the shared library at. Created empty so a
 # run without the mount searches an empty folder and says so, rather than

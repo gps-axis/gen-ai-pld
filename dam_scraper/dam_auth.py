@@ -6,6 +6,8 @@ import argparse
 import getpass
 import json
 import os
+import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -43,6 +45,29 @@ IDP_PATH_SUFFIX = "/resumeSAML20/idp/SSO.ping"
 USERNAME_SELECTOR = 'input#username[name="pf.username"][type="text"]'
 PASSWORD_SELECTOR = 'input#password[name="pf.pass"][type="password"]'
 SIGN_ON_SELECTOR = 'a[title="Sign On"][onclick="postOk();"]'
+
+# Where the sign-in comes from when a login is needed, in this order: the
+# environment (a value, or the path of a file holding it - the Docker and
+# Compose secrets convention, where only the path travels in the environment
+# and the secret sits read-only under /run/secrets), the macOS Keychain entry
+# that `store` writes, then the terminal. Nothing here ever goes into a file
+# in the repository.
+LOGIN_ID_ENV = "DAM_LOGIN_ID"
+PASSWORD_ENV = "DAM_PASSWORD"
+LOGIN_ID_FILE_ENV = "DAM_LOGIN_ID_FILE"
+PASSWORD_FILE_ENV = "DAM_PASSWORD_FILE"
+KEYCHAIN_SERVICE = "gap-dam-sso"
+KEYCHAIN_LABEL = "Gap DAM sign-in (PLD harness)"
+SECURITY_TOOL = "/usr/bin/security"
+STORE_COMMAND = "cd dam_scraper && uv run --locked python dam_auth.py store"
+# `security find-generic-password -g` prints the account among the item's
+# attributes on stdout, and the password on stderr - quoted when it is plain
+# printable ASCII, otherwise as 0x-prefixed hex (a backslash, a tab or any
+# non-ASCII character is enough to switch it). The two forms cannot be told
+# apart from the bare `-w` output, which is why -g is the one parsed here.
+_KEYCHAIN_ACCOUNT = re.compile(r'^\s*"acct"<blob>="(.*)"$', re.MULTILINE)
+_KEYCHAIN_HEX_PASSWORD = re.compile(r"^password: 0x([0-9A-Fa-f]*)", re.MULTILINE)
+_KEYCHAIN_TEXT_PASSWORD = re.compile(r'^password: "(.*)"$', re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -231,9 +256,188 @@ def _find_idp_page(context: Any, timeout_ms: int) -> Any | None:
         time.sleep(0.25)
 
 
+def _setting_from_environment(name: str, file_name: str) -> tuple[str, str]:
+    """(value, which variable supplied it): NAME's value, else the contents of
+    the file NAME_FILE names, else ('', ''). One trailing line break is dropped
+    from the file, the way `echo` and most secret stores leave one."""
+
+    value = os.environ.get(name, "")
+    path = os.environ.get(file_name, "")
+    if value and path:
+        raise RuntimeError(f"Both {name} and {file_name} are set; set one of them.")
+    if value:
+        return value, name
+    if not path:
+        return "", ""
+    try:
+        contents = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(
+            f"{file_name} names a file that could not be read: {path} ({exc.strerror})."
+        ) from exc
+    return contents.rstrip("\r\n"), file_name
+
+
+def _credentials_from_environment() -> tuple[Credentials, str] | None:
+    """The login from the environment and where it came from, or None when
+    nothing is set there."""
+
+    login_id, login_source = _setting_from_environment(LOGIN_ID_ENV, LOGIN_ID_FILE_ENV)
+    password, password_source = _setting_from_environment(PASSWORD_ENV, PASSWORD_FILE_ENV)
+    login_id = login_id.strip()
+    if not login_id and not password.strip():
+        return None
+    if not login_id:
+        raise RuntimeError(
+            f"{password_source} is set but {LOGIN_ID_ENV} is not "
+            f"(nor {LOGIN_ID_FILE_ENV}); set both or neither."
+        )
+    if not password.strip():
+        raise RuntimeError(
+            f"{login_source} is set but {PASSWORD_ENV} is not "
+            f"(nor {PASSWORD_FILE_ENV}); set both or neither."
+        )
+    return Credentials(login_id=login_id, password=password), f"{login_source} and {password_source}"
+
+
+def _keychain_available() -> bool:
+    return sys.platform == "darwin" and os.access(SECURITY_TOOL, os.X_OK)
+
+
+def _security(*arguments: str, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [SECURITY_TOOL, *arguments],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _credentials_from_keychain() -> Credentials | None:
+    """The login `store` put in the macOS Keychain, or None when there is none.
+
+    A Keychain that cannot be read at all (locked, or the tool failing) is
+    reported on stderr and treated as empty, so the terminal prompt still
+    works; an entry that exists but is unusable is an error, because the fix
+    is different and the prompt would only hide it.
+    """
+
+    if not _keychain_available():
+        return None
+    result = _security("find-generic-password", "-s", KEYCHAIN_SERVICE, "-g")
+    if result.returncode == 44:  # errSecItemNotFound
+        return None
+    if result.returncode != 0:
+        print(
+            "The macOS Keychain could not be read "
+            f"(security exit {result.returncode}): {result.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return None
+
+    account = _KEYCHAIN_ACCOUNT.search(result.stdout)
+    login_id = account.group(1).strip() if account else ""
+    hex_password = _KEYCHAIN_HEX_PASSWORD.search(result.stderr)
+    text_password = _KEYCHAIN_TEXT_PASSWORD.search(result.stderr)
+    password = ""
+    if hex_password is not None:
+        try:
+            password = bytes.fromhex(hex_password.group(1)).decode("utf-8")
+        except ValueError:
+            password = ""
+    elif text_password is not None:
+        password = text_password.group(1)
+    if not login_id or not password.strip():
+        raise RuntimeError(
+            f"The Keychain entry '{KEYCHAIN_SERVICE}' is missing its login ID or "
+            f"password; store it again: {STORE_COMMAND}"
+        )
+    return Credentials(login_id=login_id, password=password)
+
+
+def _keychain_quote(value: str) -> str:
+    """One argument for a line of `security -i` input.
+
+    Interactive mode splits the line itself: double quotes group, backslash
+    escapes, and a newline ends the command. A newline cannot come from the
+    terminal prompts, so it is refused rather than escaped.
+    """
+
+    if "\n" in value or "\r" in value:
+        raise RuntimeError("The login ID and password cannot contain a line break.")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _keychain_store(credentials: Credentials) -> None:
+    """Write the login to the Keychain and read it back to prove it landed.
+
+    The item goes in through `security -i` on stdin rather than as an
+    argument, so the password never shows in the process list. Interactive
+    mode does not report a failed command in its exit status, hence the
+    read-back.
+    """
+
+    line = " ".join(
+        [
+            "add-generic-password",
+            "-U",
+            "-s", _keychain_quote(KEYCHAIN_SERVICE),
+            "-a", _keychain_quote(credentials.login_id),
+            "-l", _keychain_quote(KEYCHAIN_LABEL),
+            "-T", SECURITY_TOOL,
+            "-w", _keychain_quote(credentials.password),
+        ]
+    )
+    result = _security("-i", stdin=line + "\n")
+    if result.returncode != 0:
+        raise RuntimeError(
+            "The macOS Keychain refused the login "
+            f"(security exit {result.returncode}): {result.stderr.strip()}"
+        )
+    try:
+        stored = _credentials_from_keychain()
+    except RuntimeError:
+        stored = None
+    if stored != credentials:
+        raise RuntimeError(
+            "The macOS Keychain did not keep the login as entered; "
+            f"nothing usable is stored under '{KEYCHAIN_SERVICE}'."
+        )
+
+
+def stored_credentials() -> tuple[Credentials, str] | None:
+    """The login that needs no terminal, and where it came from: the
+    environment, else the macOS Keychain, else None. What the scraper signs
+    in with on its own - it never asks."""
+
+    from_environment = _credentials_from_environment()
+    if from_environment is not None:
+        return from_environment
+    from_keychain = _credentials_from_keychain()
+    if from_keychain is not None:
+        return from_keychain, f"the macOS Keychain ('{KEYCHAIN_SERVICE}')"
+    return None
+
+
+def _resolve_credentials() -> Credentials:
+    """A stored login, else the terminal - and say which."""
+
+    stored = stored_credentials()
+    if stored is not None:
+        credentials, source = stored
+        print(f"Using the Gap SSO login from {source}.")
+        return credentials
+    return _prompt_credentials()
+
+
 def _prompt_credentials() -> Credentials:
     if not sys.stdin.isatty():
-        raise RuntimeError("Capture requires an interactive terminal.")
+        raise RuntimeError(
+            "No stored Gap SSO login and no interactive terminal to ask from. "
+            f"Store one with: {STORE_COMMAND} "
+            f"(or set {LOGIN_ID_ENV} and {PASSWORD_ENV})."
+        )
 
     try:
         login_id = input("Gap SSO login ID: ").strip()
@@ -248,9 +452,10 @@ def _prompt_credentials() -> Credentials:
     return Credentials(login_id=login_id, password=password)
 
 
-def _login_from_terminal(page: Any) -> None:
+def _sign_in(page: Any, credentials: Credentials | None = None) -> None:
     form = _verified_idp_form(page)
-    credentials = _prompt_credentials()
+    if credentials is None:
+        credentials = _resolve_credentials()
     try:
         form.username.fill(credentials.login_id)
     except Exception:
@@ -330,35 +535,85 @@ def _safe_page_summary(page: Any) -> str:
     return f"title={title!r}, url={safe_url!r}"
 
 
-def capture(args: argparse.Namespace) -> int:
-    """Sign in from the terminal and save the authenticated browser state."""
+def store(args: argparse.Namespace) -> int:
+    """Ask once for the Gap SSO login and keep it in the macOS Keychain."""
 
-    auth_state = args.auth_state.expanduser().resolve()
+    if not _keychain_available():
+        raise RuntimeError(
+            f"Storing the login needs the macOS Keychain ({SECURITY_TOOL}). "
+            f"Elsewhere, set {LOGIN_ID_ENV} and {PASSWORD_ENV} instead."
+        )
+    if not sys.stdin.isatty():
+        raise RuntimeError("store needs an interactive terminal to ask for the login.")
+    _keychain_store(_prompt_credentials())
+    print(
+        f"Saved the Gap SSO login to the macOS Keychain as '{KEYCHAIN_SERVICE}'. "
+        "capture uses it from now on. Run store again after a password change, "
+        "or forget to remove it."
+    )
+    return 0
+
+
+def forget(args: argparse.Namespace) -> int:
+    """Remove the login that `store` put in the macOS Keychain."""
+
+    if not _keychain_available():
+        raise RuntimeError(
+            f"There is no macOS Keychain here ({SECURITY_TOOL}); nothing to forget."
+        )
+    result = _security("delete-generic-password", "-s", KEYCHAIN_SERVICE)
+    if result.returncode == 44:  # errSecItemNotFound
+        print("No stored Gap SSO login to remove.")
+        return 0
+    if result.returncode != 0:
+        raise RuntimeError(
+            "The macOS Keychain entry could not be removed "
+            f"(security exit {result.returncode}): {result.stderr.strip()}"
+        )
+    print(f"Removed the Gap SSO login '{KEYCHAIN_SERVICE}' from the macOS Keychain.")
+    return 0
+
+
+def sign_in(
+    auth_state: Path,
+    *,
+    credentials: Credentials | None = None,
+    url: str = DEFAULT_DAM_URL,
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    headed: bool = False,
+    channel: str | None = None,
+) -> str:
+    """Log in to the DAM, save the browser state at auth_state, and return a
+    summary of the page that proved the login.
+
+    With credentials=None the login is resolved only once the SSO form is on
+    screen - environment, Keychain, then the terminal - so a browser that
+    turns out to be signed in already never asks for anything. The scraper
+    passes the login it found itself, so that it never reaches a prompt.
+    """
+
+    auth_state = auth_state.expanduser().resolve()
     auth_state.parent.mkdir(parents=True, exist_ok=True)
 
-    launch_options: dict[str, Any] = {"headless": not args.headed}
-    if args.channel:
-        launch_options["channel"] = args.channel
+    launch_options: dict[str, Any] = {"headless": not headed}
+    if channel:
+        launch_options["channel"] = channel
 
     with _playwright()() as playwright:
         browser = playwright.chromium.launch(**launch_options)
         try:
             context = browser.new_context()
             page = context.new_page()
-            page.goto(
-                args.url,
-                wait_until="domcontentloaded",
-                timeout=args.timeout_ms,
-            )
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
 
             authenticated_page = _authenticated_page(context, DEFAULT_DAM_URL)
             if authenticated_page is None:
                 gateway = _verified_sso_gateway(page)
-                _click_sso_gateway(gateway, args.timeout_ms)
-                idp_page = _find_idp_page(context, args.timeout_ms)
+                _click_sso_gateway(gateway, timeout_ms)
+                idp_page = _find_idp_page(context, timeout_ms)
                 if idp_page is None:
                     raise _classify_failed_sso(context.pages)
-                _login_from_terminal(idp_page)
+                _sign_in(idp_page, credentials)
                 try:
                     _verified_idp_form(idp_page)
                 except AuthenticationExpired:
@@ -368,7 +623,7 @@ def capture(args: argparse.Namespace) -> int:
                         "Gap SSO rejected the credentials or restarted sign-in."
                     )
                 authenticated_page = _find_authenticated_page(
-                    context, DEFAULT_DAM_URL, args.timeout_ms
+                    context, DEFAULT_DAM_URL, timeout_ms
                 )
             if authenticated_page is None:
                 raise _classify_failed_sso(context.pages)
@@ -383,6 +638,20 @@ def capture(args: argparse.Namespace) -> int:
                 if not closing_during_exception:
                     raise
 
+    return captured_page_summary
+
+
+def capture(args: argparse.Namespace) -> int:
+    """Sign in and save the authenticated browser state - see sign_in."""
+
+    auth_state = args.auth_state.expanduser().resolve()
+    captured_page_summary = sign_in(
+        auth_state,
+        url=args.url,
+        timeout_ms=args.timeout_ms,
+        headed=args.headed,
+        channel=args.channel,
+    )
     print(
         "Saved authenticated browser state from "
         f"{captured_page_summary} to {auth_state}"
@@ -436,7 +705,13 @@ def build_parser() -> argparse.ArgumentParser:
         )
 
     capture_parser = subparsers.add_parser(
-        "capture", help="Log in from the terminal and save the browser state."
+        "capture",
+        help=(
+            "Log in and save the browser state. The login comes from "
+            f"{LOGIN_ID_ENV}/{PASSWORD_ENV} (or the files {LOGIN_ID_FILE_ENV}/"
+            f"{PASSWORD_FILE_ENV} name), else the macOS Keychain entry written "
+            "by 'store', else the terminal."
+        ),
     )
     add_common_options(capture_parser)
     capture_parser.add_argument(
@@ -460,6 +735,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show the browser while checking the session.",
     )
     check_parser.set_defaults(handler=check)
+
+    store_parser = subparsers.add_parser(
+        "store",
+        help=(
+            "Ask once for the Gap SSO login and keep it in the macOS Keychain "
+            f"(item '{KEYCHAIN_SERVICE}'), so capture never prompts again."
+        ),
+    )
+    store_parser.set_defaults(handler=store)
+
+    forget_parser = subparsers.add_parser(
+        "forget", help="Remove the login that 'store' put in the macOS Keychain."
+    )
+    forget_parser.set_defaults(handler=forget)
 
     return parser
 

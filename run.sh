@@ -15,16 +15,30 @@
 # of them matches the garment (the harness pulls the text's shots and searches
 # once more before it gives up). On its own it is the whole reference pull.
 #
-# In order: make sure the Gap DAM sign-in is still good (and sign in from the
-# terminal when it is not), download that style's laydown shots into the
-# reference library, decode the phone's HEIC, then run the harness against
-# those shots. Before this file did the last two, the operator did the first
-# two by hand in another folder, and the only thing linking the four steps was
-# remembering to do them in that order.
+# In order: make sure the Gap DAM sign-in is still good (and sign in again
+# when it is not - silently, from the login kept in the macOS Keychain by
+# `dam_auth.py store` or in DAM_LOGIN_ID/DAM_PASSWORD, else by asking at the
+# terminal), download that style's laydown shots into the reference library,
+# decode the phone's HEIC, then run the harness against those shots. Before
+# this file did the last two, the operator did the first two by hand in
+# another folder, and the only thing linking the four steps was remembering to
+# do them in that order.
 #
 # --style and --item-details are the only flags consumed here. Everything else
 # goes to harness.py untouched. Without either, nothing touches the DAM and the
 # command is exactly what it always was.
+#
+# Two folders are involved, and both can be moved with the variables the
+# scraper itself reads: DAM_IMAGE_ROOT is where the shots land and what the
+# harness then searches (inputs/reference_library by default), DAM_OUTPUT_ROOT
+# is where the scraper keeps its manifests and zips (dam_scraper/downloads).
+# The container sets both to mounted volumes, so a style pulled once stays
+# pulled; see docker-entrypoint.sh.
+#
+# A DAM that holds nothing for the style or the text is a miss, not a failure:
+# the harness goes on with what the library already holds and parks (exit 20)
+# if none of it is close. A DAM that cannot be reached or signed in to is a
+# failure, and stops here.
 #
 # The harness runs on an interpreter that has numpy/PIL/scipy/requests/
 # fal_client and pillow_heif - the last one is what lets --source take a .HEIC.
@@ -95,7 +109,9 @@ if [ -n "$STYLE" ] || [ -n "$ITEM_DETAILS" ]; then
   [ -z "$ITEM_DETAILS" ] || [[ "$ITEM_DETAILS" =~ [A-Za-z0-9] ]] || die "--item-details needs some text to search with, got '$ITEM_DETAILS'"
   command -v uv >/dev/null 2>&1 || die "uv is required for the DAM steps - run ./setup.sh first."
   DAM="$HERE/dam_scraper"
-  LIB="$HERE/inputs/reference_library"
+  LIB="${DAM_IMAGE_ROOT:-$HERE/inputs/reference_library}"
+  DAM_DOWNLOADS="${DAM_OUTPUT_ROOT:-$DAM/downloads}"
+  mkdir -p "$LIB"
   # VIRTUAL_ENV is unset for these so uv uses the scraper's own environment
   # (playwright lives there, not in the harness venv) instead of warning about
   # the one that happens to be activated in the shell.
@@ -111,12 +127,13 @@ if [ -n "$STYLE" ] || [ -n "$ITEM_DETAILS" ]; then
   # check exits 0 when the saved session still reaches the DAM, 2 when there is
   # no saved session, 3 when there is one and the DAM sent it back to login.
   # The last two have the same fix; anything else is Playwright or Chromium
-  # broken, and a password prompt is not the answer to that.
+  # broken, and signing in again is not the answer to that. capture says where
+  # it got the login from, and when it has none stored and no terminal to ask
+  # at, its own message names both ways to fix that.
   set +e; dam dam_auth.py check; RC=$?; set -e
   case $RC in
     0) ;;
-    2|3) [ -t 0 ] || die "the DAM sign-in has expired and there is no terminal to sign in from. Run: cd dam_scraper && uv run --locked python dam_auth.py capture"
-         echo "  signing in to the Gap DAM"
+    2|3) echo "  signing in to the Gap DAM"
          dam dam_auth.py capture || die "DAM sign-in failed (exit $?)" ;;
     *) die "dam_auth.py check broke (exit $RC) - see the message above" ;;
   esac
@@ -126,13 +143,23 @@ if [ -n "$STYLE" ] || [ -n "$ITEM_DETAILS" ]; then
   # --output-root is spelled out because the scraper's default is relative to
   # the working directory, and this command is run from anywhere. The tee
   # keeps the scraper's progress on the terminal while its stdout is captured
-  # for the manifest line.
+  # for the manifest line. With pipefail on, the substitution's status is the
+  # scraper's, not tee's.
   DAM_ARGS=()
   [ -z "$STYLE" ] || DAM_ARGS+=("$STYLE")
   [ -z "$ITEM_DETAILS" ] || DAM_ARGS+=(--item-details "$ITEM_DETAILS")
-  DAM_OUT="$(dam dam_scrape.py "${DAM_ARGS[@]}" --image-root "$LIB" --output-root "$DAM/downloads" | tee /dev/stderr)" \
-    || die "DAM download failed (exit $?)"
-  MANIFEST="$(printf '%s\n' "$DAM_OUT" | sed -n 's/^manifest //p' | tail -n 1)"
+  set +e
+  DAM_STDOUT="$(dam dam_scrape.py "${DAM_ARGS[@]}" --image-root "$LIB" --output-root "$DAM_DOWNLOADS" | tee /dev/stderr)"
+  DAM_RC=$?
+  set -e
+  if [ "$DAM_RC" -eq 4 ]; then
+    # dam_scrape.py's "nothing to download": searched, found nothing. The
+    # library may still hold something close from an earlier pull.
+    echo "  DAM       nothing to download for this style or text; the harness goes on with the ${LIB#"$HERE/"}/ it has" >&2
+  elif [ "$DAM_RC" -ne 0 ]; then
+    die "DAM download failed (exit $DAM_RC)"
+  else
+  MANIFEST="$(printf '%s\n' "$DAM_STDOUT" | sed -n 's/^manifest //p' | tail -n 1)"
   [ -n "$MANIFEST" ] || die "dam_scrape.py finished without naming the manifest it wrote"
   # The library is shared by every pull, so "holds a JPG" proves nothing about
   # this one. Check the files the manifest says this pull produced, by name,
@@ -149,6 +176,7 @@ if missing:
     print("  missing: " + ", ".join(missing), file=sys.stderr); sys.exit(1)
 print(f"  library   {len(names)} JPG(s) for this pull, flat in {lib.name}/")
 PYCHECK
+  fi
   set -- --reference-library "$LIB" "$@"
   # The harness gets the text too, for the last resort described at the top.
   [ -z "$ITEM_DETAILS" ] || set -- --item-details "$ITEM_DETAILS" "$@"
@@ -162,4 +190,7 @@ case " $* " in
   *) [ -f "$HERE/task/SKILL.md" ] && SKILL_ARGS=(--skill-file "$HERE/task/SKILL.md") ;;
 esac
 
-exec "$PY" "$HERE/harness.py" "${SKILL_ARGS[@]}" "$@"
+# The DAM login, if it came in through the environment, has done its job. The
+# harness hands its whole environment to the agent's shell, and a password has
+# no business in there.
+exec env -u DAM_LOGIN_ID -u DAM_PASSWORD -u DAM_LOGIN_ID_FILE -u DAM_PASSWORD_FILE "$PY" "$HERE/harness.py" "${SKILL_ARGS[@]}" "$@"

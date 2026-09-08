@@ -18,6 +18,15 @@ __pycache__/
 **/__pycache__/
 *.pyc
 
+# The scraper's state and bulk: the saved DAM session is a credential, the
+# downloads are 500MB of zips, the venv is macOS-specific, and the tests and
+# discovery artifacts are not run in the image.
+dam_scraper/secrets/
+dam_scraper/downloads/
+dam_scraper/.venv/
+dam_scraper/artifacts/
+dam_scraper/tests/
+
 # Bulk archives - 28MB of inputs.zip has no business in an image layer.
 *.zip
 

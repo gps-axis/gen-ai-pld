@@ -19,8 +19,15 @@ from typing import Any, Iterable
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
 
-from auth_session import AuthStateError, load_storage_state
-from dam_auth import DEFAULT_AUTH_STATE, _find_authenticated_page
+from auth_session import AuthStateError, AuthenticationExpired, load_storage_state
+from dam_auth import (
+    DEFAULT_AUTH_STATE,
+    LOGIN_ID_ENV,
+    PASSWORD_ENV,
+    _find_authenticated_page,
+    sign_in,
+    stored_credentials,
+)
 
 
 DEFAULT_SEARCH_URL = (
@@ -50,6 +57,11 @@ MAX_PER_CODE = 10
 # whatever their Shot Request ID. The DAM pages results 50 at a time, so this
 # is exactly the set of cards a search renders before anyone scrolls to page 2.
 ITEM_DETAILS_LIMIT = 50
+# The exit status for "the DAM was searched and holds nothing for this style
+# or text". A miss rather than a failure - the session was good and the search
+# ran - and distinct so a caller can go on without the shots. run.sh does:
+# it warns and lets the harness search whatever the library already holds.
+EXIT_NOTHING_TO_DOWNLOAD = 4
 # Text searches keep their ZIP and manifest apart from the per-style folders,
 # so a text that happens to look like a style number cannot collide with one.
 ITEM_DETAILS_DIRECTORY = "item-details"
@@ -58,6 +70,10 @@ DEFAULT_IMAGE_ROOT = Path(__file__).resolve().parent.parent / "inputs" / "refere
 
 class ScrapeError(RuntimeError):
     """The requested DAM job could not be completed safely."""
+
+
+class SessionRejectedError(ScrapeError):
+    """The DAM sent the saved session back to its login page."""
 
 
 class FacetUnavailableError(ScrapeError):
@@ -332,9 +348,7 @@ def open_search_page(
     page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
     authenticated_page = _find_authenticated_page(context, url)
     if authenticated_page is None:
-        raise ScrapeError(
-            "The saved DAM session was rejected. Run dam_auth.py capture again."
-        )
+        raise SessionRejectedError("The saved DAM session was rejected.")
     search = find_visible(
         authenticated_page,
         (
@@ -1048,16 +1062,62 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def download(settings: RunSettings, args: argparse.Namespace) -> Path:
+    """The manifest of this pull: the style's, else the text's - the text
+    stands in when there is no style, or when the style has no laydown
+    assets."""
+    if args.style_number is not None:
+        try:
+            return download_style(settings, args.style_number)
+        except NoLaydownAssetsError as exc:
+            if args.item_details is None:
+                raise
+            print(
+                f"{exc} Falling back to --item-details {args.item_details!r}.",
+                file=sys.stderr,
+            )
+    return download_item_details(settings, args.item_details)
+
+
+def download_with_session(settings: RunSettings, args: argparse.Namespace) -> Path:
+    """download(), signing in first when there is no saved session or the DAM
+    sends the saved one back to login.
+
+    Only a login that needs no terminal is used (dam_auth.stored_credentials:
+    the environment, else the macOS Keychain), so a container run never hangs
+    on a prompt; with none stored the error names both ways to provide one.
+    One sign-in, then one more try: a fresh session the DAM rejects again is
+    an error, not a loop.
+    """
+    try:
+        load_storage_state(settings.auth_state)
+        return download(settings, args)
+    except (AuthStateError, SessionRejectedError) as exc:
+        stored = stored_credentials()
+        if stored is None:
+            raise ScrapeError(
+                f"{exc} No stored login to sign in with: run dam_auth.py capture, "
+                f"or set {LOGIN_ID_ENV} and {PASSWORD_ENV}."
+            ) from exc
+        credentials, source = stored
+        print(f"{exc} Signing in with the login from {source}.", file=sys.stderr)
+    sign_in(
+        settings.auth_state,
+        credentials=credentials,
+        timeout_ms=settings.timeout_ms,
+        headed=settings.headed,
+    )
+    return download(settings, args)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.style_number is None and args.item_details is None:
         parser.error("a style number, --item-details TEXT, or both is required")
     try:
-        auth_state = args.auth_state.expanduser().resolve()
-        load_storage_state(auth_state)
         settings = RunSettings(
-            auth_state=auth_state,
+            auth_state=args.auth_state.expanduser().resolve(),
             url=args.url,
             headed=args.headed,
             timeout_ms=args.timeout_ms,
@@ -1065,24 +1125,22 @@ def main(argv: list[str] | None = None) -> int:
             output_root=args.output_root.expanduser().resolve(),
             images_directory=args.image_root.expanduser().resolve(),
         )
-        manifest_path: Path | None = None
-        if args.style_number is not None:
-            try:
-                manifest_path = download_style(settings, args.style_number)
-            except NoLaydownAssetsError as exc:
-                if args.item_details is None:
-                    raise
-                print(
-                    f"{exc} Falling back to --item-details {args.item_details!r}.",
-                    file=sys.stderr,
-                )
-        if manifest_path is None:
-            manifest_path = download_item_details(settings, args.item_details)
+        manifest_path = download_with_session(settings, args)
         # The last line of stdout names the manifest, so a caller that cannot
         # know in advance which of the two searches produced it can find it.
         print(f"manifest {manifest_path}")
         return 0
-    except (AuthStateError, ScrapeError, PlaywrightTimeoutError, OSError, json.JSONDecodeError) as exc:
+    except NoLaydownAssetsError as exc:
+        print(f"DAM has nothing to download: {exc}", file=sys.stderr)
+        return EXIT_NOTHING_TO_DOWNLOAD
+    except (
+        AuthStateError,
+        AuthenticationExpired,
+        RuntimeError,  # ScrapeError and dam_auth's configuration errors
+        PlaywrightTimeoutError,
+        OSError,
+        json.JSONDecodeError,
+    ) as exc:
         print(f"DAM download failed: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:

@@ -11,16 +11,29 @@
 #              has to supply one. Execution ends GREEN.
 #   failed     anything else -> the errors block reports it
 #
-# Task order: prepare -> fal-edit (harness) -> If reference found:
-#   upload-to-spaces -> notify-endpoint
+# Task order: fetch-item-details -> prepare -> fal-edit (harness)
+#   -> If reference found: upload-to-spaces -> notify-endpoint
 #   else: upload-near-misses -> notify-parked
 #
 # 2026-09-02: the container is the rebuilt harness under PLD_Harness/, not the
 # retired pipeline in old/. Its entrypoint keeps this flow's contract, so Axis
-# and the webhook payloads are untouched. Changes here: LAYDOWN_TASK gone (it
-# named a script that no longer exists; the harness ranks and delivers its best
-# four itself), the forced reference is handed over as -e REFERENCE, and the
-# segmentation service gets its two env vars.
+# and the webhook payloads are untouched. Changes here: the old LAYDOWN_TASK
+# dropped (it named a script that no longer exists; the harness ranks and
+# delivers its best four itself - the variable is back below with the
+# operator's own wording), the forced reference is handed over as
+# -e REFERENCE, and the segmentation service gets its two env vars.
+#
+# 2026-09-08: the reference can come from the Gap DAM. A command that carries
+# a style colour (payload.style_color) has its product record looked up on the
+# tag-capture intake endpoint - brand, division, class and the rest - and the
+# harness is run the way an operator runs it on a laptop:
+#
+#   ./run.sh --style 671304002 --item-details "GAP MENS MENS KNITS L/S KNITS" \
+#            --source ... --max-images 10 --yolo --task "..."
+#
+# The style's own laydown shots are pulled into the shared library first and
+# the whole library is searched. A command without a style colour runs exactly
+# as before. The DAM sign-in is a Kestra secret, never inline here.
 #
 # TODO: move every key and token below into Kestra secrets - this file travels.
 
@@ -40,6 +53,19 @@ variables:
   # after the command is already reported complete, never as part of it.
   artifacts_url: "https://gapplatformstudio.com/studio_management/api/product_laydown_test/generation-artifacts/"
   axis_token: "7d616826-0079-4088-8ab3-ce184c44bfa1"
+  # Where a style colour's product record comes from. The same endpoint the
+  # dev server serves at
+  # http://localhost:5173/studio_management/api/product_laydown_test/tag-capture/intake/
+  tag_capture_url: "https://gapplatformstudio.com/studio_management/api/product_laydown_test/tag-capture/intake/"
+  # The intake record fields that make up the harness's --item-details text,
+  # in this order, joined by spaces: division "GAP MENS", department "MENS
+  # KNITS", class_name "L/S KNITS" -> "GAP MENS MENS KNITS L/S KNITS". The
+  # division already names the brand. A field the record lacks is skipped,
+  # and fetch-item-details logs the whole record.
+  item_details_fields: "division,department,class_name"
+  # What the run is asked to do - the operator's own command line says this.
+  # The skill has its own goal; this only adds to it.
+  laydown_task: "make the off_set_image.jpg look like the reference_greyscale shape"
 
 triggers:
   - id: kafka_commands
@@ -53,7 +79,138 @@ triggers:
     valueDeserializer: JSON
 
 tasks:
-  # 1. Stage the inputs the harness needs, and only those.
+  # 1. Look the style colour up, when the command carries one.
+  #
+  # payload.style_color (9 digits, style plus colour; 6 is accepted) names the
+  # garment in the Gap DAM. Its product record comes from the tag-capture
+  # intake endpoint, which answers with the intakes recorded for that style
+  # colour:
+  #
+  #   {"style_color": "780791002", "count": 1, "intakes": [{"brand": "Gap",
+  #     "division": "GAP WOMENS", "department": "WOMENS DENIM",
+  #     "class_name": "FASHION DENIM", "garment_image_url": "https://...",
+  #     "confirmed_at": "2026-09-04T15:32:12", ...}]}
+  #
+  # division, department and class_name become the harness's --item-details
+  # text ("GAP WOMENS WOMENS DENIM FASHION DENIM"): the DAM's fallback search
+  # when the style has no laydown shot, and the harness's last resort when
+  # none of the style's shots match. The most recently confirmed intake is
+  # the one read when there are several. Its garment photo is kept for
+  # prepare, which uses it when the command carries no source_url of its own.
+  # Every declared output is written on every path; without a style colour
+  # they are empty and the run is exactly what it was before.
+  #
+  # The lookup is enrichment, not a gate: an unreachable endpoint or an
+  # unknown style is logged and the run goes on with the style alone, which
+  # the DAM is searched by number for.
+  - id: fetch-item-details
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install --quiet kestra
+    inputFiles:
+      command.json: "{{ trigger.value | json }}"
+    outputFiles:
+      - style.txt
+      - item_details.txt
+      - item_record.json
+      - garment_image_url.txt
+    env:
+      TAG_CAPTURE_URL: "{{ vars.tag_capture_url }}"
+      AXIS_TOKEN: "{{ vars.axis_token }}"
+      ITEM_DETAILS_FIELDS: "{{ vars.item_details_fields }}"
+    script: |
+      import json, os, re, urllib.error, urllib.parse, urllib.request
+      from kestra import Kestra
+
+      def write(name, text):
+          with open(name, "w") as handle:
+              handle.write(text)
+
+      # Placeholders so every outputFile exists on every path.
+      write("style.txt", "")
+      write("item_details.txt", "")
+      write("item_record.json", "{}")
+      write("garment_image_url.txt", "")
+
+      command = json.load(open("command.json"))
+      payload = command.get("payload") or {}
+      style = str(payload.get("style_color") or command.get("style_color") or "").strip()
+      if not re.fullmatch(r"[0-9]{6}([0-9]{3})?", style):
+          print(f"No style colour on this command (style_color={style!r}); "
+                "the harness searches the library as before.")
+          Kestra.outputs({"style_color": "", "item_details": ""})
+          raise SystemExit(0)
+      write("style.txt", style)
+
+      url = os.environ["TAG_CAPTURE_URL"] + "?" + urllib.parse.urlencode({"style_color": style})
+      request = urllib.request.Request(url, headers={
+          "Accept": "application/json",
+          "Authorization": f"Token {os.environ['AXIS_TOKEN']}",
+          "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+      })
+      data = None
+      try:
+          with urllib.request.urlopen(request, timeout=30) as response:
+              data = json.loads(response.read().decode("utf-8"))
+          print(f"tag-capture intake for {style}:")
+          print(json.dumps(data, indent=2))
+      except urllib.error.HTTPError as error:
+          detail = error.read().decode("utf-8", "replace")[:2000]
+          print(f"tag-capture intake returned {error.code} for {style}: {detail}")
+      except (urllib.error.URLError, ValueError, TimeoutError) as error:
+          print(f"tag-capture intake could not be read for {style}: {error}")
+
+      # A field matches a key exactly, or as <field>_name / <field>_desc /
+      # <field>_description, so "class" takes class_name over class_code.
+      # Case does not matter.
+      fields = [f.strip().lower() for f in os.environ["ITEM_DETAILS_FIELDS"].split(",") if f.strip()]
+
+      def value_for(record, field):
+          lowered = {str(key).lower(): value for key, value in record.items()}
+          for key in (field, f"{field}_name", f"{field}_desc", f"{field}_description"):
+              value = lowered.get(key)
+              if value not in (None, "") and not isinstance(value, (dict, list)):
+                  return " ".join(str(value).split())
+          return ""
+
+      def find_record(node):
+          """The object carrying any of the fields: the response itself, a
+          record it wraps, or - from a list such as intakes - the entry with
+          the latest confirmed_at, so a re-captured tag reads its newest record."""
+          if isinstance(node, dict):
+              if any(value_for(node, field) for field in fields):
+                  return node
+              for child in node.values():
+                  found = find_record(child)
+                  if found is not None:
+                      return found
+          elif isinstance(node, list):
+              found = [record for record in (find_record(child) for child in node) if record is not None]
+              if found:
+                  return max(found, key=lambda record: str(record.get("confirmed_at") or ""))
+          return None
+
+      record = find_record(data) if data is not None else None
+      if record is None:
+          if data is not None:
+              print(f"No field named {', '.join(fields)} anywhere in the response; "
+                    "--item-details stays empty. Adjust item_details_fields in the "
+                    "flow's variables to the names above.")
+          Kestra.outputs({"style_color": style, "item_details": ""})
+          raise SystemExit(0)
+
+      write("item_record.json", json.dumps(record, indent=2))
+      item_details = " ".join(v for v in (value_for(record, field) for field in fields) if v)
+      write("item_details.txt", item_details)
+      garment_image_url = str(record.get("garment_image_url") or "").strip()
+      write("garment_image_url.txt", garment_image_url)
+      print(f"style {style} -> --item-details {item_details!r}")
+      print(f"garment photo on the record: {'yes' if garment_image_url else 'no'}")
+      Kestra.outputs({"style_color": style, "item_details": item_details,
+                      "garment_image_url": garment_image_url})
+
+  # 2. Stage the inputs the harness needs, and only those.
   #
   # hero_url is deliberately NOT downloaded. Under the harness the reference
   # comes from library_reference/ (or from an operator's approved drop), and
@@ -69,6 +226,8 @@ tasks:
       - apt-get update -qq && apt-get install -y -qq --no-install-recommends imagemagick curl jq ca-certificates > /dev/null
     inputFiles:
       command.json: "{{ trigger.value | json }}"
+      garment_image_url.txt: "{{ outputs['fetch-item-details'].outputFiles['garment_image_url.txt'] }}"
+      style.txt: "{{ outputs['fetch-item-details'].outputFiles['style.txt'] }}"
     outputFiles:
       - source_fit.jpg
       - forced_reference.jpg
@@ -83,8 +242,18 @@ tasks:
         CAP=25000000
 
         SOURCE_URL=$(jq -r '.payload.source_url // ""' command.json)
-        [ -n "$SOURCE_URL" ] && [ "$SOURCE_URL" != "null" ] \
-          || { echo "Command has no source_url"; exit 1; }
+        [ "$SOURCE_URL" != "null" ] || SOURCE_URL=""
+        # A tag-capture command may carry only the style colour; the intake
+        # record fetch-item-details read has the garment photo that was
+        # captured with the tag.
+        FROM_INTAKE=""
+        if [ -z "$SOURCE_URL" ] && [ -s garment_image_url.txt ]; then
+          SOURCE_URL="$(cat garment_image_url.txt)"
+          FROM_INTAKE=yes
+          echo "Source: the garment photo on the tag-capture intake record"
+        fi
+        [ -n "$SOURCE_URL" ] \
+          || { echo "Command has no source_url, and no intake record with a garment photo"; exit 1; }
 
         # The reference an operator dropped and approved against a parked job.
         # Present only on the release path; empty on a normal run.
@@ -92,8 +261,14 @@ tasks:
 
         curl -fsSL "$SOURCE_URL" -o source.jpg
 
-        # Stable base name for the output keys, from the source filename.
-        basename "$SOURCE_URL" | sed -E 's/\?.*$//; s/\.[A-Za-z0-9]+$//' > base_name.txt
+        # Stable base name for the output keys, from the source filename - or
+        # the style colour when the photo came off the intake record, where
+        # every garment is stored as photo.jpg.
+        if [ -n "$FROM_INTAKE" ]; then
+          cat style.txt > base_name.txt
+        else
+          basename "$SOURCE_URL" | sed -E 's/\?.*$//; s/\.[A-Za-z0-9]+$//' > base_name.txt
+        fi
         echo "Base name: $(cat base_name.txt)"
 
         # Django's category_key (BRAS) -> the library subfolder (bras). Passed
@@ -178,7 +353,7 @@ tasks:
           echo no > has_forced_reference.txt
         fi
 
-  # 2. Run the harness. no_reference = library has nothing close -> park, not fail.
+  # 3. Run the harness. no_reference = library has nothing close -> park, not fail.
   #
   # pullPolicy NEVER because pld-harness is built on this box and lives in no
   # registry - the default would try to pull it and fail before the first line.
@@ -208,8 +383,16 @@ tasks:
       # the container.
       volumes:
         - "/mnt/nvme1/ContainerFiles/agentic-gen-ai-workflow/gen-ai-pld/library_reference:/app/library_reference"
+        # The DAM session and the scraper's manifests, beside the library on
+        # the same disk. The run writes both, so neither is read-only: a
+        # session lasts across executions and the sign-in happens only when
+        # the DAM rejects it; a style pulled once is not pulled again.
+        - "/mnt/nvme1/ContainerFiles/agentic-gen-ai-workflow/gen-ai-pld/dam_auth:/app/dam_auth"
+        - "/mnt/nvme1/ContainerFiles/agentic-gen-ai-workflow/gen-ai-pld/dam_downloads:/app/dam_downloads"
     inputFiles:
       source_fit.jpg: "{{ outputs.prepare.outputFiles['source_fit.jpg'] }}"
+      style.txt: "{{ outputs['fetch-item-details'].outputFiles['style.txt'] }}"
+      item_details.txt: "{{ outputs['fetch-item-details'].outputFiles['item_details.txt'] }}"
       forced_reference.jpg: "{{ outputs.prepare.outputFiles['forced_reference.jpg'] }}"
       forced_reference_color.jpg: "{{ outputs.prepare.outputFiles['forced_reference_color.jpg'] }}"
       category.txt: "{{ outputs.prepare.outputFiles['category.txt'] }}"
@@ -249,10 +432,24 @@ tasks:
       # fresh folder, because the harness enforces its image budget by counting
       # what is already in there.
       LAYDOWN_SESSION: "{{ execution.id }}"
-      # No LAYDOWN_TASK. The one this flow used to send told the agent to
-      # finish with grade_flats.py --ship 4, a script that no longer exists;
-      # the harness now ranks and delivers its best four itself, and the
-      # entrypoint drops any task that names a retired tool.
+      # The task the run is given, from the flow's variables. The one this
+      # flow used to send named grade_flats.py --ship 4, a script that no
+      # longer exists, and the entrypoint still drops any task that names a
+      # retired tool; this one only says what the operator's command line
+      # says.
+      LAYDOWN_TASK: "{{ vars.laydown_task }}"
+      # The Gap DAM sign-in, for --style / --item-details. Kestra secrets, not
+      # inline: on the Kestra server, SECRET_DAM_LOGIN_ID and
+      # SECRET_DAM_PASSWORD hold the two values base64-encoded
+      # (echo -n 'value' | base64). A command without a style colour never
+      # uses them, but the task renders them on every run, so both must exist
+      # before this flow is deployed.
+      DAM_LOGIN_ID: "{{ secret('DAM_LOGIN_ID') }}"
+      DAM_PASSWORD: "{{ secret('DAM_PASSWORD') }}"
+      # Where the two DAM volumes above land; the image defaults to the same
+      # paths, and naming them keeps the mounts and the paths in one view.
+      DAM_AUTH_STATE: "/app/dam_auth/state.json"
+      DAM_OUTPUT_ROOT: "/app/dam_downloads"
     commands:
       - |
         # NOTE: no `set -e` - we must survive the harness's exit code and run
@@ -286,7 +483,17 @@ tasks:
           # Search only the category's folder. Axis already knows the category;
           # deriving it again is a second chance to get it wrong.
           [ -n "$CATEGORY" ] && set -- "$@" --reference-category "$CATEGORY"
+          # A command with a style colour goes through run.sh inside the
+          # container: the style's own DAM shots are pulled into the library
+          # first, the record's text is the DAM's fallback search, and the
+          # whole library is searched (the entrypoint says so and leaves the
+          # category alone). See fetch-item-details.
+          STYLE="$(cat style.txt)"
+          ITEM_DETAILS="$(cat item_details.txt)"
+          [ -n "$STYLE" ] && set -- "$@" --style "$STYLE"
+          [ -n "$ITEM_DETAILS" ] && set -- "$@" --item-details "$ITEM_DETAILS"
         fi
+        [ -n "${LAYDOWN_TASK:-}" ] && set -- "$@" --task "$LAYDOWN_TASK"
 
         /usr/local/bin/docker-entrypoint.sh "$PWD/source_fit.jpg" "$@"
         rc=$?
@@ -441,7 +648,7 @@ tasks:
         fi
         exit $rc
 
-  # 3. Branch: generated set vs parked-for-reference.
+  # 4. Branch: generated set vs parked-for-reference.
   - id: check-harness-result
     type: io.kestra.plugin.core.flow.If
     condition: "{{ json(read(outputs['fal-edit'].outputFiles['status.json'])).no_reference == false }}"
