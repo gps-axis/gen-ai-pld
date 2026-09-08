@@ -232,3 +232,8 @@ Container
 
 See DOCKER.md. Two inputs, one output, and the exit-code contract - including
 the finish-status table and why exit 20 can no longer occur.
+
+
+TODOS:
+- Adding OL credentials in .env
+- Store OL session secrets in axis db: 

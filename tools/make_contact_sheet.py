@@ -19,6 +19,7 @@ whose match is not decisive shows no input tile rather than a guess.
 Usage:  python3 tools/make_contact_sheet.py [runs_dir]
 """
 
+import hashlib
 import html
 import json
 import os
@@ -169,9 +170,19 @@ def log_metrics(path: Path):
     return out
 
 
+# The photo a run reads is always inputs/off_set_image.jpg, and the operator
+# keeps the originals by copying that file to a numbered name (x6.jpg, x21.jpg)
+# before the next one overwrites it. So the bank regularly holds the same
+# bytes twice, and a matcher that demands a clear winner sees a tie between
+# two copies of the right answer and reports nothing. Identical files are one
+# entry here, under the numbered name - the rolling one will not survive.
+ROLLING_INPUT = "off_set_image.jpg"
+
+
 def input_bank(inputs_dir: Path):
-    """Downscaled RGB arrays for every candidate raw input."""
+    """Downscaled RGB arrays for every distinct candidate raw input."""
     bank = {}
+    by_digest = {}
     if not inputs_dir.is_dir():
         return bank
     for p in sorted(inputs_dir.iterdir()):
@@ -180,9 +191,17 @@ def input_bank(inputs_dir: Path):
         if "reference" in p.name.lower():          # lay guides, not sources
             continue
         try:
+            digest = hashlib.sha256(p.read_bytes()).hexdigest()
+            twin = by_digest.get(digest)
+            if twin is not None:
+                if twin.name == ROLLING_INPUT:      # keep the name that lasts
+                    bank[p] = bank.pop(twin)
+                    by_digest[digest] = p
+                continue
             with Image.open(p) as im:
                 bank[p] = np.asarray(im.convert("RGB").resize(MATCH_SIZE, Image.LANCZOS),
                                      dtype=np.float32)
+            by_digest[digest] = p
         except Exception:
             pass
     return bank
