@@ -84,7 +84,14 @@ class FacetUnavailableError(ScrapeError):
 
 
 class NoLaydownAssetsError(ScrapeError):
-    """The search came back empty - the one failure --item-details stands in for."""
+    """The search holds nothing the scraper can download: a miss, not a
+    failure. This is what --item-details stands in for, and what exits with
+    EXIT_NOTHING_TO_DOWNLOAD when there is no text to fall back on."""
+
+
+class NoFinalImageError(NoLaydownAssetsError):
+    """The search has laydown shots, but none of them is a FINAL asset. The
+    scraper insists on FINAL, so this is as much a miss as an empty search."""
 
 
 @dataclass(frozen=True)
@@ -360,6 +367,14 @@ def no_laydown_assets_error(subject: str) -> NoLaydownAssetsError:
     return NoLaydownAssetsError(f"The Gap DAM has no laydown assets for {subject}.")
 
 
+def no_final_image_error(subject: str) -> NoFinalImageError:
+    """apply_exclusive_facet knows only that FINAL is not on offer; this names
+    the search it was not on offer for."""
+    return NoFinalImageError(
+        f"The Gap DAM has laydown shots for {subject}, but none of them is FINAL."
+    )
+
+
 def describe_batch(subject: str, shot_code: str | None) -> str:
     if shot_code is None:
         return f"The first-results batch for {subject}"
@@ -415,12 +430,17 @@ def open_search_page(
         raise
     if read_result_total(authenticated_page, timeout_ms) == 0:
         raise no_laydown_assets_error(subject)
-    apply_exclusive_facet(
-        authenticated_page,
-        ASSET_PRODUCTION_TYPE,
-        FINAL_ASSET_VALUE,
-        timeout_ms,
-    )
+    # Laydown shots with none of them FINAL are the other way a search can
+    # hold nothing to download; named for the subject, like the empty search.
+    try:
+        apply_exclusive_facet(
+            authenticated_page,
+            ASSET_PRODUCTION_TYPE,
+            FINAL_ASSET_VALUE,
+            timeout_ms,
+        )
+    except NoFinalImageError:
+        raise no_final_image_error(subject) from None
     return authenticated_page
 
 
@@ -585,7 +605,7 @@ def apply_exclusive_facet(
         options = read_facet_options(page, title, timeout_ms)
     except FacetUnavailableError:
         if title == ASSET_PRODUCTION_TYPE and value == FINAL_ASSET_VALUE:
-            raise ScrapeError("No FINAL image is available for this style.") from None
+            raise NoFinalImageError("No FINAL image is available for this style.") from None
         raise
     target = next((option for option in options if option.value == value), None)
     if target is not None and target.count > 0 and is_exclusive_selection(options, value):
@@ -601,7 +621,7 @@ def apply_exclusive_facet(
         target = next((option for option in options if option.value == value), None)
         if target is None or target.count <= 0:
             if title == ASSET_PRODUCTION_TYPE and value == FINAL_ASSET_VALUE:
-                raise ScrapeError("No FINAL image is available for this style.")
+                raise NoFinalImageError("No FINAL image is available for this style.")
             raise ScrapeError(f"{title} {value} is not available for this style.")
         if not target.checked:
             toggle_facet_checkbox(page, title, value, timeout_ms)
@@ -1065,7 +1085,7 @@ def build_parser() -> argparse.ArgumentParser:
             f"them as JPGs: by style number, up to {MAX_PER_CODE} per selected Shot "
             f"Request ID; or by --item-details text, the first {ITEM_DETAILS_LIMIT} "
             "results. Given both, the text is the fallback for a style the DAM has "
-            "no laydown assets for."
+            "no FINAL laydown assets for."
         )
     )
     parser.add_argument(
@@ -1080,7 +1100,7 @@ def build_parser() -> argparse.ArgumentParser:
             f"Free text to search the DAM with; the first {ITEM_DETAILS_LIMIT} "
             "laydown results are taken, whatever their Shot Request ID. On its own "
             "it is the whole job; next to a style number it is used only when the "
-            "style has no laydown assets."
+            "style has no laydown assets, or none of them FINAL."
         ),
     )
     parser.add_argument("--auth-state", type=Path, default=DEFAULT_AUTH_STATE)
@@ -1112,7 +1132,7 @@ def build_parser() -> argparse.ArgumentParser:
 def download(settings: RunSettings, args: argparse.Namespace) -> Path:
     """The manifest of this pull: the style's, else the text's - the text
     stands in when there is no style, or when the style has no laydown
-    assets."""
+    assets (none at all, or none of them FINAL)."""
     if args.style_number is not None:
         try:
             return download_style(settings, args.style_number)

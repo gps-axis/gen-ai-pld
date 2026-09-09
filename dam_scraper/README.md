@@ -78,8 +78,9 @@ uv run --locked python dam_scrape.py 440760022 --item-details "vintage soft hood
 `--item-details` searches the DAM with the text and takes the first 50 laydown
 results (`ITEM_DETAILS_LIMIT`, one DAM results page) in the DAM's own order,
 whatever their Shot Request ID. On its own it is the whole job; next to a style
-number it runs only when the style has no laydown assets. Any other failure of
-the style search still stops the run. Its ZIP and manifest live under
+number it runs only when the style has nothing to download: no laydown assets,
+or some but none of them tagged FINAL. Any other failure of the style search
+still stops the run. Its ZIP and manifest live under
 `downloads/item-details/<text>/`.
 
 The scraper's last line of output is `manifest <path>`, naming whichever

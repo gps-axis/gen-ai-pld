@@ -10,7 +10,8 @@
 #
 # --item-details searches the DAM with the text and takes the first page of
 # laydown shots (the scraper says how many) instead of the per-style policy.
-# Next to --style it is used when the style has no laydown assets, and again as
+# Next to --style it is used when the style has no laydown assets (none at
+# all, or none of them FINAL), and again as
 # the harness's last resort when the style's shots are in the library but none
 # of them matches the garment (the harness pulls the text's shots and searches
 # once more before it gives up). On its own it is the whole reference pull.
@@ -119,7 +120,7 @@ if [ -n "$STYLE" ] || [ -n "$ITEM_DETAILS" ]; then
 
   [ -z "$STYLE" ] || echo "  style     $STYLE  -> ${LIB#"$HERE/"}/  (flat, alongside every other style)"
   if [ -n "$ITEM_DETAILS" ] && [ -n "$STYLE" ]; then
-    echo "  fallback  \"$ITEM_DETAILS\"  (first page of laydown shots, only if the style has none)"
+    echo "  fallback  \"$ITEM_DETAILS\"  (first page of laydown shots, only if the style has none, or none FINAL)"
   elif [ -n "$ITEM_DETAILS" ]; then
     echo "  search    \"$ITEM_DETAILS\"  -> ${LIB#"$HERE/"}/  (first page of laydown shots)"
   fi

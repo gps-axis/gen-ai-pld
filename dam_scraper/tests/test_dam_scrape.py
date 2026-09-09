@@ -19,6 +19,7 @@ from dam_scrape import (
     FacetUnavailableError,
     ITEM_DETAILS_LIMIT,
     MAX_PER_CODE,
+    NoFinalImageError,
     NoLaydownAssetsError,
     REQUIRED_FILTERS,
     ScrapeError,
@@ -250,6 +251,20 @@ class FacetSelectionTests(unittest.TestCase):
                 apply_exclusive_facet(
                     object(), ASSET_PRODUCTION_TYPE, FINAL_ASSET_VALUE, 100
                 )
+
+    def test_missing_final_is_a_miss_not_a_failure(self) -> None:
+        # Laydown shots with none tagged FINAL are as much "nothing to
+        # download" as an empty search: the same fallback, the same exit.
+        for read_facet_options in (
+            {"return_value": (FacetOption("WORKING", 2, False),)},
+            {"return_value": (FacetOption(FINAL_ASSET_VALUE, 0, False),)},
+            {"side_effect": FacetUnavailableError("The Asset Production Type filter was not available.")},
+        ):
+            with patch("dam_scrape.read_facet_options", **read_facet_options):
+                with self.assertRaises(NoLaydownAssetsError):
+                    apply_exclusive_facet(
+                        object(), ASSET_PRODUCTION_TYPE, FINAL_ASSET_VALUE, 100
+                    )
 
     def test_final_read_straight_after_the_click_may_lag_the_sidebar(self) -> None:
         # The first read after the click still shows the old state; the next one
@@ -539,6 +554,25 @@ class EmptySearchTests(unittest.TestCase):
                 subject="the search 'blue hoodie'",
             )
         self.assertEqual(applied, [])
+
+    def test_no_final_image_is_named_for_the_subject(self) -> None:
+        no_final = NoFinalImageError("No FINAL image is available for this style.")
+        for query, subject, expected in (
+            ("523570", None, "style 523570"),
+            ("blue hoodie", "the search 'blue hoodie'", "the search 'blue hoodie'"),
+        ):
+            stack, context, _ = self._patched_search(
+                clear_side_effect=lambda *_: (), total=2
+            )
+            with stack:
+                stack.enter_context(
+                    patch("dam_scrape.apply_exclusive_facet", side_effect=no_final)
+                )
+                with self.assertRaisesRegex(
+                    NoLaydownAssetsError,
+                    rf"^The Gap DAM has laydown shots for {expected}, but none of them is FINAL\.$",
+                ):
+                    open_search_page(context, "https://dam.test", query, 100, subject=subject)
 
     def test_missing_facet_with_results_remains_operational_error(self) -> None:
         missing_facet = FacetUnavailableError(
@@ -873,6 +907,36 @@ class ItemDetailsTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("no laydown assets for style 440760. Falling back to --item-details 'blue hoodie'.", err)
         self.assertEqual(out.splitlines()[-1], f"manifest {manifest}")
+
+    def test_style_with_no_final_image_falls_back_to_the_text(self) -> None:
+        manifest = Path("/tmp/downloads/item-details/blue-hoodie/manifest.json")
+        style = {
+            "side_effect": NoFinalImageError(
+                "The Gap DAM has laydown shots for style 523570, but none of them is FINAL."
+            )
+        }
+        details = {"return_value": manifest}
+        code, out, err = self._run_main(
+            ["523570022", "--item-details", "blue hoodie"],
+            download_style=style, download_item_details=details,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("none of them is FINAL. Falling back to --item-details 'blue hoodie'.", err)
+        self.assertEqual(out.splitlines()[-1], f"manifest {manifest}")
+
+    def test_style_with_no_final_image_and_no_text_is_nothing_to_download(self) -> None:
+        style = {
+            "side_effect": NoFinalImageError(
+                "The Gap DAM has laydown shots for style 523570, but none of them is FINAL."
+            )
+        }
+        code, _, err = self._run_main(["523570022"], download_style=style)
+        self.assertEqual(code, EXIT_NOTHING_TO_DOWNLOAD)
+        self.assertEqual(
+            err.strip(),
+            "DAM has nothing to download: The Gap DAM has laydown shots for style 523570, "
+            "but none of them is FINAL.",
+        )
 
     def test_style_that_works_never_touches_the_text(self) -> None:
         manifest = Path("/tmp/downloads/440760/manifest.json")
