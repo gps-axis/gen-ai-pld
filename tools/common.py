@@ -119,10 +119,20 @@ def heif_to_jpeg(src: Path, dst: Path, quality: int = 100) -> Path:
                                subsampling=0)
     return dst
 
-# nano-banana-pro/edit at 4K is $0.30/image; 1K and 2K are both $0.15. Published
-# rates - fal exposes no billing API, so a reported cost is never a receipt.
+# The generation model. nano-banana-pro/edit is a flat $0.15 at 1K and 2K and
+# $0.30 at 4K. generate.py also speaks to the gpt-image family - set this to
+# "openai/gpt-image-2.5/sunburst/edit" and the request, the prompt and the
+# cost estimate follow (that model bills by token; fal's table puts a
+# high-quality 1024x1536 edit at about $0.18). Tried and set back on
+# 2026-09-08. fal exposes no billing API, so a reported cost is never a receipt.
 ENDPOINT = "fal-ai/nano-banana-pro/edit"
 PRICE_4K = 0.30
+
+
+def price_per_image(resolution: str) -> float:
+    if ENDPOINT.startswith("openai/gpt-image"):
+        return {"1K": 0.18, "2K": 0.25, "4K": 0.35}.get(resolution, 0.25)
+    return PRICE_4K if resolution == "4K" else 0.15
 
 # The shape every generation comes back in. Deliberately fixed rather than
 # derived from the input: the deliverable is a 3:4 flat whatever the photographer

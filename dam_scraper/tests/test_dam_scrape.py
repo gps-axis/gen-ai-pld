@@ -41,6 +41,7 @@ from dam_scrape import (
     safe_query_directory,
     select_asset_limit,
     toggle_facet_checkbox,
+    wrap_bare_jpg_as_archive,
     write_json_atomic,
 )
 
@@ -990,6 +991,54 @@ class ArchiveTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ScrapeError, "two files named same.jpg"):
                 inspect_jpg_archive(archive_path, expected_count=2)
+
+    def test_single_asset_sent_bare_is_wrapped_into_an_archive(self) -> None:
+        # The DAM sends one selected asset as the JPG itself, not a ZIP of one.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            download_path = Path(temporary_directory) / "assets.zip.part"
+            jpg_bytes = b"\xff\xd8\xff\xe0" + b"laydown"
+            download_path.write_bytes(jpg_bytes)
+
+            wrapped = wrap_bare_jpg_as_archive(download_path, "PB_gp_1_RAV5_2.jpg")
+
+            self.assertEqual(wrapped, "PB_gp_1_RAV5_2.jpg")
+            with zipfile.ZipFile(download_path) as archive:
+                self.assertEqual(archive.namelist(), ["PB_gp_1_RAV5_2.jpg"])
+                self.assertEqual(archive.read("PB_gp_1_RAV5_2.jpg"), jpg_bytes)
+            self.assertEqual(
+                inspect_jpg_archive(download_path, expected_count=1),
+                [{"filename": "PB_gp_1_RAV5_2.jpg", "bytes": len(jpg_bytes)}],
+            )
+
+    def test_archive_sent_by_the_dam_is_left_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            download_path = Path(temporary_directory) / "assets.zip.part"
+            with zipfile.ZipFile(download_path, "w") as archive:
+                archive.writestr("first.jpg", b"one")
+                archive.writestr("second.jpg", b"two")
+            sent = download_path.read_bytes()
+
+            self.assertIsNone(wrap_bare_jpg_as_archive(download_path, "assets.zip"))
+
+            self.assertEqual(download_path.read_bytes(), sent)
+
+    def test_bare_download_that_is_not_a_jpg_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            download_path = Path(temporary_directory) / "assets.zip.part"
+            download_path.write_bytes(b"<html><body>Sign in</body></html>")
+
+            with self.assertRaisesRegex(
+                ScrapeError, "neither a ZIP archive nor a JPG .*'login.html'"
+            ):
+                wrap_bare_jpg_as_archive(download_path, "login.html")
+
+    def test_jpg_bytes_under_a_non_image_name_are_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            download_path = Path(temporary_directory) / "assets.zip.part"
+            download_path.write_bytes(b"\xff\xd8\xff\xe0laydown")
+
+            with self.assertRaisesRegex(ScrapeError, "'download.bin'"):
+                wrap_bare_jpg_as_archive(download_path, "download.bin")
 
     def test_extract_archive_writes_members_flat(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

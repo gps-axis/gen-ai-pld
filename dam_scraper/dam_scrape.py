@@ -36,6 +36,9 @@ DEFAULT_SEARCH_URL = (
     "#/DamView&TP=default&VBID=270HZOLSY3NGJ&PN=1&WS=270H397TAWK"
 )
 IMAGE_SUFFIXES = {".jpg", ".jpeg"}
+# The first three bytes of every JPEG file: the SOI marker and the start of
+# the marker after it.
+JPEG_MAGIC = b"\xff\xd8\xff"
 # The DAM's facet titles and the values the scraper insists on. These four were
 # dropped by the merge of agen-ivn into agentic-gen-iteration (ad27d62) while
 # their uses survived, which is how a run died on NameError at the first
@@ -88,6 +91,15 @@ class NoLaydownAssetsError(ScrapeError):
 class SearchResults:
     total: int
     source_filenames: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class BatchDownload:
+    """What one bulk download left on disk: the cards that were selected for
+    it, and the name the DAM gave the file it sent back."""
+
+    selected_filenames: tuple[str, ...]
+    suggested_filename: str
 
 
 @dataclass(frozen=True)
@@ -185,6 +197,32 @@ def inspect_jpg_archive(path: Path, expected_count: int) -> list[dict[str, objec
             f"Expected {expected_count} JPG files, but the archive contained {len(members)}."
         )
     return members
+
+
+def wrap_bare_jpg_as_archive(path: Path, downloaded_name: str) -> str | None:
+    """The DAM's bulk download is a ZIP when two or more assets are selected
+    and the bare JPG when one is, so a style whose only laydown shot is one
+    file comes back as that file. Rewrite such a download in place as a ZIP
+    holding the JPG under the name the DAM gave it, so the manifest and the
+    downloads folder look the same however many shots a style has. Returns
+    the JPG's name when one was wrapped, None when `path` already is a ZIP
+    and was left alone. Anything else - an error page, say - is neither and
+    is reported under the name the DAM sent it as."""
+    if zipfile.is_zipfile(path):
+        return None
+    member_name = Path(downloaded_name).name
+    with path.open("rb") as file_handle:
+        head = file_handle.read(len(JPEG_MAGIC))
+    if head != JPEG_MAGIC or Path(member_name).suffix.casefold() not in IMAGE_SUFFIXES:
+        raise ScrapeError(
+            "The DAM response was neither a ZIP archive nor a JPG "
+            f"(the DAM sent it as {downloaded_name!r})."
+        )
+    wrapped_path = path.with_name(path.name + ".wrap")
+    with zipfile.ZipFile(wrapped_path, "w", zipfile.ZIP_STORED) as archive:
+        archive.write(path, arcname=member_name)
+    wrapped_path.replace(path)
+    return member_name
 
 
 def extract_archive(path: Path, destination: Path) -> None:
@@ -715,10 +753,11 @@ def download_batch_from_dam(
     destination: Path,
     headed: bool,
     timeout_ms: int,
-) -> SearchResults:
-    """One ZIP of `limit` JPGs: the first `limit` cards the search shows, under
-    Shot Request ID `shot_code` when one is given and in the DAM's own order
-    when it is None (the --item-details mode)."""
+) -> BatchDownload:
+    """One download of `limit` JPGs - a ZIP, or the bare JPG when `limit` is 1
+    (see wrap_bare_jpg_as_archive): the first `limit` cards the search shows,
+    under Shot Request ID `shot_code` when one is given and in the DAM's own
+    order when it is None (the --item-details mode)."""
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=not headed)
         context = browser.new_context(storage_state=auth_state, accept_downloads=True)
@@ -785,7 +824,10 @@ def download_batch_from_dam(
         download = download_info.value
         download.save_as(destination)
         browser.close()
-        return SearchResults(total=limit, source_filenames=tuple(selected_filenames))
+        return BatchDownload(
+            selected_filenames=tuple(selected_filenames),
+            suggested_filename=download.suggested_filename,
+        )
 
 
 @dataclass(frozen=True)
@@ -842,7 +884,7 @@ def fetch_batch(
     Returns the manifest's archive record, its file records and the DAM-side
     source filenames that were selected."""
     partial_path = archive_path.with_suffix(".zip.part")
-    results = download_batch_from_dam(
+    download = download_batch_from_dam(
         query=query,
         subject=subject,
         shot_code=shot_code,
@@ -853,19 +895,24 @@ def fetch_batch(
         headed=settings.headed,
         timeout_ms=settings.timeout_ms,
     )
+    wrapped_name = wrap_bare_jpg_as_archive(partial_path, download.suggested_filename)
     members = inspect_jpg_archive(partial_path, limit)
     partial_path.replace(archive_path)
     extract_archive(archive_path, settings.images_directory)
-    archive = {
+    archive: dict[str, object] = {
         "shot_request_id": shot_code,
         "filename": archive_path.name,
         "bytes": archive_path.stat().st_size,
         "sha256": sha256_file(archive_path),
     }
+    if wrapped_name is not None:
+        # This ZIP is the scraper's, not the DAM's: the DAM sent the one JPG
+        # bare, and this records which file that was.
+        archive["wrapped_bare_file"] = wrapped_name
     files = [{**member, "shot_request_id": shot_code} for member in members]
     sources = [
         {"filename": filename, "shot_request_id": shot_code}
-        for filename in results.source_filenames
+        for filename in download.selected_filenames
     ]
     return archive, files, sources
 

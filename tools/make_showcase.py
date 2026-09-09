@@ -24,6 +24,7 @@ and a showcase of runs that no longer exist is worse than none.
 """
 
 import json
+import re
 import sys
 import zipfile
 from pathlib import Path
@@ -35,13 +36,64 @@ from make_contact_sheet import HERO_MAX, esc, input_bank, match_input, rel_to, t
 STRIP_DIR_NAME = "_strips"
 TILE_W, TILE_H = 600, 800          # 3:4, like the tiles on the page
 DIVIDER = 2
-CAPTION_H = 44
+CAPTION_H = 72                     # two lines: run / note / source, then the models
 GOLD = (240, 180, 41)
 INK = (22, 25, 30)
 PANEL = (22, 25, 30)
 DIM = (139, 147, 158)
 LINE = (38, 43, 51)
 FILLED = (160, 60, 30)
+
+# The one seeded endpoint this project has used. A lineage entry carrying an
+# integer seed can only have come from it; gpt-image has no seed to record.
+NANO_BANANA = "fal-ai/nano-banana-pro/edit"
+
+
+def models_of(run: Path) -> tuple[str, str, str]:
+    """(image endpoint, agent model, how the endpoint was known) for one run.
+
+    generate.py writes the endpoint into lineage.json since 2026-09-08. Before
+    that nothing in a run folder named it, and two things still pin it down:
+    generate.py prints "seed ignored: <endpoint> has none" for a model without
+    seeds, and a candidate WITH a seed can only be nano-banana. A run with
+    neither is reported as unknown rather than guessed.
+    """
+    arch = run / "archive"
+    try:
+        lineage = json.loads((arch / "lineage.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        lineage = {}
+    entries = [v for v in lineage.values() if isinstance(v, dict)]
+    endpoint, basis = "", ""
+    named = sorted({v["endpoint"] for v in entries if v.get("endpoint")})
+    if named:
+        endpoint, basis = ", ".join(named), "recorded in lineage.json"
+    else:
+        log = run / "run.log"
+        m = (re.search(r"seed ignored: (\S+) has none", log.read_text(errors="replace"))
+             if log.exists() else None)
+        if m:
+            endpoint, basis = m.group(1), "named in run.log"
+        elif any(isinstance(v.get("seed"), int) for v in entries):
+            endpoint, basis = NANO_BANANA, "inferred: the candidates carry seeds"
+    agent = ""
+    t = run / "transcript.jsonl"
+    if t.exists():
+        with t.open() as f:
+            first = f.readline()
+        try:
+            rec = json.loads(first)
+            if rec.get("kind") == "start":
+                agent = str(rec.get("data", {}).get("model") or "")
+        except json.JSONDecodeError:
+            pass
+    return endpoint, agent, basis
+
+
+def short_model(endpoint: str) -> str:
+    """'openai/gpt-image-2.5/sunburst/edit' -> 'gpt-image-2.5/sunburst'."""
+    return re.sub(r"/edit$", "", re.sub(r"^(fal-ai|openai)/", "", endpoint))
+
 
 def shipped_runs(runs_dir: Path) -> list[str]:
     """Every run folder that delivered a best.png, oldest first."""
@@ -72,7 +124,8 @@ border-radius:4px;background:rgba(0,0,0,.62);color:#eef1f4;font-family:ui-monosp
 .who.filled{background:rgba(160,60,30,.85)}
 .cap{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:7px 12px;
 border-top:1px solid var(--line);font-size:11.5px;color:var(--dim);
-font-family:ui-monospace,Menlo,monospace}
+font-family:ui-monospace,Menlo,monospace;flex-wrap:wrap}
+.cap .models{flex-basis:100%;cursor:help}
 .dl{color:var(--dim);text-decoration:underline;text-underline-offset:3px;white-space:nowrap}
 .dl:hover{color:var(--tx)}
 header{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:16px 26px;border-bottom:1px solid var(--line)}
@@ -191,7 +244,7 @@ def _tile(src: Path, tag: str, badge: str, gold: bool, filled: bool) -> Image.Im
 
 
 def render_strip(runs_dir: Path, rid: str, src: Path, run: Path, picks: dict,
-                 note: str) -> Path:
+                 note: str, models: str) -> Path:
     """The row as one PNG: input, best, 2nd, 3rd, 4th, and a caption bar."""
     out_dir = runs_dir / STRIP_DIR_NAME
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -221,6 +274,7 @@ def render_strip(runs_dir: Path, rid: str, src: Path, run: Path, picks: dict,
     right = src.name if src else "input unmatched"
     l, _, r, _ = draw.textbbox((0, 0), right, font=mono)
     draw.text((width - 16 - (r - l), TILE_H + 12), right, font=mono, fill=DIM)
+    draw.text((16, TILE_H + 40), models, font=mono, fill=DIM)
     strip.save(out, "PNG", optimize=True)
     return out
 
@@ -239,12 +293,17 @@ def build(runs_dir: Path, inputs_dir: Path, run_ids):
             pick_tile(run, runs_dir, rank, picks) for rank in (1, 2, 3, 4))
         filled = sum(1 for r in picks.values() if r.get("chosen_by") == "harness")
         note = f"{filled} slot(s) filled by the harness" if filled else "all four chosen by the model"
-        strip = render_strip(runs_dir, rid, src, run, picks, note)
+        endpoint, agent, basis = models_of(run)
+        models = (f"images: {short_model(endpoint) or 'unknown'}"
+                  f"  \u00b7  agent: {agent or 'unknown'}")
+        detail = f"{endpoint or 'image model unknown'} ({basis or 'nothing in the run names it'}); agent {agent or 'unknown'}"
+        strip = render_strip(runs_dir, rid, src, run, picks, note, models)
         strips.append(strip)
         cells.append(f"""<figure class="pair">
   <div class="imgs">{tiles}</div>
   <figcaption class="cap"><span>{esc(rid)}</span><span>{esc(note)}</span><span>{esc(src.name if src else 'input unmatched')}</span>
-  <a class="dl" href="{esc(rel_to(strip, runs_dir))}" download="{esc(rid)}_strip.png">this row as png</a></figcaption>
+  <a class="dl" href="{esc(rel_to(strip, runs_dir))}" download="{esc(rid)}_strip.png">this row as png</a>
+  <span class="models" title="{esc(detail)}">{esc(models)}</span></figcaption>
 </figure>""")
 
     bundle = bundle_strips(runs_dir, strips)
@@ -256,7 +315,8 @@ def build(runs_dir: Path, inputs_dir: Path, run_ids):
 <body>
 <header><div><h1>Laydown - original and the four picks</h1>
 <p>{len(cells)} runs &middot; left is the off-set photo that went in, beside it the best pick, then the second, third and fourth
-&middot; each pick names its candidate and who chose it &middot; click any tile for full resolution</p></div>
+&middot; each pick names its candidate and who chose it &middot; the second caption line names the image model and the agent model
+&middot; click any tile for full resolution</p></div>
 <a class="dl" href="{esc(rel_to(bundle, runs_dir))}" download="laydown_strips.zip">Download all {len(cells)} rows as images (zip)</a></header>
 <main>
 {chr(10).join(cells)}

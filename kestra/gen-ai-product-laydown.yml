@@ -334,6 +334,12 @@ tasks:
         type: io.kestra.plugin.scripts.shell.Commands
         containerImage: pld-harness
         timeout: PT45M
+        # Kestra prefixes the block with `set -e` unless told otherwise, and
+        # the block below has to outlive the harness's exit code: 20 is a
+        # park, and the lines after the call are what turn it into a green
+        # execution. With the default, the shell died at the call and every
+        # park was reported as a failure.
+        failFast: false
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
           pullPolicy: NEVER
@@ -379,8 +385,10 @@ tasks:
           AXIS_CATEGORY: "{{ outputs['resolve-hero'].vars.category_key }}"
         commands:
           - |
-            # NOTE: no `set -e` - we must survive the harness's exit code and run
-            # the lines after it. Written for POSIX sh (no arrays).
+            # NOTE: failFast is off above, and the harness call below still
+            # reads its status through `|| rc=$?`, which survives errexit on
+            # any Kestra version - we must run the lines after it whatever the
+            # code. Written for POSIX sh (no arrays).
             export OUT_DIR="$PWD"
 
             : > debug_report.txt
@@ -392,10 +400,10 @@ tasks:
             echo "--- library ---"
             ls /app/library_reference/ || echo "LIBRARY MISSING"
 
+            rc=0
             /usr/local/bin/docker-entrypoint.sh "$PWD/source_fit.jpg" \
                   --max-iters "$MAX_ITERS" \
-                  --reference-category "$AXIS_CATEGORY"
-            rc=$?
+                  --reference-category "$AXIS_CATEGORY" || rc=$?
             echo "harness exit code: $rc"
 
             # Placeholders so every declared outputFile exists on every path.

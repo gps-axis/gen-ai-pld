@@ -79,6 +79,44 @@ SYSTEM = (
     "Every image you return is a single photograph of one garment."
 )
 
+# gpt-image-2.5 has no system channel, no seed, and sizes its output by a
+# quality level and an explicit frame rather than by 1K/2K/4K. So the rules
+# above go at the top of the prompt instead, --resolution maps onto a quality
+# and a frame in the run's aspect that meets fal's limits (both sides
+# multiples of 16, at most 8.3 megapixels), and the seed is recorded as None:
+# every call samples afresh, so "change the seed" is simply "generate again".
+GPT_QUALITY = {"1K": "medium", "2K": "high", "4K": "xhigh"}
+GPT_LONG_EDGE = {"1K": 1536, "2K": 2048, "4K": 3072}
+
+
+def is_gpt_image() -> bool:
+    return C.ENDPOINT.startswith("openai/gpt-image")
+
+
+def gpt_image_size(resolution: str, aspect: str) -> dict:
+    aw, ah = (float(x) for x in aspect.split(":"))
+    long_edge = GPT_LONG_EDGE[resolution]
+    if ah >= aw:                       # portrait or square: height is the long edge
+        w, h = long_edge * aw / ah, long_edge
+    else:
+        w, h = long_edge, long_edge * ah / aw
+    snap = lambda v: max(16, int(round(v / 16)) * 16)  # noqa: E731
+    return {"width": snap(w), "height": snap(h)}
+
+
+def fal_arguments(prompt: str, urls: list, a, seed: int) -> dict:
+    """The request for C.ENDPOINT - the two model families take different fields."""
+    if is_gpt_image():
+        return {"prompt": f"{SYSTEM}\n\n{prompt}", "image_urls": urls,
+                "num_images": 1, "output_format": "png",
+                "quality": GPT_QUALITY[a.resolution],
+                "image_size": gpt_image_size(a.resolution, a.aspect_ratio)}
+    return {"prompt": prompt, "image_urls": urls,
+            "num_images": 1, "output_format": "png",
+            "system_prompt": SYSTEM,
+            "resolution": a.resolution, "aspect_ratio": a.aspect_ratio,
+            "seed": seed}
+
 
 # --------------------------------------------------------------------------
 # Naming, lineage and the upload cache
@@ -509,7 +547,10 @@ def main() -> int:
         print("\n" + "=" * 70)
         print(prompt)
         print("=" * 70)
-        print(f"\n--dry-run: nothing uploaded, nothing billed. "
+        request = fal_arguments(prompt, ["<image 1>", "<image 2>"], a, 0)
+        request.pop("prompt")
+        print(f"\n{C.ENDPOINT} would be sent: {json.dumps(request)}")
+        print(f"--dry-run: nothing uploaded, nothing billed. "
               f"Snapshot at {snap}")
         return 0
 
@@ -551,14 +592,14 @@ def main() -> int:
     # at a time" - which was exactly the call that silently paid double.
     base = a.seed if a.seed is not None else a.base_seed + start
     seeds = [base + i for i in range(want)]
+    if is_gpt_image():
+        if a.seed is not None:
+            print(f"seed ignored: {C.ENDPOINT} has none; every call samples afresh")
+        seeds = [None] * want
     names = [f"cand_{start + i + 1:02d}" for i in range(want)]
 
     def one(i: int):
-        args = {"prompt": prompt, "image_urls": urls,
-                "num_images": 1, "output_format": "png",
-                "system_prompt": SYSTEM,
-                "resolution": a.resolution, "aspect_ratio": a.aspect_ratio,
-                "seed": seeds[i]}
+        args = fal_arguments(prompt, urls, a, seeds[i])
         for attempt in (1, 2):
             try:
                 r = fal_client.subscribe(C.ENDPOINT, arguments=args,
@@ -594,6 +635,12 @@ def main() -> int:
                 "prompt_hash": phash,
                 "seed": seeds[i],
                 "resolution": a.resolution,
+                # Which model drew it. Not derivable later: the endpoint is a
+                # constant in common.py that has changed under running runs,
+                # and a showcase built afterwards had to read tea leaves (a
+                # seed means nano-banana, a "seed ignored" line names the
+                # other) to say what made each picture.
+                "endpoint": C.ENDPOINT,
                 "reference": str(reference) if use_ref else None,
                 "created": datetime.now().isoformat(timespec="seconds"),
             })
@@ -618,7 +665,7 @@ def main() -> int:
                           "prompt": phash, "source": a.source}
     sf.write_text(json.dumps(book, indent=2) + "\n")
 
-    cents = len(got) * (C.PRICE_4K if a.resolution == "4K" else 0.15) * 100
+    cents = len(got) * C.price_per_image(a.resolution) * 100
     total = len(generated(arch))
     C.log(run, f"generated {len(got)} at {a.resolution} from {a.source}, "
                f"prompt {phash} ({total} total)", cents)

@@ -82,7 +82,9 @@ tasks:
   # 1. Look the style colour up, when the command carries one.
   #
   # payload.style_color (9 digits, style plus colour; 6 is accepted) names the
-  # garment in the Gap DAM. Its product record comes from the tag-capture
+  # garment in the Gap DAM; any key that names the style, anywhere in the
+  # command, is accepted, and a command without one is logged with its field
+  # names so the gap is visible. The product record comes from the tag-capture
   # intake endpoint, which answers with the intakes recorded for that style
   # colour:
   #
@@ -134,13 +136,53 @@ tasks:
       write("garment_image_url.txt", "")
 
       command = json.load(open("command.json"))
-      payload = command.get("payload") or {}
-      style = str(payload.get("style_color") or command.get("style_color") or "").strip()
-      if not re.fullmatch(r"[0-9]{6}([0-9]{3})?", style):
-          print(f"No style colour on this command (style_color={style!r}); "
-                "the harness searches the library as before.")
+
+      # The style colour, wherever the command carries it: payload.style_color
+      # by convention, but any key that names the style, at any depth, with a
+      # 6- or 9-digit value. A key spelt style_color beats a plain "style".
+      STYLE_KEY = re.compile(r"^(style_?colou?r|style_?(number|no|num|id)|style|sku)$", re.IGNORECASE)
+      STYLE_VALUE = re.compile(r"[0-9]{6}([0-9]{3})?")
+
+      def find_style(node):
+          found = []
+          def walk(item, path):
+              if isinstance(item, dict):
+                  for key, value in item.items():
+                      if STYLE_KEY.match(str(key)):
+                          text = str(value if value is not None else "").strip()
+                          if STYLE_VALUE.fullmatch(text):
+                              found.append((0 if "colo" in str(key).lower() else 1, ".".join(path + [str(key)]), text))
+                      walk(value, path + [str(key)])
+              elif isinstance(item, list):
+                  for index, value in enumerate(item):
+                      walk(value, path + [f"[{index}]"])
+          walk(node, [])
+          found.sort(key=lambda entry: entry[0])
+          return found[0] if found else None
+
+      def field_names(node, depth=0):
+          """command_id, payload{source_url, item_category, ...}: the shape of
+          the command, keys only, two levels deep - enough to see where the
+          style colour would have to go."""
+          if not isinstance(node, dict):
+              return ""
+          parts = []
+          for key, value in node.items():
+              inner = field_names(value, depth + 1) if depth < 1 else ""
+              parts.append(f"{key}{{{inner}}}" if inner else str(key))
+          return ", ".join(parts)
+
+      hit = find_style(command)
+      if hit is None:
+          print("No style colour on this command, so there is nothing to look up "
+                "or to search the DAM by; the harness searches the library as before.")
+          print(f"The command carries these fields: {field_names(command)}")
+          print("Put the style colour in the command payload as style_color "
+                "(9 digits, style plus colour) to run it through the DAM.")
           Kestra.outputs({"style_color": "", "item_details": ""})
           raise SystemExit(0)
+      _, where, style = hit
+      print(f"style colour {style} read from {where}")
       write("style.txt", style)
 
       url = os.environ["TAG_CAPTURE_URL"] + "?" + urllib.parse.urlencode({"style_color": style})
@@ -374,6 +416,12 @@ tasks:
     type: io.kestra.plugin.scripts.shell.Commands
     containerImage: pld-harness
     timeout: PT45M
+    # Kestra prefixes the block with `set -e` unless told otherwise, and the
+    # block below has to outlive the harness's exit code: 20 is a park, and
+    # the lines after the call are what turn it into a green execution. With
+    # the default, the shell died at the call and every park was reported to
+    # Django as a failure.
+    failFast: false
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
       pullPolicy: NEVER
@@ -452,10 +500,11 @@ tasks:
       DAM_OUTPUT_ROOT: "/app/dam_downloads"
     commands:
       - |
-        # NOTE: no `set -e` - we must survive the harness's exit code and run
-        # the lines after it. Written for POSIX sh (no arrays): the scripts
-        # runner wraps this in the image's default shell, which is not
-        # guaranteed to be bash.
+        # NOTE: failFast is off above, and the harness call below still reads
+        # its status through `|| rc=$?`, which survives errexit on any Kestra
+        # version - we must run the lines after it whatever the code. Written
+        # for POSIX sh (no arrays): the scripts runner wraps this in the
+        # image's default shell, which is not guaranteed to be bash.
         export OUT_DIR="$PWD"
 
         # Everything the debug bundle learns goes to stdout AND to a file that
@@ -495,8 +544,8 @@ tasks:
         fi
         [ -n "${LAYDOWN_TASK:-}" ] && set -- "$@" --task "$LAYDOWN_TASK"
 
-        /usr/local/bin/docker-entrypoint.sh "$PWD/source_fit.jpg" "$@"
-        rc=$?
+        rc=0
+        /usr/local/bin/docker-entrypoint.sh "$PWD/source_fit.jpg" "$@" || rc=$?
         echo "harness exit code: $rc"
 
         # Placeholders so every declared outputFile exists on every path.

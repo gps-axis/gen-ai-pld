@@ -90,6 +90,12 @@ folder, and any folder inside the DAM's ZIP is dropped rather than recreated.
 The source ZIP and the manifest stay in `downloads/<first-six-digits>/`; the
 manifest is what records which files belong to which style.
 
+The DAM sends two or more selected assets as a ZIP and a single one as the
+bare JPG, so a style with exactly one laydown shot comes back as that JPG. The
+scraper wraps it into a one-file ZIP under the name the DAM gave it, so
+`downloads/` and the manifest look the same either way; the manifest marks
+such an archive with `wrapped_bare_file`.
+
 Override either location with `--image-root` and `--output-root`, or with the
 `DAM_IMAGE_ROOT` and `DAM_OUTPUT_ROOT` environment variables.
 
