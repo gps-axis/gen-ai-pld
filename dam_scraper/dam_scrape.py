@@ -17,7 +17,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
+from playwright.sync_api import (
+    Error as PlaywrightError,
+    TimeoutError as PlaywrightTimeoutError,
+    sync_playwright,
+)
 
 from auth_session import AuthStateError, AuthenticationExpired, load_storage_state
 from dam_auth import (
@@ -103,10 +107,16 @@ class SearchResults:
 @dataclass(frozen=True)
 class BatchDownload:
     """What one bulk download left on disk: the cards that were selected for
-    it, and the name the DAM gave the file it sent back."""
+    it, and the name the DAM gave the file it sent back. `total` is the count
+    the results pane showed when they were selected, and `shot_request_ids`
+    the Shot Request ID values checked at that moment: the one code of a style
+    batch, or whatever leftover a text search could not clear - () when it
+    ran, as intended, under no Shot Request ID at all."""
 
     selected_filenames: tuple[str, ...]
     suggested_filename: str
+    total: int = 0
+    shot_request_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -280,6 +290,11 @@ def is_complete_manifest_reusable(
     policy = manifest.get("shot_request_policy")
     if not isinstance(policy, dict):
         return False
+    # A text search that ran under a leftover Shot Request ID took its first
+    # page from a narrowed pool. A rerun may get the filter off and take the
+    # real first page, so that pull is not the same thing as a fresh one.
+    if policy.get("leftover_shot_request_ids"):
+        return False
     if policy.get("maximum_per_code") == MAX_PER_CODE:
         return True
     if policy.get("first_results_limit") == ITEM_DETAILS_LIMIT:
@@ -391,11 +406,25 @@ def wait_for_post(page: Any, action: Any, timeout_ms: int) -> None:
 
 
 def open_search_page(
-    context: Any, url: str, query: str, timeout_ms: int, subject: str | None = None
+    context: Any,
+    url: str,
+    query: str,
+    timeout_ms: int,
+    subject: str | None = None,
+    shot_request_clear_required: bool = True,
 ) -> Any:
     """The DAM searched for `query`, with the leftover Shot Request ID filter
     cleared and FINAL applied. `subject` is how the search is named in errors:
-    "style 440760" by default, or whatever --item-details is searching for."""
+    "style 440760" by default, or whatever --item-details is searching for.
+
+    A leftover Shot Request ID that will not come off ends a style search: its
+    plan is built from the facet's per-code counts, and the code it then picks
+    has to be applied on its own. The text search needs none of that - its
+    requirements are FINAL and Shot Type L, and it takes the first page
+    whatever the Shot Request ID - so with `shot_request_clear_required` False
+    it goes on under the leftover filter, after saying so on stderr. What
+    stayed applied is read back by the download and recorded in the manifest,
+    and such a pull is not reused (see is_complete_manifest_reusable)."""
     subject = subject or f"style {query}"
     page = context.new_page()
     page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -428,6 +457,14 @@ def open_search_page(
         if read_result_total(authenticated_page, timeout_ms) == 0:
             raise no_laydown_assets_error(subject) from None
         raise
+    except ScrapeError as exc:
+        if shot_request_clear_required:
+            raise
+        print(
+            f"warning: {exc} The search for {subject} goes on under the leftover "
+            "Shot Request ID filter; FINAL and Shot Type L still apply.",
+            file=sys.stderr,
+        )
     if read_result_total(authenticated_page, timeout_ms) == 0:
         raise no_laydown_assets_error(subject)
     # Laydown shots with none of them FINAL are the other way a search can
@@ -540,34 +577,71 @@ def read_facet_options(
     )
 
 
+# How long a facet gets to settle after a click before its state is judged.
+# The DAM redraws the sidebar in more than one pass, so the read straight after
+# a click can still show the old state, or no options at all, for a moment.
+FACET_SETTLE_MS = 5_000
+# A click the DAM drops on the floor gets this many more tries before the run
+# gives up on the facet.
+FACET_TOGGLE_ATTEMPTS = 3
+
+
+def find_facet_checkbox(containers: Any, value: str) -> Any | None:
+    """The checkbox for `value` among a facet's containers, or None when the
+    facet does not list the value."""
+    candidates = containers.locator(
+        f"input[type='checkbox'][aria-label={json.dumps(value)}]"
+    )
+    if candidates.count() == 0:
+        return None
+    return candidates.first
+
+
 def toggle_facet_checkbox(
     page: Any, title: str, value: str, timeout_ms: int
 ) -> None:
+    """Click the facet's checkbox for `value` and wait for the sidebar to show
+    it the other way. The DAM drops a click now and then - one run's leftover
+    P01 stayed checked for the whole timeout, and came off in three seconds on
+    the next - so a click that has not shown after FACET_SETTLE_MS is made
+    again, FACET_TOGGLE_ATTEMPTS times in all; "did not update" is raised only
+    after the last. A value the facet stops listing while it is being unchecked
+    is off the filter, which is what the uncheck was for."""
     containers = find_facet_containers(page, title, timeout_ms)
-    checkbox_candidates = containers.locator(
-        f"input[type='checkbox'][aria-label={json.dumps(value)}]"
-    )
-    if checkbox_candidates.count() == 0:
+    checkbox = find_facet_checkbox(containers, value)
+    if checkbox is None:
         raise ScrapeError(f"The {title} value {value} could not be read.")
-    checkbox = checkbox_candidates.first
     expected_checked = not checkbox.is_checked()
-    wait_for_post(
-        page,
-        lambda: checkbox.evaluate("element => element.click()"),
-        timeout_ms,
-    )
-    page.wait_for_timeout(1_500)
     deadline = time.monotonic() + timeout_ms / 1000
-    while True:
-        options = read_facet_options(page, title, timeout_ms)
-        checked = next(
-            (option.checked for option in options if option.value == value), False
+    for attempt in range(FACET_TOGGLE_ATTEMPTS):
+        if attempt:
+            # The sidebar has been redrawn since the last click; find the
+            # checkbox afresh rather than clicking a stale one.
+            containers = find_facet_containers(page, title, timeout_ms)
+            checkbox = find_facet_checkbox(containers, value)
+            if checkbox is None:
+                if not expected_checked:
+                    return
+                raise ScrapeError(f"The {title} value {value} could not be read.")
+        wait_for_post(
+            page,
+            lambda checkbox=checkbox: checkbox.evaluate("element => element.click()"),
+            timeout_ms,
         )
-        if checked == expected_checked:
-            return
-        if time.monotonic() >= deadline:
-            raise ScrapeError(f"{title} {value} did not update.")
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(1_500)
+        settle_deadline = min(deadline, time.monotonic() + FACET_SETTLE_MS / 1000)
+        while True:
+            options = read_facet_options(page, title, timeout_ms)
+            checked = next(
+                (option.checked for option in options if option.value == value),
+                False,
+            )
+            if checked == expected_checked:
+                return
+            if time.monotonic() >= settle_deadline:
+                break
+            page.wait_for_timeout(500)
+    raise ScrapeError(f"{title} {value} did not update.")
 
 
 def clear_facet_filters(page: Any, title: str, timeout_ms: int) -> tuple[FacetOption, ...]:
@@ -578,13 +652,14 @@ def clear_facet_filters(page: Any, title: str, timeout_ms: int) -> tuple[FacetOp
     return read_facet_options(page, title, timeout_ms)
 
 
-# How long a facet gets to settle after a click before its state is judged.
-# The DAM redraws the sidebar in more than one pass, so the read straight after
-# a click can still show the old state, or no options at all, for a moment.
-FACET_SETTLE_MS = 5_000
-# A click the DAM drops on the floor gets this many more tries before the run
-# gives up on the facet.
-FACET_TOGGLE_ATTEMPTS = 3
+def checked_facet_values(page: Any, title: str, timeout_ms: int) -> tuple[str, ...]:
+    """The facet's checked values in sidebar order; () when the sidebar does
+    not show the facet, which is what it does with nothing to offer."""
+    try:
+        options = read_facet_options(page, title, timeout_ms)
+    except FacetUnavailableError:
+        return ()
+    return tuple(option.value for option in options if option.checked)
 
 
 def is_exclusive_selection(options: Iterable[FacetOption], value: str) -> bool:
@@ -741,25 +816,112 @@ def discover_shot_counts(
         return counts
 
 
-def discover_result_total(
+def batch_limit(subject: str, shot_code: str | None, planned: int, total: int) -> int:
+    """How many cards the download takes. A style batch was planned from the
+    facet's own count for its code, so a page with fewer results than planned
+    is an error. The text search is planned as "the first page", so it takes
+    what the page holds, up to that."""
+    if total >= planned:
+        return planned
+    if shot_code is not None:
+        raise ScrapeError(
+            f"{describe_batch(subject, shot_code)} returned {total} "
+            f"assets; the selection plan expected {planned}."
+        )
+    return total
+
+
+# A bulk download the browser reports as canceled - the DAM, or the link in
+# between, dropped the transfer - is started again from the same selection,
+# this many times in all.
+DOWNLOAD_ATTEMPTS = 3
+
+
+def is_canceled_download(exc: BaseException) -> bool:
+    """Playwright's "Download.save_as: canceled": the transfer was cut off,
+    which is how a 238 MB ZIP ended after six minutes on a slow link when the
+    same ZIP had taken two on a good one."""
+    return isinstance(exc, PlaywrightError) and "canceled" in str(exc)
+
+
+def save_bulk_download(
+    page: Any,
+    selected_filenames: tuple[str, ...],
     *,
-    query: str,
     subject: str,
-    auth_state: Path,
-    url: str,
-    headed: bool,
+    shot_code: str | None,
+    destination: Path,
     timeout_ms: int,
-) -> int:
-    """How many FINAL laydown assets the text search has, once the leftover
-    Shot Request ID filter is cleared - the pool --item-details draws from."""
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=not headed)
-        context = browser.new_context(storage_state=auth_state)
-        page = open_search_page(context, url, query, timeout_ms, subject=subject)
-        page.wait_for_timeout(1_000)
-        total = read_result_total(page, timeout_ms)
-        browser.close()
-        return total
+) -> Any:
+    """Open the DAM's download dialog for the selected cards, choose JPG
+    Original Resolution and save its Standard download to `destination`.
+    Returns the finished download. A transfer the browser reports canceled is
+    started again from the same selection, DOWNLOAD_ATTEMPTS times in all; the
+    dialog is opened afresh each time, so the selection is re-counted too."""
+    last_error: BaseException | None = None
+    for attempt in range(DOWNLOAD_ATTEMPTS):
+        if attempt:
+            print(
+                f"The download for {describe_batch(subject, shot_code)} was "
+                f"canceled in transfer; starting it again "
+                f"({attempt + 1} of {DOWNLOAD_ATTEMPTS}).",
+                file=sys.stderr,
+            )
+            dismiss_popups(page)
+        first_asset = find_visible(
+            page,
+            (f"[role='region'][aria-label='Gap Image: {selected_filenames[0]}']",),
+            timeout_ms,
+        )
+        first_asset.locator("xpath=ancestor::*[@data-pv][1]").hover()
+        bulk_download = find_visible(
+            page,
+            (
+                "button[aria-label='Download']",
+                "a[aria-label='Download']",
+                "button:has-text('Download')",
+            ),
+            timeout_ms,
+        )
+        bulk_download.click()
+
+        original = find_visible(page, ("input[aria-label='Original']",), timeout_ms)
+        jpg_original = find_visible(
+            page, ("input[aria-label='JPG Original Resolution']",), timeout_ms
+        )
+        download_dialog = original.locator(
+            "xpath=ancestor::*[@data-vf='DownloadMultipleFormatSelector_VForm']"
+        )
+        selected_count = parse_selected_asset_count(download_dialog.inner_text())
+        if selected_count != len(selected_filenames):
+            raise ScrapeError(
+                f"Selected {len(selected_filenames)} assets for "
+                f"{describe_batch(subject, shot_code)}, but the download dialog "
+                f"contained {selected_count or 0}."
+            )
+        if original.is_checked():
+            wait_for_post(page, original.uncheck, timeout_ms)
+        if not jpg_original.is_checked():
+            wait_for_post(page, jpg_original.check, timeout_ms)
+
+        standard_download = find_visible(
+            page, ("a[aria-label='Standard download']",), timeout_ms
+        ).locator("xpath=parent::*")
+        with page.expect_download(timeout=timeout_ms) as download_info:
+            standard_download.click()
+        download = download_info.value
+        try:
+            download.save_as(destination)
+        except PlaywrightError as exc:
+            if not is_canceled_download(exc):
+                raise
+            last_error = exc
+            continue
+        return download
+    raise ScrapeError(
+        f"The download for {describe_batch(subject, shot_code)} was canceled in "
+        f"transfer {DOWNLOAD_ATTEMPTS} times ({last_error})."
+    )
 
 
 def download_batch_from_dam(
@@ -774,79 +936,49 @@ def download_batch_from_dam(
     headed: bool,
     timeout_ms: int,
 ) -> BatchDownload:
-    """One download of `limit` JPGs - a ZIP, or the bare JPG when `limit` is 1
-    (see wrap_bare_jpg_as_archive): the first `limit` cards the search shows,
-    under Shot Request ID `shot_code` when one is given and in the DAM's own
-    order when it is None (the --item-details mode)."""
+    """One download of up to `limit` JPGs - a ZIP, or the bare JPG when one
+    card is taken (see wrap_bare_jpg_as_archive): the first cards the search
+    shows, under Shot Request ID `shot_code` when one is given and in the DAM's
+    own order when it is None (the --item-details mode, which also settles for
+    a leftover Shot Request ID it could not clear - see open_search_page)."""
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=not headed)
         context = browser.new_context(storage_state=auth_state, accept_downloads=True)
         authenticated_page = open_search_page(
-            context, url, query, timeout_ms, subject=subject
+            context,
+            url,
+            query,
+            timeout_ms,
+            subject=subject,
+            shot_request_clear_required=shot_code is not None,
         )
         if shot_code is not None:
             set_shot_request_filter(authenticated_page, shot_code, timeout_ms)
+            shot_request_ids: tuple[str, ...] = (shot_code,)
+        else:
+            # Read before the cards are touched: the facet read may unfold the
+            # filter aside, which set_shot_request_filter folds away on purpose.
+            shot_request_ids = checked_facet_values(
+                authenticated_page, SHOT_REQUEST_ID, timeout_ms
+            )
         authenticated_page.wait_for_timeout(1_000)
         results = read_search_results(authenticated_page, timeout_ms)
-        if results.total < limit:
-            raise ScrapeError(
-                f"{describe_batch(subject, shot_code)} returned {results.total} "
-                f"assets; the selection plan expected {limit}."
-            )
+        limit = batch_limit(subject, shot_code, limit, results.total)
         selected_filenames = select_asset_limit(authenticated_page, limit, timeout_ms)
-        first_asset = find_visible(
+        download = save_bulk_download(
             authenticated_page,
-            (f"[role='region'][aria-label='Gap Image: {selected_filenames[0]}']",),
-            timeout_ms,
+            selected_filenames,
+            subject=subject,
+            shot_code=shot_code,
+            destination=destination,
+            timeout_ms=timeout_ms,
         )
-        first_asset.locator("xpath=ancestor::*[@data-pv][1]").hover()
-        bulk_download = find_visible(
-            authenticated_page,
-            (
-                "button[aria-label='Download']",
-                "a[aria-label='Download']",
-                "button:has-text('Download')",
-            ),
-            timeout_ms,
-        )
-        bulk_download.click()
-
-        original = find_visible(
-            authenticated_page, ("input[aria-label='Original']",), timeout_ms
-        )
-        jpg_original = find_visible(
-            authenticated_page,
-            ("input[aria-label='JPG Original Resolution']",),
-            timeout_ms,
-        )
-        download_dialog = original.locator(
-            "xpath=ancestor::*[@data-vf='DownloadMultipleFormatSelector_VForm']"
-        )
-        selected_count = parse_selected_asset_count(download_dialog.inner_text())
-        if selected_count != limit:
-            browser.close()
-            raise ScrapeError(
-                f"Selected {limit} assets for {describe_batch(subject, shot_code)}, "
-                f"but the download dialog contained {selected_count or 0}."
-            )
-        if original.is_checked():
-            wait_for_post(authenticated_page, original.uncheck, timeout_ms)
-        if not jpg_original.is_checked():
-            wait_for_post(authenticated_page, jpg_original.check, timeout_ms)
-
-        standard_download = find_visible(
-            authenticated_page,
-            ("a[aria-label='Standard download']",),
-            timeout_ms,
-        ).locator("xpath=parent::*")
-        with authenticated_page.expect_download(timeout=timeout_ms) as download_info:
-            standard_download.click()
-        download = download_info.value
-        download.save_as(destination)
         browser.close()
         return BatchDownload(
             selected_filenames=tuple(selected_filenames),
             suggested_filename=download.suggested_filename,
+            total=results.total,
+            shot_request_ids=shot_request_ids,
         )
 
 
@@ -899,10 +1031,12 @@ def fetch_batch(
     shot_code: str | None,
     limit: int,
     archive_path: Path,
-) -> tuple[dict[str, object], list[dict[str, object]], list[dict[str, object]]]:
+) -> tuple[
+    dict[str, object], list[dict[str, object]], list[dict[str, object]], BatchDownload
+]:
     """Download one batch to `archive_path` and unpack it into the library.
-    Returns the manifest's archive record, its file records and the DAM-side
-    source filenames that were selected."""
+    Returns the manifest's archive record, its file records, the DAM-side
+    source filenames that were selected, and the download itself."""
     partial_path = archive_path.with_suffix(".zip.part")
     download = download_batch_from_dam(
         query=query,
@@ -916,7 +1050,7 @@ def fetch_batch(
         timeout_ms=settings.timeout_ms,
     )
     wrapped_name = wrap_bare_jpg_as_archive(partial_path, download.suggested_filename)
-    members = inspect_jpg_archive(partial_path, limit)
+    members = inspect_jpg_archive(partial_path, len(download.selected_filenames))
     partial_path.replace(archive_path)
     extract_archive(archive_path, settings.images_directory)
     archive: dict[str, object] = {
@@ -934,7 +1068,7 @@ def fetch_batch(
         {"filename": filename, "shot_request_id": shot_code}
         for filename in download.selected_filenames
     ]
-    return archive, files, sources
+    return archive, files, sources, download
 
 
 def download_style(settings: RunSettings, style_number: str) -> Path:
@@ -962,7 +1096,7 @@ def download_style(settings: RunSettings, style_number: str) -> Path:
     files: list[dict[str, object]] = []
     selected_sources: list[dict[str, object]] = []
     for batch in plan:
-        archive, batch_files, sources = fetch_batch(
+        archive, batch_files, sources, _ = fetch_batch(
             settings,
             query=query,
             subject=subject,
@@ -1026,26 +1160,17 @@ def download_item_details(settings: RunSettings, details: str) -> Path:
 
     output_directory.mkdir(parents=True, exist_ok=True)
     subject = f"the search {query!r}"
-    total = discover_result_total(
-        query=query,
-        subject=subject,
-        auth_state=settings.auth_state,
-        url=settings.url,
-        headed=settings.headed,
-        timeout_ms=settings.timeout_ms,
-    )
-    if total == 0:
-        raise no_laydown_assets_error(subject)
-    limit = min(ITEM_DETAILS_LIMIT, total)
-    archive, files, selected_sources = fetch_batch(
+    archive, files, selected_sources, download = fetch_batch(
         settings,
         query=query,
         subject=subject,
         shot_code=None,
-        limit=limit,
+        limit=ITEM_DETAILS_LIMIT,
         archive_path=output_directory
         / f"gap-{query_directory}-first-results-jpg-original.zip",
     )
+    total = download.total
+    taken = len(selected_sources)
 
     manifest = {
         "status": "complete",
@@ -1057,13 +1182,17 @@ def download_item_details(settings: RunSettings, details: str) -> Path:
         "shot_request_policy": {
             "mode": "first_results",
             "first_results_limit": ITEM_DETAILS_LIMIT,
+            # The Shot Request ID values the search ran under. [] is the
+            # intended state; anything else is a leftover from an earlier run
+            # that would not come off, and the pull is not reused.
+            "leftover_shot_request_ids": list(download.shot_request_ids),
             "selected_batches": [
-                {"shot_request_id": None, "available": total, "selected": limit}
+                {"shot_request_id": None, "available": total, "selected": taken}
             ],
         },
         "format": "JPG Original Resolution",
         "download_method": "Standard download",
-        "result_count": limit,
+        "result_count": taken,
         "selected_sources": selected_sources,
         "image_root": str(settings.images_directory),
         "archives": [archive],
@@ -1072,7 +1201,7 @@ def download_item_details(settings: RunSettings, details: str) -> Path:
     }
     write_json_atomic(manifest_path, manifest)
     print(
-        f"Downloaded {limit} of {total} JPG files for {subject} "
+        f"Downloaded {taken} of {total} JPG files for {subject} "
         f"to {settings.images_directory}"
     )
     return manifest_path
@@ -1204,7 +1333,7 @@ def main(argv: list[str] | None = None) -> int:
         AuthStateError,
         AuthenticationExpired,
         RuntimeError,  # ScrapeError and dam_auth's configuration errors
-        PlaywrightTimeoutError,
+        PlaywrightError,  # its TimeoutError included; "Download.save_as: canceled" was one
         OSError,
         json.JSONDecodeError,
     ) as exc:

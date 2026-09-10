@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import dam_auth
 from auth_session import AuthStateError, AuthenticationExpired
+from playwright.sync_api import Error as PlaywrightError
 from dam_scrape import (
     ASSET_PRODUCTION_TYPE,
     EXIT_NOTHING_TO_DOWNLOAD,
@@ -27,11 +28,13 @@ from dam_scrape import (
     SHOT_REQUEST_ID,
     ShotBatch,
     apply_exclusive_facet,
+    batch_limit,
     choose_shot_batches,
     dismiss_popups,
     extract_archive,
     find_facet_containers,
     inspect_jpg_archive,
+    is_canceled_download,
     is_complete_manifest_reusable,
     main,
     normalize_style_number,
@@ -345,6 +348,77 @@ class FacetSelectionTests(unittest.TestCase):
         )
         self.assertEqual(containers.checkbox.clicks, 1)
 
+    def test_facet_click_the_dam_dropped_is_clicked_again(self) -> None:
+        # The settle window closes with the checkbox still as it was: the DAM
+        # dropped the click. The second one takes.
+        containers = _FacetContainers()
+        unchecked = (FacetOption(FINAL_ASSET_VALUE, 4, False),)
+        checked = (FacetOption(FINAL_ASSET_VALUE, 4, True),)
+        with (
+            patch("dam_scrape.FACET_SETTLE_MS", 0),
+            patch("dam_scrape.find_facet_containers", return_value=containers),
+            patch("dam_scrape.read_facet_options", side_effect=(unchecked, checked)),
+            patch(
+                "dam_scrape.wait_for_post",
+                side_effect=lambda _, action, __: action(),
+            ),
+        ):
+            toggle_facet_checkbox(
+                _FacetPage(), ASSET_PRODUCTION_TYPE, FINAL_ASSET_VALUE, 10_000
+            )
+
+        self.assertEqual(containers.checkbox.clicks, 2)
+
+    def test_facet_click_that_never_sticks_fails_after_the_last_attempt(self) -> None:
+        containers = _FacetContainers()
+        unchecked = (FacetOption(FINAL_ASSET_VALUE, 4, False),)
+        with (
+            patch("dam_scrape.FACET_SETTLE_MS", 0),
+            patch("dam_scrape.find_facet_containers", return_value=containers),
+            patch("dam_scrape.read_facet_options", return_value=unchecked),
+            patch(
+                "dam_scrape.wait_for_post",
+                side_effect=lambda _, action, __: action(),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ScrapeError, r"^Asset Production Type FINAL did not update\.$"
+            ):
+                toggle_facet_checkbox(
+                    _FacetPage(), ASSET_PRODUCTION_TYPE, FINAL_ASSET_VALUE, 10_000
+                )
+
+        self.assertEqual(containers.checkbox.clicks, 3)
+
+    def test_value_the_facet_drops_while_unchecking_counts_as_cleared(self) -> None:
+        # The leftover P01 is clicked off; the settle read still shows it
+        # checked, and by the retry the redrawn facet no longer lists P01 at
+        # all. Off the filter is what the uncheck was for: no error, no click.
+        listed = _FacetContainers(checked=True)
+        gone = _FacetContainers(checked=True, listed=False)
+        still_checked = (FacetOption("P01", 22, True),)
+        with (
+            patch("dam_scrape.FACET_SETTLE_MS", 0),
+            patch("dam_scrape.find_facet_containers", side_effect=(listed, gone)),
+            patch("dam_scrape.read_facet_options", return_value=still_checked),
+            patch(
+                "dam_scrape.wait_for_post",
+                side_effect=lambda _, action, __: action(),
+            ),
+        ):
+            toggle_facet_checkbox(_FacetPage(), SHOT_REQUEST_ID, "P01", 10_000)
+
+        self.assertEqual(listed.checkbox.clicks, 1)
+        self.assertEqual(gone.checkbox.clicks, 0)
+
+    def test_value_missing_at_the_first_look_cannot_be_toggled(self) -> None:
+        gone = _FacetContainers(listed=False)
+        with patch("dam_scrape.find_facet_containers", return_value=gone):
+            with self.assertRaisesRegex(
+                ScrapeError, r"^The Shot Request ID value P01 could not be read\.$"
+            ):
+                toggle_facet_checkbox(_FacetPage(), SHOT_REQUEST_ID, "P01", 10_000)
+
 
 class _SettlePage:
     def wait_for_timeout(self, _: int) -> None:
@@ -383,32 +457,38 @@ class _SearchContext:
 
 
 class _FacetCheckbox:
-    def __init__(self) -> None:
+    def __init__(self, checked: bool = False) -> None:
         self.clicks = 0
+        self.checked = checked
 
     def is_checked(self) -> bool:
-        return False
+        return self.checked
 
     def evaluate(self, _: str) -> None:
         self.clicks += 1
 
 
 class _FacetCheckboxCandidates:
-    def __init__(self, checkbox: _FacetCheckbox) -> None:
+    def __init__(self, checkbox: _FacetCheckbox, listed: bool) -> None:
         self.first = checkbox
+        self.listed = listed
 
     def count(self) -> int:
-        return 1
+        return 1 if self.listed else 0
 
 
 class _FacetContainers:
-    def __init__(self) -> None:
-        self.checkbox = _FacetCheckbox()
+    """A facet's containers holding one checkbox - or, with `listed` False,
+    a redrawn facet that no longer lists the value at all."""
+
+    def __init__(self, checked: bool = False, listed: bool = True) -> None:
+        self.checkbox = _FacetCheckbox(checked)
+        self.listed = listed
         self.selector = ""
 
     def locator(self, selector: str) -> _FacetCheckboxCandidates:
         self.selector = selector
-        return _FacetCheckboxCandidates(self.checkbox)
+        return _FacetCheckboxCandidates(self.checkbox, self.listed)
 
 
 class _FacetPage:
@@ -486,6 +566,111 @@ class _VirtualFacetSidebar:
 NO_LAYDOWN_ASSETS = r"^The Gap DAM has no laydown assets for style 440760\.$"
 
 
+def _patched_search(
+    *, clear_side_effect: object, total: int
+) -> tuple[ExitStack, _SearchContext, list[tuple[str, str]]]:
+    """open_search_page with the browser out of the way: the leftover clear
+    does `clear_side_effect`, the results pane says `total`, and every facet
+    application is appended to the returned list instead of clicked."""
+    page = _SearchPage()
+    applied: list[tuple[str, str]] = []
+    stack = ExitStack()
+    stack.enter_context(
+        patch("dam_scrape._find_authenticated_page", return_value=page)
+    )
+    stack.enter_context(patch("dam_scrape.find_visible", return_value=page.search))
+    stack.enter_context(
+        patch("dam_scrape.wait_for_post", side_effect=lambda _, action, __: action())
+    )
+    stack.enter_context(
+        patch("dam_scrape.clear_facet_filters", side_effect=clear_side_effect)
+    )
+    stack.enter_context(patch("dam_scrape.read_result_total", return_value=total))
+    stack.enter_context(
+        patch(
+            "dam_scrape.apply_exclusive_facet",
+            side_effect=lambda _, title, value, __: applied.append((title, value)),
+        )
+    )
+    return stack, _SearchContext(page), applied
+
+
+class LeftoverShotRequestTests(unittest.TestCase):
+    """The DAM keeps the Shot Request ID a run leaves checked (P01, say), so
+    every search first unchecks it - and now and then the DAM will not let it
+    go. That ends a style search, whose plan is built from the facet; a text
+    search needs only FINAL and Shot Type L, so it goes on and says so."""
+
+    STUCK = "Shot Request ID P01 did not update."
+
+    def test_style_search_still_fails_on_a_stuck_leftover(self) -> None:
+        stack, context, applied = _patched_search(
+            clear_side_effect=ScrapeError(self.STUCK), total=22
+        )
+        with stack, self.assertRaisesRegex(
+            ScrapeError, r"^Shot Request ID P01 did not update\.$"
+        ):
+            open_search_page(context, "https://dam.test", "440760", 100)
+        self.assertEqual(applied, [])
+
+    def test_text_search_goes_on_under_a_stuck_leftover_and_says_so(self) -> None:
+        stack, context, applied = _patched_search(
+            clear_side_effect=ScrapeError(self.STUCK), total=22
+        )
+        stderr = io.StringIO()
+        with stack, redirect_stderr(stderr):
+            page = open_search_page(
+                context,
+                "https://dam.test",
+                "blue hoodie",
+                100,
+                subject="the search 'blue hoodie'",
+                shot_request_clear_required=False,
+            )
+        self.assertIs(page, context.page)
+        self.assertEqual(applied, [(ASSET_PRODUCTION_TYPE, FINAL_ASSET_VALUE)])
+        self.assertIn(self.STUCK, stderr.getvalue())
+        self.assertIn("the search 'blue hoodie'", stderr.getvalue())
+        self.assertIn("FINAL and Shot Type L still apply", stderr.getvalue())
+
+    def test_text_search_still_reports_a_facet_missing_with_results(self) -> None:
+        # Results but no facet is the sidebar failing to render, not a
+        # leftover: an operational error in either mode.
+        missing_facet = FacetUnavailableError(
+            "The Shot Request ID filter was not available."
+        )
+        stack, context, applied = _patched_search(
+            clear_side_effect=missing_facet, total=7
+        )
+        with stack, self.assertRaises(FacetUnavailableError):
+            open_search_page(
+                context,
+                "https://dam.test",
+                "blue hoodie",
+                100,
+                subject="the search 'blue hoodie'",
+                shot_request_clear_required=False,
+            )
+        self.assertEqual(applied, [])
+
+
+class BatchLimitTests(unittest.TestCase):
+    def test_style_batch_short_of_its_plan_is_an_error(self) -> None:
+        with self.assertRaisesRegex(
+            ScrapeError,
+            r"^Shot Request ID AV5 for style 671304 returned 2 assets; "
+            r"the selection plan expected 3\.$",
+        ):
+            batch_limit("style 671304", "AV5", 3, 2)
+
+    def test_batch_takes_its_plan_when_the_page_holds_it(self) -> None:
+        self.assertEqual(batch_limit("style 671304", "AV5", 3, 3), 3)
+        self.assertEqual(batch_limit("the search 'x'", None, 50, 900), 50)
+
+    def test_text_search_takes_what_the_page_holds(self) -> None:
+        self.assertEqual(batch_limit("the search 'x'", None, 50, 12), 12)
+
+
 class EmptySearchTests(unittest.TestCase):
     """An empty search must read as "no laydown assets for this style", not as
     the Shot Request ID facet going missing - which is what the sidebar does
@@ -494,27 +679,7 @@ class EmptySearchTests(unittest.TestCase):
     def _patched_search(
         self, *, clear_side_effect: object, total: int
     ) -> tuple[ExitStack, _SearchContext, list[tuple[str, str]]]:
-        page = _SearchPage()
-        applied: list[tuple[str, str]] = []
-        stack = ExitStack()
-        stack.enter_context(
-            patch("dam_scrape._find_authenticated_page", return_value=page)
-        )
-        stack.enter_context(patch("dam_scrape.find_visible", return_value=page.search))
-        stack.enter_context(
-            patch("dam_scrape.wait_for_post", side_effect=lambda _, action, __: action())
-        )
-        stack.enter_context(
-            patch("dam_scrape.clear_facet_filters", side_effect=clear_side_effect)
-        )
-        stack.enter_context(patch("dam_scrape.read_result_total", return_value=total))
-        stack.enter_context(
-            patch(
-                "dam_scrape.apply_exclusive_facet",
-                side_effect=lambda _, title, value, __: applied.append((title, value)),
-            )
-        )
-        return stack, _SearchContext(page), applied
+        return _patched_search(clear_side_effect=clear_side_effect, total=total)
 
     def test_empty_search_with_missing_facet_names_the_style(self) -> None:
         # Nothing was left checked from the previous run, so the sidebar never
@@ -1005,6 +1170,30 @@ class ItemDetailsTests(unittest.TestCase):
             ]
             self.assertTrue(is_complete_manifest_reusable(manifest, output_directory))
 
+    def test_text_manifest_pulled_under_a_leftover_filter_is_refetched(self) -> None:
+        # The search ran with P01 still checked from an earlier run, so its
+        # "everything" was P01's everything. A rerun may get the filter off.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_directory = Path(temporary_directory)
+            (output_directory / "assets.zip").touch()
+            manifest = {
+                "status": "complete",
+                "filters": dict(REQUIRED_FILTERS),
+                "archives": [{"filename": "assets.zip"}],
+                "shot_request_policy": {
+                    "mode": "first_results",
+                    "first_results_limit": ITEM_DETAILS_LIMIT,
+                    "leftover_shot_request_ids": ["P01"],
+                    "selected_batches": [
+                        {"shot_request_id": None, "available": 2, "selected": 2}
+                    ],
+                },
+            }
+            self.assertFalse(is_complete_manifest_reusable(manifest, output_directory))
+
+            manifest["shot_request_policy"]["leftover_shot_request_ids"] = []
+            self.assertTrue(is_complete_manifest_reusable(manifest, output_directory))
+
 
 class ArchiveTests(unittest.TestCase):
     def test_jpg_archive_is_inspected(self) -> None:
@@ -1202,3 +1391,26 @@ class ManifestTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CanceledDownloadTests(unittest.TestCase):
+    def test_canceled_transfer_is_recognised(self) -> None:
+        self.assertTrue(is_canceled_download(PlaywrightError("Download.save_as: canceled")))
+        self.assertFalse(is_canceled_download(PlaywrightError("Download.save_as: no such file")))
+        self.assertFalse(is_canceled_download(ScrapeError("canceled")))
+
+    def test_browser_error_is_a_clean_failure_not_a_traceback(self) -> None:
+        # Before this, "Download.save_as: canceled" escaped main as a traceback
+        # with exit 1; a caller could not tell it from a crash.
+        stderr = io.StringIO()
+        with (
+            patch(
+                "dam_scrape.download_with_session",
+                side_effect=PlaywrightError("Download.save_as: canceled"),
+            ),
+            redirect_stderr(stderr),
+            redirect_stdout(io.StringIO()),
+        ):
+            code = main(["--item-details", "blue hoodie"])
+        self.assertEqual(code, 2)
+        self.assertIn("DAM download failed: Download.save_as: canceled", stderr.getvalue())

@@ -83,6 +83,22 @@ or some but none of them tagged FINAL. Any other failure of the style search
 still stops the run. Its ZIP and manifest live under
 `downloads/item-details/<text>/`.
 
+The DAM remembers the Shot Request ID a run leaves checked, so every search
+first unchecks whatever the last one left behind (`P01`, say). The DAM drops
+that click now and then; the scraper clicks again, three times in all. A style
+search that still cannot get the filter off stops, because its plan is built
+from the facet's per-code counts. The text search needs none of that - `FINAL`
+and Shot Type `L` are its requirements - so it goes on under the leftover
+filter, prints a warning naming it, and records the values as
+`leftover_shot_request_ids` in its manifest. That pull is narrower than
+intended and is not reused: the next run tries again for the full first page.
+
+A bulk download the browser reports as canceled (the DAM, or the link to it,
+dropped the transfer - a 238 MB first page did that once after six minutes) is
+started again from the same selection, three times in all, before the run
+fails. Any other browser error ends the run with `DAM download failed:` and
+exit 2, like the DAM's own errors, instead of a traceback.
+
 The scraper's last line of output is `manifest <path>`, naming whichever
 manifest the run produced; `run.sh` reads it from there.
 
